@@ -1,0 +1,17 @@
+{
+  "contributed": false,
+  "smartScore": 3,
+  "toolCount": 6,
+  "uniqueTools": 4,
+  "lastEvaluated": 1792289682132,
+  "sessionStartIso": "2026-10-18T02:14:39.953Z",
+  "isKnowledgeGap": false,
+  "hasGitCommit": true,
+  "friction": {
+    "interrupt": 0,
+    "toolReject": 0,
+    "correction": 0,
+    "toolError": 1
+  },
+  "promptSummary": "帮我排查 K8s pod 启动超时，token=<REDACTED:openai>"
+}
