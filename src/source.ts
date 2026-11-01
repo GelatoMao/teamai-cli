@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import fse from 'fs-extra';
 import YAML from 'yaml';
 import { loadTeamConfig, autoDetectInit, loadLocalConfig, detectProjectConfig } from './config.js';
-import { pullRepo } from './utils/git.js';
+import { assertAttachedTeamRepo, createGit, DetachedTeamRepoError, pullRepo } from './utils/git.js';
 import { parseFrontmatter } from './utils/frontmatter.js';
 import { detectProvider, getProvider } from './providers/index.js';
 import { log, spinner } from './utils/logger.js';
@@ -28,10 +28,12 @@ import {
   deliveredSkillFiles, describeKeptEntry, describeMembersLink, describeSkippedLink, holdsGitDir, holdsNonRegular, isLink, isTeamaiSkillCopy,
   keepsTrackedCopy, membersLinkAt,
 } from './resources/delivered-copies.js';
-import { getHermesHome } from './hermes-home.js';
 import { warnOnce } from './utils/warn-once.js';
 import { blobIdOf, historicalVersions } from './utils/team-history.js';
-import { resolveOpenclawStateDir, resolveOpenclawWorkspace, resolveOpenclawWorkspaceDir } from './openclaw-hooks.js';
+import { installOf, locate, ownOf } from './locate.js';
+import { resolveOpenclawWorkspace } from './openclaw-home.js';
+import { isToolId, TOOLS } from './tools.js';
+import { toolHome } from './tool-home.js';
 import { BUILTIN_SKILL_NAMES, LEGACY_BUILTIN_SKILL_NAMES } from './builtin-skills.js';
 import { getUserHome } from './utils/home.js';
 import { acquireLock, releaseLock } from './update.js';
@@ -43,7 +45,7 @@ import type {
   SourceInstallManifest,
   GlobalOptions,
 } from './types.js';
-import { getCopilotHome, isAgentExcluded, resolveBaseDir, scopedToolPaths, SOURCE_PULL_TTL_MS } from './types.js';
+import { isAgentExcluded, resolveBaseDir, scopedToolPaths, SOURCE_PULL_TTL_MS } from './types.js';
 import type { DeliveryRecorder } from './git-exclude-delivered.js';
 
 // ─── Source repo management ──────────────────────────────
@@ -61,6 +63,19 @@ async function withSourceLock(options: GlobalOptions, action: () => Promise<void
     await action();
   } finally {
     if (!options.dryRun) await releaseLock(lock);
+  }
+}
+
+/** Whether `source add` and `remove` may edit the team clone's teamai.yaml; a detached clone says why not and exits 1. */
+async function teamRepoEditable(localPath: string): Promise<boolean> {
+  try {
+    await assertAttachedTeamRepo(createGit(localPath), localPath);
+    return true;
+  } catch (error) {
+    if (!(error instanceof DetachedTeamRepoError)) throw error;
+    log.error(error.message);
+    process.exitCode = 1;
+    return false;
   }
 }
 
@@ -135,12 +150,12 @@ function isCanonicalSkillName(value: string): boolean {
 }
 
 /**
- * The homes of tools whose skills live outside the scope root (#993 bug 8):
- * Hermes, OpenClaw (state dir and workspace) and, in user scope, Copilot.
- * A source destination recorded as an absolute path must lie inside one.
+ * The homes a tool's skills can sit in outside the scope root (#993 bug 8):
+ * every tool's home, wherever it moved, and OpenClaw's workspace. A source
+ * destination recorded as an absolute path must lie inside one.
  */
 async function externalToolHomes(): Promise<string[]> {
-  const homes = [getHermesHome(), resolveOpenclawStateDir(), getCopilotHome()];
+  const homes = Object.keys(TOOLS).filter(isToolId).map((tool) => toolHome(tool));
   // The workspace OpenClaw is configured to read, even once its directory is gone:
   // a record of a copy there stays valid, so pull and `source remove` keep working.
   const workspace = await resolveOpenclawWorkspace();
@@ -181,12 +196,12 @@ async function resolveSourcePhysicalPath(target: string): Promise<string> {
     return await fse.realpath(absolute);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw new Error(`Cannot verify source destination: ${absolute}. Manual review is required (${(error as NodeJS.ErrnoException).code ?? 'unknown error'}).`);
+      throw new Error(`Cannot verify source destination: ${absolute}. Manual review is required (${(error as NodeJS.ErrnoException).code ?? 'unknown error'}).`, { cause: error });
     }
     // A missing leaf is safe to append; an existing dangling link is not.
     try {
       await fse.lstat(absolute);
-      throw new Error(`Cannot determine source destination through a dangling symlink: ${absolute}. Manual review is required.`);
+      throw new Error(`Cannot determine source destination through a dangling symlink: ${absolute}. Manual review is required.`, { cause: error });
     } catch (statError) {
       if ((statError as NodeJS.ErrnoException).code !== 'ENOENT') throw statError;
     }
@@ -214,7 +229,7 @@ async function readSourceManifest(manifestPath: string): Promise<SourceInstallMa
     raw = await fse.readFile(manifestPath, 'utf8');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw new Error(`Cannot read source ownership record: ${manifestPath}`);
+    throw new Error(`Cannot read source ownership record: ${manifestPath}`, { cause: error });
   }
   let value: unknown;
   try {
@@ -344,7 +359,7 @@ async function ensureSourceRepo(source: SourceConfig, force: boolean, dryRun = f
   // (token, credential helper, or SSH agent) is used.
   try {
     await ensureDir(path.dirname(repoDir));
-    const cloneSpin = spinner(`[source:${source.name}] Cloning...`).start();
+    const cloneSpin = (await spinner(`[source:${source.name}] Cloning...`)).start();
 
     const providerName = detectProvider(source.repo);
     const provider = getProvider(providerName);
@@ -371,6 +386,7 @@ async function ensureSourceRepo(source: SourceConfig, force: boolean, dryRun = f
  */
 export async function sourceAdd(repoUrl: string, options: { name?: string } & GlobalOptions): Promise<void> {
   const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
+  if (!await teamRepoEditable(localConfig.repo.localPath)) return;
   await withSourceLock(options, () => sourceAddLocked(repoUrl, options, localConfig, teamConfig));
 }
 
@@ -447,6 +463,7 @@ async function sourceAddLocked(repoUrl: string, options: { name?: string } & Glo
  */
 export async function sourceRemove(name: string, options: GlobalOptions): Promise<void> {
   const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
+  if (!await teamRepoEditable(localConfig.repo.localPath)) return;
   await withSourceLock(options, () => sourceRemoveLocked(name, options, localConfig, teamConfig));
 }
 
@@ -611,7 +628,7 @@ export async function sourceList(): Promise<void> {
  */
 export async function sourceAddHttp(
   endpoint: string,
-  options: { token?: string; force?: boolean } & GlobalOptions,
+  options: { token?: string; force?: boolean; agent?: string } & GlobalOptions,
 ): Promise<void> {
   const trimmed = endpoint.trim();
   if (!trimmed) {
@@ -635,10 +652,14 @@ export async function sourceAddHttp(
   }
 
   const { initLocalAgentHttp } = await import('./local-agent.js');
+  const { normalizeAgentList } = await import('./known-agents.js');
   // force: true so re-running add-http updates the bypass's own endpoint/token.
-  await initLocalAgentHttp({ endpoint: trimmed, token: options.token, force: true });
+  // filterAgents stays undefined without --agent: hooks go to every tool, as before.
+  // --agent may name several tools, as it does on init.
+  const agents = normalizeAgentList(options.agent);
+  await initLocalAgentHttp({ endpoint: trimmed, token: options.token, force: true, filterAgents: agents.length > 0 ? agents : undefined });
   log.success(`HTTP source added (${trimmed}).`);
-  log.info('It will report/sync on the next AI session (via the hook-dispatch hook already installed).');
+  log.info('It will report/sync on the next AI session in each workspace where `teamai bind-project` ran once (via the hook-dispatch hook already installed).');
 }
 
 /**
@@ -889,12 +910,12 @@ async function pullSingleSource(
     // cross-installation ownership is checked.
     const targets: string[] = [];
     // Recorded copies holding a file of the member's where the source now has one: kept on record, not copied.
-    const retained: string[] = [];
+    const retainedTargets: string[] = [];
     let codexSkillsPath: string | undefined;
     let conflictingPath: string | undefined;
     let conflictingRecord: string | undefined;
     const toolPaths = scopedToolPaths(teamConfig, localConfig);
-    const skillTarget = skillTargetsFor(toolPaths, localConfig);
+    const skillTarget = skillTargetsFor(teamConfig, localConfig);
     for (const [tool, toolPath] of Object.entries(toolPaths)) {
       if (isAgentExcluded(localConfig, tool)) continue;
       let membersShared = false;
@@ -935,14 +956,15 @@ async function pullSingleSource(
         if (colliding) {
           log.warn(`[source:${source.name}] Kept ${target}: ${colliding} there is yours, and ${source.name}/${skill.name} now has a file at that path. `
             + `Rename or delete ${colliding}, then run teamai pull, to receive the source version.`);
-          retained.push(target);
+          retainedTargets.push(target);
           continue;
         }
       }
+      // oxlint-disable-next-line teamai/configured-tool-paths -- compare Codex own directory with the shared destination
       if (tool === CODEX_TOOL && target !== path.join(baseDir, toolPath.skills, skill.name)) codexSkillsPath = toolPath.skills;
       targets.push(target);
     }
-    if (targets.length > 0 || retained.length > 0) plans.push({ skill, targets, retained, codexSkillsPath, conflictingPath, conflictingRecord });
+    if (targets.length > 0 || retainedTargets.length > 0) plans.push({ skill, targets, retained: retainedTargets, codexSkillsPath, conflictingPath, conflictingRecord });
   }
 
   // Directory copies merge content. Crossing an existing parent/child boundary
@@ -1017,7 +1039,7 @@ async function pullSingleSource(
   }
 
   const keptInPlace = new Set<string>();
-  for (const { skill, targets, retained, conflictingPath, conflictingRecord } of plans) {
+  for (const { skill, targets, retained: retainedTargets, conflictingPath, conflictingRecord } of plans) {
     if (conflictingPath) {
       log.warn(`[source:${source.name}] Skipping "${skill.name}": another source repository owns ${conflictingPath}. Remove that installation before pulling this skill. Ownership record: ${conflictingRecord}`);
       continue;
@@ -1051,14 +1073,14 @@ async function pullSingleSource(
       // copyDir may replace a leaf symlink: pin the actual post-copy location.
       installedPhysicalPaths[relativeTarget] = await resolveSourcePhysicalPath(targetDir);
     }
-    for (const targetDir of retained) {
+    for (const targetDir of retainedTargets) {
       const relativeTarget = recordedDestination(baseDir, targetDir);
       const skillPaths = installedPaths[skill.name] ??= [];
       if (!skillPaths.includes(relativeTarget)) skillPaths.push(relativeTarget);
       installedPhysicalPaths[relativeTarget] = await resolveSourcePhysicalPath(targetDir);
     }
     // A copy kept whole is still this source's on record, so removal judges it later.
-    if (retained.length > 0) keptInPlace.add(skill.name);
+    if (retainedTargets.length > 0) keptInPlace.add(skill.name);
     if (targets.length === 0) continue;
 
     if (oldInstalled.has(skill.name)) {
@@ -1500,14 +1522,13 @@ async function legacyCopyKeeper(
   sourceName: string, repoDir: string, teamConfig: TeamaiConfig, localConfig: LocalConfig, baseDir: string,
 ): Promise<(skillName: string, sourcePath?: string) => KeepRecordedCopy> {
   const toolPaths = scopedToolPaths(teamConfig, localConfig);
+  const install = installOf(teamConfig, localConfig);
   const legacyRoots: string[] = [];
   for (const tool of ['hermes', 'openclaw']) {
     const configured = toolPaths[tool]?.skills;
     if (!configured) continue;
-    const workspace = tool === 'openclaw' ? await resolveOpenclawWorkspaceDir() : null;
-    const delivered = tool === 'hermes' ? path.join(getHermesHome(), 'skills') : workspace && path.join(workspace, 'skills');
     const legacy = path.join(baseDir, configured);
-    if (legacy !== delivered) legacyRoots.push(legacy);
+    if (legacy !== ownOf(await locate(tool, 'skills', install))?.path) legacyRoots.push(legacy);
   }
   const history = await pathExists(path.join(repoDir, '.git'));
   return (skillName, sourcePath) => async (skillDir) => {

@@ -30,6 +30,19 @@ Read-only, no git:
 teamai init --http https://your-team-host/api --token <api-key>
 ```
 
+An agent access token (`sk-`) works for one agent only. Pass that agent with `--agent <tool>`; each agent then keeps its own token. While an agent's current token still works, a new one for the same agent is not used, so its delivered models keep working.
+
+Then enroll each workspace you want synced: run `teamai bind-project` once there. Binding it to a ClawPro project is optional — add `--skip` to stay unbound, and no prompt asks again. A worktree inherits its main checkout's choice. The HTTP agent leaves a workspace where this never ran alone, saying so once per session; a workspace enrolled but still pending a project keeps asking in each new chat (and after a pause) until it is bound or skipped, and a non-interactive `teamai bind-project` lists the account's projects so a setup script can act on them.
+
+Running it again with the same endpoint and key keeps them. Moving to another endpoint or key needs `--force`, and without it nothing is changed:
+
+```text
+$ teamai init --http https://new-host.example/api --token <new-key>
+...
+✖ The HTTP local agent already uses https://your-team-host/api. Re-run with --force to replace it with https://new-host.example/api.
+$ teamai init --http https://new-host.example/api --token <new-key> --force
+```
+
 ```bash
 teamai doctor
 teamai list
@@ -87,11 +100,11 @@ teamai status
 
 ```bash
 teamai roles list
-teamai roles set hai
+teamai roles set hai   # unless the team assigns roles (below)
 teamai pull
 ```
 
-How roles are defined: [Distribution mechanism](./distribution.md#roles-and-projects).
+How roles are defined: [Distribution mechanism](./distribution.md#roles-and-projects). A team that assigns roles in `manifest/members.yaml` decides yours: `roles list` shows them, `roles set` is refused, and a change goes through that file — see [Assigning roles in the team repo](./distribution.md#assigning-roles-in-the-team-repo).
 
 ### Tag subscriptions
 
@@ -115,6 +128,29 @@ sharing:
 `false` removes the commit trailer. `true` keeps it. Leave the block out and teamai does not change each tool's own setting.
 
 `coAuthorEnabled` in `~/.teamai/config.yaml` on your machine wins. The next `teamai pull` writes each tool's config.
+
+## Auto-Compact Threshold
+
+In the team repo's `teamai.yaml`:
+
+```yaml
+sharing:
+  autoCompact:
+    tokens: 400000
+```
+
+AI tools then compact a conversation at their next compaction check once its context reaches about 400K tokens; a long turn can run a little past it before that check. Each tool takes the number its own way:
+
+| Tool | Setting written |
+|------|-----------------|
+| Claude Code, TClaude | `settings.json` `autoCompactWindow` = tokens + 33K |
+| CodeBuddy, WorkBuddy | `settings.json` `autoCompactWindow` = tokens ÷ the tool's mid-turn ratio (0.92, or WorkBuddy's 0.9) |
+| Codex, TCodex | `config.toml` `model_auto_compact_token_limit` = tokens |
+| DeepSeek Harness | `cordis.patch.yml` row `compaction-basic`, one ratio per model |
+
+A tool still compacts by its model's own window when that is smaller, so a model with a small window is not affected. teamai skips a tool and says why when the tool cannot take the number: an environment variable overrides the setting, a custom CodeBuddy model has no `maxInputTokens`, or no DeepSeek Harness model fits. Cursor has no such setting. Restart the tool after a pull.
+
+These files are shared by the machine, so one scope decides: the user scope when there is one, else the workspace the pull runs in. A value you set yourself is never overwritten. `autoCompactTokens` in that scope's config wins; `0` opts out. When the team drops the block, the next `teamai pull` removes the values teamai wrote.
 
 ## Keeping Delivered Files Out of Git
 

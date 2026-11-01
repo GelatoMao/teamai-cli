@@ -38,19 +38,19 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { ChildProcess } from 'node:child_process';
-import { homedir } from 'node:os';
 import crossSpawn from 'cross-spawn';
-import { AgentAdapter, type SessionMeta, type SessionReadRef } from './base.js';
+import { z } from 'zod';
+import { AgentAdapter, type SessionMeta, type SessionReadRef, type Subagent, type SubagentsRead } from './base.js';
 import type { Session, Message, ContentBlock, ThinkingBlock, ToolCallBlock, ToolResultBlock } from '../ir.js';
 import { imagePlaceholderText } from '../ir.js';
-import { titleFromUserText, visibleUserText } from '../title.js';
+import { typedTitle, visibleUserText } from '../title.js';
 import { assertSafeSessionFileId, deriveTargetSessionId } from '../ids.js';
 import { findSqlite3 } from '../sqlite.js';
 import { log } from '../../utils/logger.js';
 import { execCommand, probeBinary } from '../../utils/exec.js';
 import { isOnPath } from '../../utils/lookpath.js';
+import { desktopCodexBinaries } from '../../codex-desktop.js';
 import {
-  getCodexSessionsDir,
   resolveRealCwd,
   readJsonl,
   readJsonlHead,
@@ -59,6 +59,7 @@ import {
   dirExists,
   scanFiles,
 } from '../fs.js';
+import { sessionStoreDir } from '../../locate.js';
 
 // ---------------------------------------------------------------------------
 // Tool-name normalization map
@@ -218,24 +219,29 @@ function pushItemCompleted(records: Record<string, unknown>[], args: ItemComplet
   records.push(buildItemCompletedRecord(args));
 }
 
-/** Location of the codex CLI bundled with Codex Desktop (ChatGPT.app) on macOS. */
-const DESKTOP_CODEX_CANDIDATES = [
-  '/Applications/ChatGPT.app/Contents/Resources/codex',
-  `${homedir()}/Applications/ChatGPT.app/Contents/Resources/codex`,
-  '/Applications/Codex.app/Contents/Resources/codex',
-];
-
 /**
  * The codex CLI that runs: `codex` on PATH (npm / brew install), else the one bundled with
  * Codex Desktop. Probed and later started through cross-spawn, which resolves the npm
  * `codex.cmd` shim on Windows that a plain PATH join and `spawn` miss.
  */
 async function findCodexCli(): Promise<string | null> {
-  for (const candidate of ['codex', ...DESKTOP_CODEX_CANDIDATES]) {
+  for (const candidate of ['codex', ...desktopCodexBinaries()]) {
     if (await probeBinary(candidate)) return candidate;
   }
   return null;
 }
+
+const ChildRolloutMetaSchema = z.object({
+  type: z.literal('session_meta'),
+  payload: z.object({
+    id: z.string().min(1),
+    timestamp: z.string().optional(),
+    cwd: z.string().optional(),
+    source: z.object({ subagent: z.object({ thread_spawn: z.object({ parent_thread_id: z.string().min(1) }) }) }),
+    subagent_history_start_ordinal: z.number().int().optional(),
+  }),
+});
+type ChildRollout = { file: string; meta: z.infer<typeof ChildRolloutMetaSchema>['payload'] };
 
 // ---------------------------------------------------------------------------
 // CodexAdapter
@@ -252,15 +258,7 @@ export class CodexAdapter extends AgentAdapter {
   constructor(platform = 'codex', storageRoot?: string) {
     super();
     this.platform = platform;
-    this.storageRoot = storageRoot ?? getCodexSessionsDir();
-  }
-
-  static isAvailable(): boolean {
-    return dirExists(getCodexSessionsDir());
-  }
-
-  static getDefaultStoragePath(): string {
-    return getCodexSessionsDir();
+    this.storageRoot = storageRoot ?? sessionStoreDir('codex', undefined);
   }
 
   /**
@@ -338,10 +336,10 @@ export class CodexAdapter extends AgentAdapter {
     return name;
   }
 
-  async listConversations(projectPath?: string): Promise<SessionMeta[]> {
+  async listConversations(projectPath?: string, { archived = false }: { archived?: boolean } = {}): Promise<SessionMeta[]> {
     const metas: SessionMeta[] = [];
 
-    for (const f of this.scanJsonlFiles()) {
+    for (const f of archived ? this.scanAllRollouts() : this.scanJsonlFiles()) {
       const first = this.readFirstLine(f);
       if (!first || first.type !== 'session_meta') continue;
 
@@ -396,7 +394,7 @@ export class CodexAdapter extends AgentAdapter {
             text = (content ?? []).map((c) => String(c.text ?? '')).join(' ');
           }
           if (!text) continue;
-          const cleaned = titleFromUserText(visibleUserText(text));
+          const cleaned = typedTitle(text);
           if (cleaned) contentTitle = cleaned;
         }
       } catch {
@@ -477,7 +475,7 @@ export class CodexAdapter extends AgentAdapter {
           text = (content ?? []).map((c) => String(c.text ?? '')).join(' ');
         }
         if (!text) continue;
-        const cleaned = titleFromUserText(visibleUserText(text));
+        const cleaned = typedTitle(text);
         if (cleaned) {
           readTitle = cleaned;
           break;
@@ -500,8 +498,72 @@ export class CodexAdapter extends AgentAdapter {
     };
   }
 
+  /**
+   * The agents a session spawned: rollouts written since it started whose first record names it, or an agent it
+   * spawned, as the parent thread. Each agent reads from `subagent_history_start_ordinal`, so the parent history the
+   * agent was given is not read twice; a rollout without it is read whole, with its start `unknown`. Agents come in
+   * spawn order, each followed by the agents it spawned.
+   */
+  async readSubagents(session: Session, _ref: SessionReadRef): Promise<SubagentsRead> {
+    const since = Date.parse(session.createdAt);
+    const children = new Map<string, ChildRollout[]>();
+    for (const file of this.scanAllRollouts()) {
+      try {
+        if (fs.statSync(file).mtimeMs < since) continue;
+      } catch {
+        continue;
+      }
+      const parsed = ChildRolloutMetaSchema.safeParse(this.readFirstLine(file));
+      if (!parsed.success || Date.parse(parsed.data.payload.timestamp ?? '') < since) continue;
+      const parent = parsed.data.payload.source.subagent.thread_spawn.parent_thread_id;
+      children.set(parent, [...children.get(parent) ?? [], { file, meta: parsed.data.payload }]);
+    }
+    const agents: Subagent[] = [];
+    const visit = (parent: string, depth: number): void => {
+      const spawned = [...children.get(parent) ?? []].sort((left, right) => (left.meta.timestamp ?? '').localeCompare(right.meta.timestamp ?? ''));
+      for (const child of spawned) {
+        if (agents.some((agent) => agent.session.sessionId === child.meta.id)) continue;
+        agents.push({ ...this.readChild(child), depth });
+        visit(child.meta.id, depth + 1);
+      }
+    };
+    visit(session.sessionId, 1);
+    return { status: 'read', agents };
+  }
+
+  private readChild({ file, meta }: ChildRollout): Omit<Subagent, 'depth'> {
+    const start = meta.subagent_history_start_ordinal;
+    const records = [...readJsonl(file)].filter((record) =>
+      start === undefined || (typeof record.ordinal === 'number' && record.ordinal >= start));
+    const messages = this.buildMessages(records);
+    const createdAt = parseCodexTimestamp(meta.timestamp);
+    return {
+      session: {
+        sessionId: meta.id,
+        title: '',
+        cwd: meta.cwd ?? '',
+        platform: this.platform,
+        createdAt,
+        updatedAt: messages.at(-1)?.timestamp ?? createdAt,
+        messages,
+        metadata: {},
+      },
+      finished: records.some((record) => record.type === 'event_msg'
+        && typeof record.payload === 'object' && record.payload !== null && 'type' in record.payload && record.payload.type === 'task_complete'),
+      start: start === undefined ? 'unknown' : 'recorded',
+    };
+  }
+
   private buildMessages(records: Record<string, unknown>[]): Message[] {
     const messages: Message[] = [];
+    // Images returned by tools go in a user message of their own after the round's tool results
+    let toolImages: ContentBlock[] = [];
+    let toolImagesTimestamp: string | undefined;
+    const flushToolImages = () => {
+      if (toolImages.length === 0) return;
+      messages.push({ role: 'user', content: toolImages, timestamp: toolImagesTimestamp });
+      toolImages = [];
+    };
 
     for (const rec of records) {
       const rtype = rec.type as string;
@@ -522,6 +584,9 @@ export class CodexAdapter extends AgentAdapter {
 
       const payload = (rec.payload as Record<string, unknown>) ?? {};
       const ptype = payload.type as string;
+      // Only items that start a new message end the round; ignored ones (web_search_call, developer messages) don't
+      const startsMessage = (ptype === 'message' && payload.role !== 'developer') || ptype === 'function_call' || ptype === 'custom_tool_call' || ptype === 'reasoning';
+      if (startsMessage) flushToolImages();
 
       if (ptype === 'message') {
         const role = payload.role as string;
@@ -541,7 +606,8 @@ export class CodexAdapter extends AgentAdapter {
           arguments_ = { input: payload.input };
         } else {
           try {
-            arguments_ = typeof argsRaw === 'string' ? JSON.parse(argsRaw) : (argsRaw as Record<string, unknown>) ?? {};
+            const decoded: unknown = typeof argsRaw === 'string' ? JSON.parse(argsRaw) : argsRaw ?? {};
+            arguments_ = typeof decoded === 'object' && decoded !== null && !Array.isArray(decoded) ? { ...decoded } : { _raw: String(argsRaw) };
           } catch {
             arguments_ = { _raw: String(argsRaw) };
           }
@@ -556,7 +622,20 @@ export class CodexAdapter extends AgentAdapter {
         }
       } else if (ptype === 'function_call_output' || ptype === 'custom_tool_call_output') {
         const callId = String(payload.call_id ?? '');
-        const output = String(payload.output ?? '');
+        const rawOutput = payload.output;
+        let output: string;
+        if (Array.isArray(rawOutput)) {
+          // Some tools (images, the JS REPL) return a list of content items instead of a string
+          const items = this.parseMessageContent({ content: rawOutput });
+          output = items.flatMap((b) => (b.type === 'text' ? [b.text] : [])).join('\n');
+          const images = items.filter((b) => b.type === 'image');
+          if (images.length > 0) {
+            toolImages.push(...images);
+            toolImagesTimestamp = parseCodexTimestamp(rec.timestamp);
+          }
+        } else {
+          output = String(rawOutput ?? '');
+        }
         const block: ToolResultBlock = { type: 'tool_result', callId, content: output, isError: false };
 
         if (messages.length > 0 && messages[messages.length - 1].role === 'user') {
@@ -565,16 +644,17 @@ export class CodexAdapter extends AgentAdapter {
           messages.push({ role: 'user', content: [block], timestamp: parseCodexTimestamp(rec.timestamp) });
         }
       } else if (ptype === 'reasoning') {
-        // reasoning → ThinkingBlock
-        const rawContent = payload.rawContent as Array<Record<string, unknown>> | undefined;
-        let text = '';
-        if (Array.isArray(rawContent)) {
-          for (const part of rawContent) {
-            if (part.type === 'reasoning_text') {
-              text += String(part.text ?? '');
-            }
-          }
-        }
+        // reasoning → ThinkingBlock. Codex writes the readable part to summary and may add content;
+        // rawContent is what writeSession emits.
+        const textOf = (parts: unknown, types: string[]): string[] =>
+          Array.isArray(parts)
+            ? parts
+                .filter((p) => p && typeof p === 'object' && types.includes(String((p as Record<string, unknown>).type)))
+                .map((p) => String((p as Record<string, unknown>).text ?? ''))
+            : [];
+        let text = textOf(payload.rawContent, ['reasoning_text']).join('');
+        if (!text) text = textOf(payload.content, ['reasoning_text', 'text']).join('');
+        if (!text) text = textOf(payload.summary, ['summary_text']).join('\n\n');
         const block: ThinkingBlock = { type: 'thinking', text };
 
         if (messages.length > 0 && messages[messages.length - 1].role === 'assistant') {
@@ -584,6 +664,7 @@ export class CodexAdapter extends AgentAdapter {
         }
       }
     }
+    flushToolImages();
     return messages;
   }
 
@@ -606,6 +687,16 @@ export class CodexAdapter extends AgentAdapter {
 
       if (itemType === 'input_text' || itemType === 'output_text') {
         blocks.push({ type: 'text', text });
+      } else if (itemType === 'input_image' && typeof it.image_url === 'string') {
+        // A pasted image is stored as a data: URL; anything else keeps just the pointer
+        const dataUrl = /^data:([^;,]+);base64,(.*)$/s.exec(it.image_url);
+        const mimeType = dataUrl?.[1] ?? 'image/png';
+        blocks.push({
+          type: 'image',
+          mimeType,
+          ...(dataUrl ? { data: dataUrl[2] } : { filePath: it.image_url }),
+          label: `image.${mimeType.split('/')[1] ?? 'png'}`,
+        });
       }
     }
     return blocks;
@@ -1001,8 +1092,11 @@ export class CodexAdapter extends AgentAdapter {
         };
       }
       case 'image': {
-        // rollout messages only support text: degrade the image to a placeholder (counted degraded)
-        const contentType = role === 'user' ? 'input_text' : 'output_text';
+        // Codex keeps user images inline as input_image data: URLs; without data, or in an
+        // assistant message, degrade to a placeholder (counted degraded)
+        const content = role === 'user' && block.data
+          ? [{ type: 'input_image', image_url: `data:${block.mimeType};base64,${block.data}` }]
+          : [{ type: role === 'user' ? 'input_text' : 'output_text', text: imagePlaceholderText(block) }];
         return {
           timestamp: ts,
           type: 'response_item',
@@ -1010,7 +1104,7 @@ export class CodexAdapter extends AgentAdapter {
             type: 'message',
             id: `msg_${generateUuidV7()}`,
             role,
-            content: [{ type: contentType, text: imagePlaceholderText(block) }],
+            content,
           },
         };
       }

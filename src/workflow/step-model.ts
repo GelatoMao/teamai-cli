@@ -5,13 +5,20 @@
  * gets it on argv, and so does OpenCode with the variant: OpenCode 2 reads neither from the agent file, and OpenCode 1
  * does not start a subagent, which is how pull deploys OpenCode agents.
  */
-import { isModelAlias, loadModelAliases, resolveModelValue, TEAM_ALIASES_FILE, type ResolutionStep } from '../models/aliases.js';
-import { toolExtrasFor, type AgentSpec } from '../resources/agent-format.js';
-import type { LocalConfig } from '../types.js';
-import { localToolFamily, type LocalToolRun, type LocalWorkflowTool } from './local-tool-adapter.js';
+import path from 'node:path';
+import { installOf, locate, ownOf } from '../locate.js';
+import { isModelAlias, loadModelAliases, noModelCause, noModelReason, resolveModelValue, type NoModel } from '../models/aliases.js';
+import {
+  agentFileExtensionForTool, reverseByTool, toolExtrasFor, type AgentSpec, type ToolName,
+} from '../resources/agent-format.js';
+import { isAgentToolId } from '../tools.js';
+import type { LocalConfig, TeamaiConfig } from '../types.js';
+import { isLaunchTool, launchAdapterIdOf } from '../tool-launch/tools.js';
+import { readFileSafe } from '../utils/fs.js';
 import type { WorkflowFailure } from './types.js';
 
-export type StepModel = NonNullable<LocalToolRun['model']>;
+/** The model a prompt step's tool runs on, with the reasoning effort it takes. */
+export type StepModel = { name: string; effort?: string };
 
 /**
  * The model and effort the launch passes, none when it passes none, or why the step cannot run. `by` says whether the
@@ -26,7 +33,8 @@ export type StepModelChoice =
 export interface StepModelRequest {
   /** The step path the lease names, such as `check.classify`. */
   step: string;
-  tool: LocalWorkflowTool;
+  /** The tool the step runs on: a launch tool, or the coding session's own for a child it starts. */
+  tool: ToolName;
   /** The lease's `model`, as written. */
   model?: string;
   /** The lease's `defaultModel`, as written. */
@@ -37,70 +45,55 @@ export interface StepModelRequest {
   config: LocalConfig;
 }
 
-type ModelOrigin = 'step' | 'defaults';
+export type ModelOrigin = 'step' | 'defaults';
 
-/** Why a value gives the tool no model: no entry for it, the member's `~` or `default`, a model switch, or an error. */
-type NoModel = 'unmapped' | 'local' | 'switched' | 'unresolved';
-
-interface NoModelContext {
-  step: string;
-  /** `model alias "fast"`, or `model "fast"` when it cannot be told to be an alias. */
-  value: string;
-  tool: string;
-  source: string;
-  reason: string;
-}
-
-const NO_MODEL: Record<NoModel, Record<ModelOrigin, (at: NoModelContext) => string>> = {
-  unmapped: {
-    step: (at) => `Step "${at.step}" asks for ${at.value}, which has no model for ${at.tool} in ${at.source}. Add one or remove model from the step.`,
-    defaults: (at) => `Step "${at.step}" gets ${at.value} from defaults, which has no model for ${at.tool} in ${at.source}. Add one, or set model on the step.`,
-  },
-  local: {
-    step: (at) => `Step "${at.step}" asks for ${at.value}, which ${at.source} turns off for ${at.tool}. Remove that entry or remove model from the step.`,
-    defaults: (at) => `Step "${at.step}" gets ${at.value} from defaults, which ${at.source} turns off for ${at.tool}. Remove that entry, or set model on the step.`,
-  },
-  switched: {
-    step: (at) => `Step "${at.step}" asks for ${at.value}, which gives no model for ${at.tool} while teamai models switch points ${at.tool} at a model profile. `
-      + 'Run teamai models restore, or remove model from the step.',
-    defaults: (at) => `Step "${at.step}" gets ${at.value} from defaults, which gives no model for ${at.tool} while teamai models switch points ${at.tool} at a model profile. `
-      + 'Run teamai models restore, or set model on the step.',
-  },
-  unresolved: {
-    step: (at) => `Step "${at.step}" asks for ${at.value}, which cannot be resolved for ${at.tool}: ${at.reason}. Fix that, or remove model from the step.`,
-    defaults: (at) => `Step "${at.step}" gets ${at.value} from defaults, which cannot be resolved for ${at.tool}: ${at.reason}. Fix that, or set model on the step.`,
-  },
+/** What the member can do about a step model that gives the tool no model. */
+const NO_MODEL_FIX: Record<NoModel, Record<ModelOrigin, string>> = {
+  unmapped: { step: 'Add one or remove model from the step.', defaults: 'Add one, or set model on the step.' },
+  local: { step: 'Remove that entry or remove model from the step.', defaults: 'Remove that entry, or set model on the step.' },
+  switched: { step: 'Run teamai models restore, or remove model from the step.', defaults: 'Run teamai models restore, or set model on the step.' },
+  unresolved: { step: 'Fix that, or remove model from the step.', defaults: 'Fix that, or set model on the step.' },
 };
 
-/** Why a resolution step gives no model. The only other one that can is `default`: the alias does not map the tool. */
-const NO_MODEL_STEPS: Partial<Record<ResolutionStep, NoModel>> = { local: 'local', switched: 'switched' };
+/**
+ * Why a step cannot run the model it asks for, or gets from `defaults`: `value` is `model alias "fast"` or `model "x"`,
+ * `cause` the `noModelCause` of its resolution.
+ */
+export function stepModelUnavailableText(step: string, origin: ModelOrigin, value: string, cause: string, reason: NoModel): string {
+  const asks = origin === 'step' ? `asks for ${value}` : `gets ${value} from defaults`;
+  return `Step "${step}" ${asks}, which ${cause}. ${NO_MODEL_FIX[reason][origin]}`;
+}
 
 function unavailable(message: string): StepModelChoice {
   return { ok: false, failure: { code: 'model_unavailable', message } };
 }
 
+/** The model the definition sets for `tool`. agy's own model reads back into `tool_extras.agy`, never the team's `model`. */
+function definitionModel(agent: AgentSpec | undefined, tool: ToolName): string | undefined {
+  if (agent === undefined) return undefined;
+  const own = tool === 'agy' ? toolExtrasFor(agent, 'agy')?.['model'] : undefined;
+  return typeof own === 'string' ? own : agent.model;
+}
+
 export async function chooseStepModel(request: StepModelRequest): Promise<StepModelChoice> {
   const { step, tool, agent } = request;
+  const defined = definitionModel(agent, tool);
   const chosen: { origin: ModelOrigin; value: string } | undefined = request.model !== undefined
     ? { origin: 'step', value: request.model }
-    : agent?.model === undefined && request.defaultModel !== undefined ? { origin: 'defaults', value: request.defaultModel } : undefined;
+    : defined === undefined && request.defaultModel !== undefined ? { origin: 'defaults', value: request.defaultModel } : undefined;
   if (!chosen) {
-    const family = localToolFamily(tool);
-    if (!agent?.model || family === 'claude') return { ok: true };
+    // A tool teamai does not launch starts the agent itself, from the file it reads the model from.
+    const family = isLaunchTool(tool) ? launchAdapterIdOf(tool) : undefined;
+    // Claude and CodeBuddy read it from the agent file `--agent` names.
+    if (!agent || !defined || family === undefined || family === 'claude' || family === 'codebuddy') return { ok: true };
     const variant = family === 'opencode' ? toolExtrasFor(agent, 'opencode')?.['variant'] : undefined;
-    return { ok: true, by: 'definition', model: { name: agent.model, ...(variant !== undefined ? { effort: String(variant) } : {}) } };
+    return { ok: true, by: 'definition', model: { name: defined, ...(variant !== undefined ? { effort: String(variant) } : {}) } };
   }
   const aliases = await loadModelAliases(request.config);
   const resolution = resolveModelValue(aliases, chosen.value, tool);
   if (!resolution.ok || resolution.model === undefined) {
-    const why = resolution.ok ? NO_MODEL_STEPS[resolution.step] ?? 'unmapped' : 'unresolved';
-    return unavailable(NO_MODEL[why][chosen.origin]({
-      step,
-      value: isModelAlias(aliases, chosen.value) ? `model alias "${chosen.value}"` : `model "${chosen.value}"`,
-      tool,
-      source: (resolution.ok && resolution.source) || TEAM_ALIASES_FILE,
-      reason: resolution.ok ? '' : resolution.reason,
-    }));
+    const value = isModelAlias(aliases, chosen.value) ? `model alias "${chosen.value}"` : `model "${chosen.value}"`;
+    return unavailable(stepModelUnavailableText(step, chosen.origin, value, noModelCause(resolution, tool), noModelReason(resolution)));
   }
   return {
     ok: true,
@@ -108,4 +101,27 @@ export async function chooseStepModel(request: StepModelRequest): Promise<StepMo
     model: { name: resolution.model, ...(resolution.effort !== undefined ? { effort: resolution.effort } : {}) },
     ...(isModelAlias(aliases, chosen.value) ? { alias: chosen.value } : {}),
   };
+}
+
+/**
+ * The agent `name` as `teamai pull` deployed it for `tool` in `config`'s scope, and the file it was read from, which is
+ * the key its pull recorded it under. Null when it is not deployed, cannot be read, or `tool` is one teamai does not
+ * launch, whose agent files it does not read back.
+ */
+export async function loadDeployedAgent(input: {
+  tool: string;
+  name: string;
+  config: LocalConfig;
+  toolPaths: TeamaiConfig['toolPaths'] | undefined;
+}): Promise<{ spec: AgentSpec; file: string } | null> {
+  const { tool, name, config, toolPaths } = input;
+  if (toolPaths === undefined || !isLaunchTool(tool) || !isAgentToolId(tool)) return null;
+  // The same directory `teamai pull` writes, not the step's cwd.
+  const agents = ownOf(await locate(tool, 'agents', installOf({ toolPaths }, config)))?.path;
+  if (agents === undefined) return null;
+  const file = path.join(agents, `${name}${agentFileExtensionForTool(tool)}`);
+  const content = await readFileSafe(file);
+  if (content === null) return null;
+  const reversed = reverseByTool(tool, file, content);
+  return reversed.ok ? { spec: reversed.spec, file } : null;
 }

@@ -35,13 +35,15 @@ teamai mcp remove --dry-run # preview removal without changing tool configs or m
 teamai mcp remove      # remove teamai-managed MCP servers
 ```
 
+`mcp inject` and `mcp remove` return exit code 1 if a tool config cannot be read or parsed, including in a dry run. Other tools may still change. Fix the config named in the warning and rerun the command; the unreadable config and its ownership records are kept for that retry.
+
 MCP definitions travel with the team repo like skills/rules — edit, then the
 members pick them up on sync.
 
 A server with a `${VAR}` the tool cannot expand itself gets the resolved value
 written into its project config (`.mcp.json`, `.cursor/mcp.json`, ...). With
 `sharing.gitExclude` on, Claude's (not in a single-repo team, whose worktrees
-each read their own branch's servers) and CodeBuddy's servers go to their local
+each read their own branch's servers) and CodeBuddy's and WorkBuddy's servers go to their local
 scopes in `~/.claude.json` and `.codebuddy.json` instead, outside the project,
 and the next pull (on an HTTP-backed team, the local agent's next sync) moves
 teamai's servers out of `.mcp.json`. Before
@@ -84,9 +86,19 @@ server with any header, env value, argument or URL (only a bare stdio command is
 `teamai uninstall` takes that line out. The next sync or `teamai pull` in the
 workspace also lists a file an older local agent wrote a credential into; `teamai doctor` checks those files too.
 
+ZCode servers use `mcp.servers` in `~/.zcode/cli/config.json` or the project's `.zcode/config.json`. This follows the 3.16.2 source; 3.15.1 is not certified. Pull moves only unchanged teamai entries out of `~/.agents/mcp.json`. Doctor names other servers there because the desktop app stops reading that fallback once the native config has servers.
+
+Antigravity takes user servers in `~/.gemini/config/mcp_config.json`. It reads a project's servers only from a plugin, so teamai writes them to `.agents/plugins/teamai/mcp_config.json` with a `plugin.json` (`{"name": "teamai"}`) beside it. agy takes stdio and HTTP servers; pull skips an `sse` server for agy with a warning. `agy mcp list` shows only the user file's servers.
+
+WorkBuddy uses the first existing user file in `~/.workbuddy/.mcp.json`, `~/.workbuddy/mcp.json`, and `~/.codebuddy.json`. `CODEBUDDY_CONFIG_DIR` moves the last file. A project uses `.mcp.json`, or `mcp.json` when only that exists. With `sharing.gitExclude` on, its servers use `projects[<project path>].mcpServers` in `.codebuddy.json`. These paths follow the CodeBuddy 2.168.0 engine; WorkBuddy's launcher binding is not certified. Pull removes only unchanged teamai entries from the former `.workbuddy/mcp.json` project file.
+
+When `.workbuddy-ai/` exists in the home or project (WorkBuddy 5.7+), the default skills path moves to `.workbuddy-ai/skills`. Every other surface still waits for `.workbuddy/`, so a member with only `.workbuddy-ai/` gets no rules, team instructions, agents, MCP servers or hooks, and `teamai doctor` fails `workbuddy receives ...` with the ones held.
+
+When a tool's home or configured MCP path moves, pull leaves old copies in place and names them once. Remove them after no tool reads them. Doctor reports unread mappings, moved files, and project MCP that is read only from a session started at the project root. Internal builds with an unknown MCP channel get a note instead of a guessed config.
+
 ### Pi MCP delivery
 
-Pi 0.99.0+ receives stdio and streamable HTTP servers through the existing MCP commands and `teamai pull`; SSE is skipped. User scope writes `~/.pi/agent/mcp.json`, workspace scope writes `.pi/mcp.json` (Pi requires project trust). TeamAI keeps Pi's default codemode exposure and converts timeout milliseconds to seconds. Relocated Pi agent directories (`PI_CODING_AGENT_DIR` / `PI_CONFIG_DIR`) are unsupported. Local exposure/enabled edits on managed servers survive until the team definition changes; doctor reports differences from the team entry. Extensions that replace `/mcp` must be removed to use Pi's built-in MCP.
+Pi 0.99.0+ receives stdio and streamable HTTP servers through the existing MCP commands and `teamai pull`; SSE is skipped. User scope writes `~/.pi/agent/mcp.json`, workspace scope writes `.pi/mcp.json` (Pi requires project trust). TeamAI keeps Pi's default codemode exposure and converts timeout milliseconds to seconds. User MCP follows `PI_CODING_AGENT_DIR`. Project MCP is read only from a session started at the project root. Local exposure/enabled edits on managed servers survive until the team definition changes; doctor reports differences from the team entry. Extensions that replace `/mcp` must be removed to use Pi's built-in MCP.
 
 ## Invite a member
 
@@ -121,6 +133,14 @@ teamai roles remove <id>     # remove a role
 
 After editing roles, `teamai push` to publish the manifest. Members re-sync on
 their next session.
+
+To assign roles in the team repo instead of letting each member pick one, add
+`manifest/members.yaml` (`members: { alice: [frontend] }`, `default: []` for
+members it does not list). While it exists, `teamai roles set` is refused and
+an unlisted member receives shared resources only. Who may edit the file is the
+forge's decision (protected branch, code owners for `manifest/`); teamai keeps
+no access list. Details: docs/guide/distribution.md, "Assigning roles in the
+team repo".
 
 ## Projects (manage several projects from one repo)
 
@@ -162,7 +182,7 @@ for the real reset fallback. Removal refuses when that refresh also fails.
 
 Every namespace that names a directory — `knowledge`, `skills`, `agents`, `env`,
 `hooks`, `mcp`, `models`, `docs` and `wiki` in either manifest, and `learnings` in `projects.yaml` (a role's `learnings:` is
-ignored and unchecked) — must be a single path segment: no `/`, `\`, `:` or control character, no trailing
+not checked) — must be a single path segment: no `/`, `\`, `:` or control character, no trailing
 `.` or space, and not a Windows device name (`CON`, `NUL`, `COM1`, …). `team-codebase`
 cannot be a `docs` namespace (`docs/team-codebase/` is the legacy codebase output). Two
 namespaces of one resource type may not differ only by case, across both
@@ -183,8 +203,13 @@ agent name in two namespaces one member has active is an error naming both
 files; two namespace rules or claudemd files of one name are both delivered.
 A replacement must be usable to replace anything: a skill directory needs its
 `SKILL.md` (pull names one without it), and while an agent file does not parse
-the root agent stays installed. `teamai doctor` lists each replacement as a note. Teams without roles or
-projects are unaffected.
+the root agent stays installed. `teamai doctor` lists each replacement as a note.
+
+A member with no role or project (on a team without `manifest/projects.yaml`)
+gets every skill namespace, so nothing replaces anything: the root skill wins
+over a namespace skill of its name, then the namespace that sorts first, and
+`pull` names each copy it skipped and the role that would deliver it
+(`docs/guide/distribution.md`, "One skill name in the root and in namespaces").
 
 Docs have no override. A top-level `docs/<ns>/` that any role or project lists
 under `resources.docs` reaches only members with that namespace active; a
@@ -196,17 +221,18 @@ same filter.
 Wiki codebase slugs follow the same rule under `resources.wiki`: once any role
 or project lists a `teamwiki/evidence/code/<slug>/` slug there, `recall` only
 surfaces it for members with that namespace active; an undeclared slug stays
-shared. The slug is whatever `teamai codebase --project <slug>` wrote, not
+shared. The slug is the `project:` value that `teamai import` prints, not
 necessarily the project's manifest id.
 
 ## Keep delivered files out of git
 
 With `sharing.gitExclude.enabled: true` in `teamai.yaml`, each member's pull lists
 the skills and rules (one file per line, never a skill's directory, so a file a
-member adds to a delivered skill stays visible), agents, `teamai-context` files, hook
-files and team docs (one file per line) it delivered into a project, and each shared
-config file (MCP, `.codex/hooks.json`, OpenCode's) while it holds only teamai's entries,
-in teamai's `delivered` block in the clone's
+member adds to a delivered skill stays visible), agents, `teamai-context`
+files, hook files and team docs (one file per line) it delivered into a project,
+and each shared config file (MCP, `.codex/hooks.json`, OpenCode's) and `CLAUDE.md`
+instruction files (including `.claude-internal/CLAUDE.md` and `.tclaude/CLAUDE.md`)
+while it holds only teamai's entries, in teamai's `delivered` block in the clone's
 `.git/info/exclude` (local to the clone, never committed), so `git add -A` does
 not commit them; a member's own files, and copies they edited, stay visible. `init` writes it for a
 new team; an existing team adds the line and commits it through the normal
@@ -223,7 +249,7 @@ teamai dashboard             # start the AI coding session dashboard (default po
 teamai dashboard --port 8080 # custom port
 ```
 
-Opens a local web UI for team coding-session activity and knowledge-base health.
+Opens a local web UI for team coding-session activity, workflow runs, scorer pass rates, and knowledge-base health.
 
 ## Team packages (npm + Claude plugins)
 
@@ -311,9 +337,10 @@ has no session-start hook, they run `teamai pull` manually.
 Turning a tricky fix into team knowledge is **automatic** once recall is on for
 the team (`sharing.recall.enabled: true` in `teamai.yaml`, then `teamai push`; it is
 off by default, and `teamai recall enable` turns it on for one machine only): at the end of a session
-worth sharing, TeamAI prompts the member and the dedicated
-`share` workflow (`teamai skill get share`) summarizes the session and runs
-`teamai contribute`. Nobody has to invoke it by hand. (A member whose teamai config
+worth sharing, TeamAI prompts the member and offers the `teamai-share-learnings` workflow:
+its learning step runs the `share` skill (`teamai skill get share`) to summarize the
+session, and its contribute step runs `teamai contribute` for each learning. A team file
+`workflows/teamai-share-learnings.yaml` replaces teamai's default. Nobody has to invoke it by hand. (A member whose teamai config
 cannot be loaded gets no prompt; `teamai skill get share` names the file and the error.)
 
 Teams that work in English set `language: en` in `teamai.yaml` and `teamai push`.

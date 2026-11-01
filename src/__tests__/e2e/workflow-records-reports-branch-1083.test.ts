@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,10 +8,12 @@ import { getCurrentVersion } from '../../package-info.js';
 import type { LocalConfig, TeamaiConfig } from '../../types.js';
 import { syncWorkflowDefinitions } from '../../workflow/cache.js';
 import { startRun } from '../../workflow/engine.js';
-import { localDriver, runLocalDriver } from '../../workflow/local-driver.js';
-import { createLocalToolAdapter, type ToolSpawn } from '../../workflow/local-tool-adapter.js';
+import { runLocalDriver } from '../../workflow/drivers/local/local-driver.js';
+import { driverIdentity } from '../../driver-identity.js';
+import { createLocalToolAdapter, type ToolSpawn } from '../../workflow/drivers/local/local-tool-adapter.js';
 import { pendingRecords } from '../../workflow/records.js';
 import { fakeClaude, recordDelivery } from '../helpers/delivered-checkout.js';
+import { knownSecrets } from '../../env-resolution.js';
 
 // #1083 end-to-end: a real git clone with a real bare origin, driven through
 // the engine the CLI uses. The run record and the workflow stats totals must
@@ -78,6 +81,8 @@ describe('#1083 workflow run records reach the reports branch', () => {
     };
 
     const rev = git(repo, 'rev-parse', '--short', 'HEAD').trim();
+    const teamRevision = git(repo, 'rev-parse', 'HEAD').trim();
+    const sourceHash = createHash('sha256').update(TWO_STEPS).digest('hex');
     const agentFile = path.join(os.homedir(), '.claude', 'agents', 'reviewer.md');
     await fs.mkdir(path.dirname(agentFile), { recursive: true });
     await fs.writeFile(agentFile, '---\nname: reviewer\ndescription: Reviews builds.\nmodel: claude-opus-4-1\n---\nReview carefully.\n');
@@ -96,7 +101,7 @@ describe('#1083 workflow run records reach the reports branch', () => {
     const claude: ToolSpawn = (_command, _args, options) => spawn(process.execPath, ['-e', `process.stdout.write(${JSON.stringify(stream)})`], options);
 
     await syncWorkflowDefinitions(config);
-    const started = await startRun(config, 'build', {}, { driver: localDriver(work) });
+    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config), driver: driverIdentity('local', work) });
     expect(started).toMatchObject({ data: { status: 'running', record: 'published' } });
     const runId = String((started as { data: { run: string } }).data.run);
 
@@ -108,6 +113,12 @@ describe('#1083 workflow run records reach the reports branch', () => {
     expect(startRecord.phase).toBe('start');
     expect(startRecord.status).toBe('running');
     expect(startRecord.username).toBe('alice');
+    expect(startRecord.sourceHash).toBe(sourceHash);
+    expect(startRecord.teamRevision).toBe(teamRevision);
+    git(sandbox, 'clone', 'origin.git', 'fresh');
+    const fresh = path.join(sandbox, 'fresh');
+    expect(() => git(fresh, 'cat-file', '-e', teamRevision)).not.toThrow();
+    expect(git(fresh, 'show', `${teamRevision}:workflows/build.yaml`)).toBe(TWO_STEPS);
 
     const done = await runLocalDriver(config, runId, work, {
       tools: { default: 'claude' },
@@ -121,19 +132,22 @@ describe('#1083 workflow run records reach the reports branch', () => {
     const endRecord = JSON.parse(endRaw) as Record<string, unknown>;
     expect(endRecord.phase).toBe('end');
     expect(endRecord.status).toBe('succeeded');
+    expect(endRecord.sourceHash).toBe(sourceHash);
+    expect(endRecord.teamRevision).toBe(teamRevision);
     expect(endRecord.stepCounts).toEqual({ total: 3, succeeded: 3, failed: 0, skipped: 0, cancelled: 0 });
     expect(endRecord.steps).toEqual([
-      { step: 'one', pass: 1, outcome: 'success' },
-      { step: 'two', pass: 1, outcome: 'success' },
+      { step: 'one', pass: 1, runMode: 'attended', outcome: 'success' },
+      { step: 'two', pass: 1, runMode: 'attended', outcome: 'success' },
       {
         step: 'review',
         pass: 1,
+        runMode: 'attended',
         agent: {
           v: 1,
           definition: { name: 'reviewer', applied: 'main' },
           tool: { name: 'claude', version: '2.1.301' },
           model: { requested: 'claude-opus-4-1', reported: 'claude-opus-4-1-20250805' },
-          team: { revision: git(repo, 'rev-parse', rev).trim(), localChanges: false },
+          team: { revision: git(repo, 'rev-parse', rev).trim(), localChanges: false, selection: { scope: 'user', additionalRoles: [] } },
           teamai: getCurrentVersion(),
           driver: 'local',
           fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),

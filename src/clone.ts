@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 
 import fs from 'fs-extra';
 
@@ -8,6 +9,7 @@ import { getGitCodeToken } from './providers/gitcode/gitcode-api.js';
 import { tgitGitCloneUrl } from './providers/tgit/rest-auth.js';
 import { log } from './utils/logger.js';
 import { sanitizeGitUrl } from './utils/redact.js';
+import { assertSafeRepoCachePath } from './utils/repo-cache.js';
 
 // ─── Types ──────────────────────────────────────────────
 
@@ -97,9 +99,12 @@ function runCommand(
 
         let stdout = '';
         let stderr = '';
+        // Same split-chunk UTF-8 handling as execCommand in utils/exec.ts.
+        const stdoutDecoder = new StringDecoder('utf8');
+        const stderrDecoder = new StringDecoder('utf8');
 
-        child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
-        child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+        child.stdout.on('data', (chunk: Buffer) => { stdout += stdoutDecoder.write(chunk); });
+        child.stderr.on('data', (chunk: Buffer) => { stderr += stderrDecoder.write(chunk); });
 
         const timer = setTimeout(() => {
             child.kill();
@@ -108,7 +113,11 @@ function runCommand(
 
         child.on('close', (code) => {
             clearTimeout(timer);
-            resolve({ stdout, stderr, code: code ?? 1 });
+            resolve({
+                stdout: stdout + stdoutDecoder.end(),
+                stderr: stderr + stderrDecoder.end(),
+                code: code ?? 1,
+            });
         });
 
         child.on('error', (err) => {
@@ -223,6 +232,11 @@ function resolveCloneAuth(
 
 // ─── Public API ─────────────────────────────────────────
 
+async function removeCachedClone(localPath: string): Promise<void> {
+    assertSafeRepoCachePath(localPath);
+    await fs.remove(localPath);
+}
+
 /**
  * Shallow clone 远端仓库到指定本地目录。
  *
@@ -248,9 +262,7 @@ export async function shallowClone(
     const timeoutMs = opts?.timeoutMs ?? 180_000;
 
     // 清理已存在目录
-    if (await fs.pathExists(localPath)) {
-        await fs.remove(localPath);
-    }
+    await removeCachedClone(localPath);
     await fs.ensureDir(localPath);
 
     const { cloneUrl, cloneMethod, extraAuthHeader } = resolveCloneAuth(url, provider, { forceSsh, forceAnonymous });
@@ -272,14 +284,14 @@ export async function shallowClone(
         const { code, stderr } = await runCommand('git', cloneArgs, { timeoutMs });
         if (code !== 0) {
             // 清理失败的目录
-            await fs.remove(localPath).catch(() => undefined);
+            await removeCachedClone(localPath).catch(() => undefined);
             throw new Error(`git clone failed (exit ${code}): ${redactToken(stderr.trim())}`);
         }
     } catch (err) {
         if (err instanceof Error && err.message.startsWith('git clone failed')) {
             throw err;
         }
-        await fs.remove(localPath).catch(() => undefined);
+        await removeCachedClone(localPath).catch(() => undefined);
         throw err;
     }
 
@@ -335,6 +347,7 @@ export async function shallowFetch(
     opts?: { timeoutMs?: number; provider?: string },
 ): Promise<{ sha: string }> {
     const timeoutMs = opts?.timeoutMs ?? 180_000;
+    assertSafeRepoCachePath(localPath);
 
     // 获取当前分支
     const branch = await gitCmd(['rev-parse', '--abbrev-ref', 'HEAD'], localPath, timeoutMs);
@@ -345,6 +358,7 @@ export async function shallowFetch(
         ? ['-c', `http.extraHeader=${authHeader}`, 'fetch', '--depth=50', 'origin']
         : ['fetch', '--depth=50', 'origin'];
     await gitCmd(fetchArgs, localPath, timeoutMs);
+    assertSafeRepoCachePath(localPath);
     await gitCmd(['reset', '--hard', `origin/${branch}`], localPath, timeoutMs);
 
     const sha = await gitCmd(['rev-parse', 'HEAD'], localPath);

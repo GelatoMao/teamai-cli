@@ -1,5 +1,6 @@
 import path from 'node:path';
 import type { LocalConfig, TeamaiConfig, State } from './types.js';
+import { isCodexTool } from './utils/tool-names.js';
 import {
   DEFAULT_CODEX_ROOT,
   cursorConfigDir,
@@ -53,13 +54,12 @@ import { log } from './utils/logger.js';
 //                    see cursorConfigDir. Known upstream bug: the local executor may
 //                    ignore this, so treat it as best-effort.
 
-const CODEX_TOOLS = new Set(['codex', 'codex-internal', 'tcodex']);
 const CURSOR_TOOLS = new Set(['cursor']);
 
 type Family = 'claude' | 'codex' | 'cursor';
 
 function familyOf(tool: string): Family {
-  if (CODEX_TOOLS.has(tool)) return 'codex';
+  if (isCodexTool(tool)) return 'codex';
   return CURSOR_TOOLS.has(tool) ? 'cursor' : 'claude';
 }
 
@@ -74,6 +74,8 @@ export interface CoAuthorChange {
    */
   action: 'updated' | 'removed' | 'moved' | 'skipped';
   reason?: string;
+  /** A skip because the write threw, so the file does not hold the intent. */
+  failed?: true;
 }
 
 export interface CoAuthorReconcileResult {
@@ -107,10 +109,10 @@ async function resolveTargets(
   for (const [tool, paths] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
     if (disabled.has(tool)) continue;
     if (whitelist && !whitelist.includes(tool)) continue;
-    // ZCode and Muse Code expose no documented attribution setting — writing
-    // one into their shared config file would be an unknown key the tool never
-    // reads.
-    if (tool === 'zcode' || tool === 'muse') continue;
+    // ZCode, Muse Code and Antigravity CLI expose no documented attribution
+    // setting — writing one into their shared config file would be an unknown
+    // key the tool never reads.
+    if (tool === 'zcode' || tool === 'muse' || tool === 'agy') continue;
     const family = familyOf(tool);
 
     // Installation probe: the tool's root dir (parent of its resource dir), same
@@ -422,7 +424,7 @@ export async function coAuthorLocalSettingsFile(
   const settings = scopedToolPaths(teamConfig, localConfig).claude?.settings;
   if (localConfig.scope !== 'project' || !settings) return { kind: 'none' };
   const file = path.join(resolveBaseDir(localConfig), path.dirname(settings), 'settings.local.json');
-  if (managed[file] !== false) return { kind: 'none' };
+  if (managed[file] ?? true) return { kind: 'none' };
   const read = await readJsonObject(file);
   if (read.kind === 'invalid') return { kind: 'unreadable', file };
   const attribution = read.kind === 'ok' ? read.value.attribution : undefined;
@@ -461,7 +463,7 @@ export async function reconcileCoAuthorForConfig(
       : undefined;
     if (intent === undefined && !moveTo) continue;
     const recorded = managed[file];
-    const wroteStrip = recorded === false;
+    const wroteStrip = !recorded && recorded !== undefined;
     delete managed[file];
     try {
       const next = wroteStrip ? await withoutPreFixAttribution(file) : { kind: 'none' as const };
@@ -477,7 +479,7 @@ export async function reconcileCoAuthorForConfig(
       changes.push({ tool, file, enabled: false, action: moveTo ? 'moved' : 'removed' });
     } catch (e) {
       managed[file] = recorded;
-      changes.push({ tool, file, enabled: false, action: 'skipped', reason: (e as Error).message });
+      changes.push({ tool, file, enabled: false, action: 'skipped', reason: (e as Error).message, failed: true });
     }
   }
 
@@ -508,7 +510,7 @@ export async function reconcileCoAuthorForConfig(
         reason: changed ? undefined : 'already up-to-date',
       });
     } catch (e) {
-      changes.push({ tool: t.tool, file: t.file, enabled: intent, action: 'skipped', reason: (e as Error).message });
+      changes.push({ tool: t.tool, file: t.file, enabled: intent, action: 'skipped', reason: (e as Error).message, failed: true });
     }
   }
 

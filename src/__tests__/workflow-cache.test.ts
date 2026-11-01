@@ -1,13 +1,15 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { LocalConfig } from '../types.js';
-import { loadCachedWorkflow, syncWorkflowDefinitions } from '../workflow/cache.js';
+import { formatUnknownScorer, loadCachedWorkflow, syncWorkflowDefinitions } from '../workflow/cache.js';
 import type { SyncWorkflowResult } from '../workflow/cache.js';
 import { formatDiagnostic } from '../workflow/parse.js';
 import { leaseNext, startRun } from '../workflow/engine.js';
 import { readRun } from '../workflow/store.js';
+import { knownSecrets } from '../env-resolution.js';
 
 const dirs: string[] = [];
 
@@ -57,11 +59,299 @@ steps:
     command: node compile.js
 `;
 
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+}
+
+function initializeTeamRepository(config: LocalConfig): { commit(message: string): string; push(): void } {
+  const repository = config.repo.localPath;
+  const remote = path.join(path.dirname(repository), 'remote.git');
+  git(path.dirname(repository), 'init', '--bare', '--initial-branch=main', remote);
+  git(repository, 'init', '--initial-branch=main');
+  git(repository, 'config', 'user.name', 'TeamAI Test');
+  git(repository, 'config', 'user.email', 'teamai@example.test');
+  git(repository, 'remote', 'add', 'origin', remote);
+  return {
+    commit(message: string): string {
+      git(repository, 'add', '.');
+      git(repository, 'commit', '--allow-empty', '-m', message);
+      return git(repository, 'rev-parse', 'HEAD');
+    },
+    push(): void {
+      git(repository, 'push', '--set-upstream', 'origin', 'main');
+    },
+  };
+}
+
 afterEach(() => {
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 describe('workflow cache', () => {
+  it('stores the team revision when the knowledge path is a symlink alias', async () => {
+    const directConfig = testConfig();
+    const linkedKnowledge = path.join(path.dirname(directConfig.repo.localPath), 'knowledge-link');
+    fs.symlinkSync(directConfig.repo.localPath, linkedKnowledge, 'dir');
+    const config: LocalConfig = {
+      ...directConfig,
+      repo: { ...directConfig.repo, localPath: linkedKnowledge },
+    };
+    const repository = initializeTeamRepository(config);
+    writeWorkflow(config, 'build', VALID);
+    const revision = repository.commit('add workflow through linked path');
+    repository.push();
+
+    await syncWorkflowDefinitions(config);
+
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBe(revision);
+  });
+
+  it('stores only a remote-reachable commit that holds the cached workflow bytes', async () => {
+    const config = testConfig();
+    const repository = initializeTeamRepository(config);
+    writeWorkflow(config, 'build', VALID);
+    const firstRevision = repository.commit('add workflow');
+    repository.push();
+
+    await syncWorkflowDefinitions(config);
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBe(firstRevision);
+
+    writeWorkflow(config, 'build', `${VALID}\n# local edit\n`);
+    await syncWorkflowDefinitions(config);
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBeUndefined();
+
+    const localRevision = repository.commit('edit workflow locally');
+    await syncWorkflowDefinitions(config);
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBeUndefined();
+
+    repository.push();
+    await syncWorkflowDefinitions(config);
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBe(localRevision);
+  });
+
+  it('keeps a verified revision when an unrelated unpushed commit moves HEAD', async () => {
+    const config = testConfig();
+    const repository = initializeTeamRepository(config);
+    writeWorkflow(config, 'build', VALID);
+    const pushed = repository.commit('add workflow');
+    repository.push();
+    await syncWorkflowDefinitions(config);
+
+    fs.writeFileSync(path.join(config.repo.localPath, 'README.md'), 'unrelated\n');
+    repository.commit('unrelated local commit');
+    await syncWorkflowDefinitions(config);
+
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBe(pushed);
+    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
+    if ('error' in started) throw new Error(started.error.message);
+    const run = await readRun(config, String(started.data.run));
+    if (typeof run === 'string') throw new Error(`Could not read run: ${run}`);
+    expect(run.teamRevision).toBe(pushed);
+  });
+
+  it('drops an unchanged workflow revision that the team remote no longer reaches', async () => {
+    const config = testConfig();
+    const repository = initializeTeamRepository(config);
+    writeWorkflow(config, 'build', VALID);
+    const pushed = repository.commit('add workflow');
+    repository.push();
+    await syncWorkflowDefinitions(config);
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBe(pushed);
+
+    const tree = git(config.repo.localPath, 'write-tree');
+    const rewritten = git(config.repo.localPath, 'commit-tree', tree, '-m', 'rewrite team history');
+    git(config.repo.localPath, 'checkout', '-B', 'main', rewritten);
+    git(config.repo.localPath, 'push', '--force', '--set-upstream', 'origin', 'main');
+    fs.writeFileSync(path.join(config.repo.localPath, 'README.md'), 'unrelated\n');
+    repository.commit('unrelated local commit');
+    await syncWorkflowDefinitions(config);
+
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBeUndefined();
+  });
+
+  it('omits the team revision for an untracked workflow at a remote-reachable commit', async () => {
+    const config = testConfig();
+    const repository = initializeTeamRepository(config);
+    const trackedName = 'tracked';
+    fs.writeFileSync(path.join(config.repo.localPath, 'README.md'), '# Team\n');
+    writeWorkflow(config, trackedName, VALID.replace('name: build', `name: ${trackedName}`));
+    const teamRevision = repository.commit('initialize team');
+    repository.push();
+    await syncWorkflowDefinitions(config);
+    expect((await loadCachedWorkflow(config, trackedName))?.teamRevision).toBe(teamRevision);
+
+    writeWorkflow(config, 'build', VALID);
+
+    await syncWorkflowDefinitions(config);
+
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBeUndefined();
+  });
+
+  it('omits a commit pushed only to a remote other than the team origin', async () => {
+    const config = testConfig();
+    const repository = initializeTeamRepository(config);
+    writeWorkflow(config, 'build', VALID);
+    const teamRevision = repository.commit('add workflow');
+    repository.push();
+    await syncWorkflowDefinitions(config);
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBe(teamRevision);
+
+    writeWorkflow(config, 'build', `${VALID}\n# personal revision\n`);
+    const personalRevision = repository.commit('edit workflow on personal remote');
+    const personal = path.join(path.dirname(config.repo.localPath), 'personal.git');
+    git(path.dirname(config.repo.localPath), 'init', '--bare', '--initial-branch=main', personal);
+    git(config.repo.localPath, 'remote', 'add', 'personal', personal);
+    git(config.repo.localPath, 'push', '--set-upstream', 'personal', 'main');
+
+    await syncWorkflowDefinitions(config);
+
+    expect(git(config.repo.localPath, 'rev-parse', 'HEAD')).toBe(personalRevision);
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBeUndefined();
+  });
+
+  it('omits the team revision when a prompt file differs from the remote-reachable commit', async () => {
+    const config = testConfig();
+    const repository = initializeTeamRepository(config);
+    fs.mkdirSync(path.join(config.repo.localPath, 'prompts'));
+    fs.writeFileSync(path.join(config.repo.localPath, 'prompts', 'review.md'), 'Review carefully.\n');
+    writeWorkflow(config, 'build', `schemaVersion: v1alpha1
+name: build
+description: Review the build.
+steps:
+  - id: review
+    prompt_file: prompts/review.md
+`);
+    const revision = repository.commit('add prompt workflow');
+    repository.push();
+
+    await syncWorkflowDefinitions(config);
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBe(revision);
+
+    fs.writeFileSync(path.join(config.repo.localPath, 'prompts', 'review.md'), 'Review the local edit.\n');
+    await syncWorkflowDefinitions(config);
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBeUndefined();
+  });
+
+  it('publishes no run team revision when a kept parent and current child came from different commits', async () => {
+    const config = testConfig();
+    const repository = initializeTeamRepository(config);
+    writeWorkflow(config, 'build', `schemaVersion: v1alpha1
+name: build
+description: Build with a child.
+steps:
+  - id: check
+    workflow: check
+`);
+    writeWorkflow(config, 'check', `schemaVersion: v1alpha1
+name: check
+description: Check the build.
+steps:
+  - id: test
+    command: npm test
+`);
+    const firstRevision = repository.commit('add workflows');
+    repository.push();
+    await syncWorkflowDefinitions(config);
+
+    const first = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
+    if ('error' in first) throw new Error(first.error.message);
+    const firstRun = await readRun(config, String(first.data.run));
+    if (typeof firstRun === 'string') throw new Error(`Could not read first run: ${firstRun}`);
+    expect(firstRun.teamRevision).toBe(firstRevision);
+
+    writeWorkflow(config, 'build', `schemaVersion: v1alpha1
+name: build
+description: ''
+steps:
+  - id: check
+    workflow: check
+`);
+    writeWorkflow(config, 'check', `schemaVersion: v1alpha1
+name: check
+description: Check the build again.
+steps:
+  - id: test
+    command: npm test
+`);
+    repository.commit('change child and break parent');
+    repository.push();
+    await syncWorkflowDefinitions(config);
+
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBe(firstRevision);
+    const currentChildRevision = (await loadCachedWorkflow(config, 'check'))?.teamRevision;
+    expect(currentChildRevision).toBeDefined();
+    expect(currentChildRevision).not.toBe(firstRevision);
+
+    const mixed = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
+    if ('error' in mixed) throw new Error(mixed.error.message);
+    const mixedRun = await readRun(config, String(mixed.data.run));
+    if (typeof mixedRun === 'string') throw new Error(`Could not read mixed run: ${mixedRun}`);
+    expect(mixedRun.teamRevision).toBeUndefined();
+  });
+
+  it('records the earlier team revision on a run of a kept workflow', async () => {
+    const config = testConfig();
+    const repository = initializeTeamRepository(config);
+    writeWorkflow(config, 'build', VALID);
+    const pushed = repository.commit('add workflow');
+    repository.push();
+    await syncWorkflowDefinitions(config);
+
+    writeWorkflow(config, 'build', 'schemaVersion: [\n');
+    repository.commit('break workflow');
+    repository.push();
+    expect((await syncWorkflowDefinitions(config)).kept).toEqual(['build']);
+
+    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
+    if ('error' in started) throw new Error(started.error.message);
+    const run = await readRun(config, String(started.data.run));
+    if (typeof run === 'string') throw new Error(`Could not read run: ${run}`);
+    expect(run.teamRevision).toBe(pushed);
+  });
+
+  it('clears a kept workflow revision that the team remote no longer reaches', async () => {
+    const config = testConfig();
+    const repository = initializeTeamRepository(config);
+    writeWorkflow(config, 'build', VALID);
+    repository.commit('add workflow');
+    repository.push();
+    await syncWorkflowDefinitions(config);
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBeDefined();
+
+    writeWorkflow(config, 'build', 'schemaVersion: [\n');
+    git(config.repo.localPath, 'add', '.');
+    const tree = git(config.repo.localPath, 'write-tree');
+    const rewritten = git(config.repo.localPath, 'commit-tree', tree, '-m', 'rewrite team history');
+    git(config.repo.localPath, 'checkout', '-B', 'main', rewritten);
+    git(config.repo.localPath, 'push', '--force', '--set-upstream', 'origin', 'main');
+
+    const synced = await syncWorkflowDefinitions(config);
+    const kept = await loadCachedWorkflow(config, 'build');
+
+    expect(synced.kept).toEqual(['build']);
+    expect(kept?.definition.description).toBe('Compile the project.');
+    expect(kept?.teamRevision).toBeUndefined();
+  });
+
+  it('clears an unreadable kept workflow revision', async () => {
+    const config = testConfig();
+    const repository = initializeTeamRepository(config);
+    writeWorkflow(config, 'build', VALID);
+    repository.commit('add workflow');
+    repository.push();
+    await syncWorkflowDefinitions(config);
+    const [cacheFile] = cacheFiles(config);
+    const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8')) as Record<string, unknown>;
+    cached.teamRevision = 'not-a-commit';
+    fs.writeFileSync(cacheFile, `${JSON.stringify(cached)}\n`);
+    writeWorkflow(config, 'build', 'schemaVersion: [\n');
+
+    const synced = await syncWorkflowDefinitions(config);
+
+    expect(synced.kept).toEqual(['build']);
+    expect((await loadCachedWorkflow(config, 'build'))?.teamRevision).toBeUndefined();
+  });
+
   it.each([
     ['fan-out pass outputs', "steps.build.passes[0].outputs.ok", '    output: { ok: boolean }\n'],
     ['fan-out pass outputs without an output schema', "steps.build.passes[0].outputs.ok", ''],
@@ -200,7 +490,7 @@ steps:
     const first = await loadCachedWorkflow(config, 'build');
     expect(first?.definition.steps[0]).toMatchObject({ promptFile: 'prompts/review.md', prompt: 'first prompt' });
 
-    const started = await startRun(config, 'build');
+    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
     if ('error' in started) throw new Error(started.error.message);
     fs.writeFileSync(promptFile, 'second prompt');
     const changed = await syncWorkflowDefinitions(config);
@@ -216,6 +506,29 @@ steps:
     const invalid = await syncWorkflowDefinitions(config);
     expect(invalid.kept).toEqual(['build']);
     expect((await loadCachedWorkflow(config, 'build'))?.definition.steps[0]?.prompt).toBe('second prompt');
+  });
+
+  it('resolves an already namespace-qualified prompt path as written', async () => {
+    const config = testConfig();
+    // Two active namespaces, and prompts/dev/ops/note.md exists — the shape that
+    // used to make an explicit prompts/ops/note.md load the wrong file: the path
+    // was prefixed with every active namespace, and prompts/dev/ops/note.md won.
+    fs.mkdirSync(path.join(config.repo.localPath, 'prompts', 'ops'), { recursive: true });
+    fs.mkdirSync(path.join(config.repo.localPath, 'prompts', 'dev', 'ops'), { recursive: true });
+    fs.writeFileSync(path.join(config.repo.localPath, 'prompts', 'ops', 'note.md'), 'ops prompt');
+    fs.writeFileSync(path.join(config.repo.localPath, 'prompts', 'dev', 'ops', 'note.md'), 'dev prompt');
+    writeWorkflow(config, 'build', `schemaVersion: v1alpha1
+name: build
+description: Review the project.
+steps:
+  - id: review
+    prompt_file: prompts/ops/note.md
+`);
+
+    await syncWorkflowDefinitions(config);
+
+    const cached = await loadCachedWorkflow(config, 'build');
+    expect(cached?.definition.steps[0]).toMatchObject({ prompt: 'ops prompt' });
   });
 
   it('rejects symlinked prompt files that escape the team repo', async () => {
@@ -274,9 +587,9 @@ steps:
     expect(result.cached).toEqual(['build']);
     expect(result.unrunnable).toEqual(['workflows/broken.yaml']);
     expect(result.invalid.some((diagnostic) => diagnostic.file === 'workflows/broken.yaml' && diagnostic.line > 0)).toBe(true);
-    const started = await startRun(config, 'broken');
+    const started = await startRun(config, 'broken', {}, { secrets: await knownSecrets(config) });
     expect(started).toMatchObject({ error: { code: 'workflow_not_found' } });
-    const runnable = await startRun(config, 'build');
+    const runnable = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
     expect(runnable).toMatchObject({ data: { name: 'build', status: 'running' } });
   });
 
@@ -284,7 +597,7 @@ steps:
     const config = testConfig();
     writeWorkflow(config, 'build', VALID);
     await syncWorkflowDefinitions(config);
-    const first = await startRun(config, 'build');
+    const first = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
     if ('error' in first) throw new Error(first.error.message);
     const before = await readRun(config, String(first.data.run));
     if (typeof before !== 'object') throw new Error('run was not stored');
@@ -295,7 +608,7 @@ steps:
     expect(again.kept).toEqual(['build']);
     expect(again.cached).not.toContain('build');
     expect(again.invalid[0]).toMatchObject({ file: 'workflows/build.yaml', field: '(document)' });
-    const second = await startRun(config, 'build');
+    const second = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
     if ('error' in second) throw new Error(second.error.message);
     const after = await readRun(config, String(second.data.run));
     if (typeof after !== 'object') throw new Error('run was not stored');
@@ -313,7 +626,7 @@ steps:
 
     await syncWorkflowDefinitions(config, { dryRun: true });
 
-    const started = await startRun(config, 'build');
+    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
     expect(started).toMatchObject({ data: { name: 'build', status: 'running' } });
   });
 
@@ -330,7 +643,7 @@ steps:
 
     expect(result.cached).toEqual([]);
     expect(cachedText(config)).not.toContain('outside-dir.js');
-    const started = await startRun(config, 'build');
+    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
     expect(started).toMatchObject({ error: { code: 'workflow_not_found' } });
   });
 
@@ -345,8 +658,8 @@ steps:
 
     const result = await syncWorkflowDefinitions(config);
 
-    expect(result).toEqual({ cached: [], kept: [], invalid: [], unrunnable: [] });
-    expect(await startRun(config, 'build')).toMatchObject({ error: { code: 'workflow_not_found' } });
+    expect(result).toEqual({ cached: [], kept: [], invalid: [], unrunnable: [], scorers: { cached: [], invalid: [], verified: [] }, unknownScorers: [], aliasConflicts: [] });
+    expect(await startRun(config, 'build', {}, { secrets: await knownSecrets(config) })).toMatchObject({ error: { code: 'workflow_not_found' } });
   });
 
   it('does not read or cache a symlinked yaml outside workflows', async () => {
@@ -362,7 +675,7 @@ steps:
     expect(result.invalid).toEqual([]);
     expect(result.unrunnable).toEqual([]);
     expect(cachedText(config)).not.toContain('outside-only.js');
-    const started = await startRun(config, 'build');
+    const started = await startRun(config, 'build', {}, { secrets: await knownSecrets(config) });
     expect(started).toMatchObject({ error: { code: 'workflow_not_found' } });
   });
 
@@ -372,13 +685,13 @@ steps:
     await syncWorkflowDefinitions(config);
     expect(await loadCachedWorkflow(config, 'build')).not.toBeNull();
 
-    writeWorkflow(config, 'build', VALID.replace('command: node compile.js', 'command: node compile.js\n    timeout: 10m'));
+    writeWorkflow(config, 'build', VALID.replace('command: node compile.js', 'command: node compile.js\n    future_option: 10m'));
     const synced = await syncWorkflowDefinitions(config);
 
     expect(synced.unrunnable).toContain('workflows/build.yaml');
     expect(synced.kept).not.toContain('build');
     expect(await loadCachedWorkflow(config, 'build')).toBeNull();
-    expect(await startRun(config, 'build')).toMatchObject({ error: { code: 'workflow_not_found' } });
+    expect(await startRun(config, 'build', {}, { secrets: await knownSecrets(config) })).toMatchObject({ error: { code: 'workflow_not_found' } });
   });
 
   it('keeps each self-mode checkout on its own cache', async () => {
@@ -406,7 +719,7 @@ steps:
     await syncWorkflowDefinitions(first);
     await syncWorkflowDefinitions(second);
 
-    const started = await startRun(first, 'build');
+    const started = await startRun(first, 'build', {}, { secrets: await knownSecrets(first) });
     if ('error' in started) throw new Error(started.error.message);
     const leased = await leaseNext(first, String(started.data.run), { kind: 'local', machine: 'test', workspace: '/work' });
     expect(leased).toMatchObject({ data: { lease: { command: 'echo main-command' } } });
@@ -414,14 +727,14 @@ steps:
     writeWorkflow(first, 'build', 'schemaVersion: [\n');
     const kept = await syncWorkflowDefinitions(first);
     expect(kept.kept).toEqual(['build']);
-    const afterInvalid = await startRun(first, 'build');
+    const afterInvalid = await startRun(first, 'build', {}, { secrets: await knownSecrets(first) });
     if ('error' in afterInvalid) throw new Error(afterInvalid.error.message);
     const stillFirst = await leaseNext(first, String(afterInvalid.data.run), { kind: 'local', machine: 'test', workspace: '/work' });
     expect(stillFirst).toMatchObject({ data: { lease: { command: 'echo main-command' } } });
 
     fs.rmSync(path.join(second.repo.localPath, 'workflows', 'build.yaml'));
     await syncWorkflowDefinitions(second);
-    const afterDelete = await startRun(first, 'build');
+    const afterDelete = await startRun(first, 'build', {}, { secrets: await knownSecrets(first) });
     expect(afterDelete).toMatchObject({ data: { name: 'build', status: 'running' } });
   });
 
@@ -540,7 +853,7 @@ steps:
     expect(result.invalid).toEqual([expect.objectContaining({ code: 'missing_needs', field: 'steps[1].needs' })]);
     expect(result.unrunnable).toEqual(['workflows/build.yaml']);
     expect(result.kept).toEqual([]);
-    expect(await startRun(config, 'build')).toMatchObject({ error: { code: 'workflow_not_found' } });
+    expect(await startRun(config, 'build', {}, { secrets: await knownSecrets(config) })).toMatchObject({ error: { code: 'workflow_not_found' } });
   });
 
   it('reports only the broken step when a step numbered 10 or higher is valid', async () => {
@@ -676,7 +989,7 @@ steps:
     const result = await syncWorkflowDefinitions(config);
 
     expect(result.invalid.map(formatDiagnostic)).toEqual([
-      'workflows/build.yaml:9: field "steps[0].output": step "stop" has no action, so it carries only id, needs, if, and end',
+      'workflows/build.yaml:9: field "steps[0].output": step "stop" has no action, so it carries only id, needs, if, end, approve, choose, loop, and break',
     ]);
   });
 
@@ -831,7 +1144,7 @@ steps:
     ]);
     expect(result.unrunnable).toEqual(['workflows/build.yaml']);
     expect(result.kept).toEqual([]);
-    expect(await startRun(config, 'build')).toMatchObject({ error: { code: 'workflow_not_found' } });
+    expect(await startRun(config, 'build', {}, { secrets: await knownSecrets(config) })).toMatchObject({ error: { code: 'workflow_not_found' } });
   });
 
   it('reports a template in a command and points to env', async () => {
@@ -1002,12 +1315,12 @@ steps:
     const result = await syncWorkflowDefinitions(config);
 
     expect(result.invalid.map(formatDiagnostic)).toEqual([
-      'workflows/review.yaml:12: field "steps[1].prompt_file": step "review" prompt_file template {{ length(steps.build.result) }}: "steps.build.result" must read steps.<id>.outcome, steps.<id>.end, steps.<id>.outputs, steps.<id>.passes or steps.<id>.results',
+      'workflows/review.yaml:12: field "steps[1].prompt_file": step "review" prompt_file template {{ length(steps.build.result) }}: "steps.build.result" must read steps.<id>.outcome, steps.<id>.end, steps.<id>.choice, steps.<id>.note, steps.<id>.outputs, steps.<id>.passes, steps.<id>.results or steps.<id>.branches',
     ]);
     expect(result.invalid.map((diagnostic) => diagnostic.code)).toEqual(['bad_template']);
     expect(result.unrunnable).toEqual(['workflows/review.yaml']);
     expect(result.kept).toEqual([]);
-    expect(await startRun(config, 'review', { targets: [] })).toMatchObject({ error: { code: 'workflow_not_found' } });
+    expect(await startRun(config, 'review', { targets: [] }, { secrets: await knownSecrets(config) })).toMatchObject({ error: { code: 'workflow_not_found' } });
   });
 
   it('reports a bad template in prompt_file text and drops the version that rendered it as text', async () => {
@@ -1038,7 +1351,7 @@ steps:
     expect(result.invalid[0]?.code).toBe('bad_template');
     expect(result.unrunnable).toEqual(['workflows/build.yaml']);
     expect(result.kept).toEqual([]);
-    expect(await startRun(config, 'build')).toMatchObject({ error: { code: 'workflow_not_found' } });
+    expect(await startRun(config, 'build', {}, { secrets: await knownSecrets(config) })).toMatchObject({ error: { code: 'workflow_not_found' } });
   });
 
   it('lets a prompt_file read item where a for_each binds it, and keeps item as written elsewhere', async () => {
@@ -1140,7 +1453,7 @@ steps:
     ]);
     expect(result.invalid[0]?.code).toBe('bad_template');
     expect(result.unrunnable).toEqual(['workflows/build.yaml']);
-    expect(await startRun(config, 'build')).toMatchObject({ error: { code: 'workflow_not_found' } });
+    expect(await startRun(config, 'build', {}, { secrets: await knownSecrets(config) })).toMatchObject({ error: { code: 'workflow_not_found' } });
   });
 
   it('reports an if that reads an input the workflow does not declare', async () => {
@@ -1194,7 +1507,7 @@ steps:
     ]);
     expect(result.invalid.map((diagnostic) => diagnostic.code)).toEqual(['dotted_name', 'dotted_name', 'dotted_name']);
     expect(result.kept).toEqual([]);
-    expect(await startRun(config, 'build')).toMatchObject({ error: { code: 'workflow_not_found' } });
+    expect(await startRun(config, 'build', {}, { secrets: await knownSecrets(config) })).toMatchObject({ error: { code: 'workflow_not_found' } });
   });
 
   it('reads env numbers and booleans as text and reports a value that is not a scalar', async () => {
@@ -1497,7 +1810,7 @@ steps:
 async function syncAndStart(config: LocalConfig): Promise<SyncWorkflowResult> {
   const result = await syncWorkflowDefinitions(config);
   for (const name of [...result.cached, ...result.kept]) {
-    expect(await startRun(config, name), name).not.toMatchObject({ error: { code: expect.stringMatching(/^workflow_(recursion|not_found)$/) } });
+    expect(await startRun(config, name, {}, { secrets: await knownSecrets(config) }), name).not.toMatchObject({ error: { code: expect.stringMatching(/^workflow_(recursion|not_found)$/) } });
   }
   return result;
 }
@@ -1579,7 +1892,7 @@ steps:
     expect(second.kept).toEqual([]);
     expect(second.unrunnable).toEqual(['workflows/ship.yaml']);
     expect(second.cached).toEqual(['build']);
-    expect(await startRun(config, 'ship')).toMatchObject({ error: { code: 'workflow_not_found', message: expect.stringContaining('Workflow "ship" has no runnable version') } });
+    expect(await startRun(config, 'ship', {}, { secrets: await knownSecrets(config) })).toMatchObject({ error: { code: 'workflow_not_found', message: expect.stringContaining('Workflow "ship" has no runnable version') } });
   });
 
   it('reports a parent whose child has no runnable version because of its own references', async () => {
@@ -1765,7 +2078,7 @@ steps:
     expect(result.cached).toEqual([]);
     expect(result.kept).toEqual(['a', 'b']);
     expect(result.unrunnable).toEqual([]);
-    expect(await startRun(config, 'a')).toMatchObject({ data: { name: 'a' } });
+    expect(await startRun(config, 'a', {}, { secrets: await knownSecrets(config) })).toMatchObject({ data: { name: 'a' } });
   });
 
   describe('checks every version against the versions the other files settle to', () => {
@@ -2062,5 +2375,41 @@ steps:
       'workflows/build.yaml:14: field "steps[1].model": model is only allowed on a prompt or prompt_file step',
     ]);
     expect((await loadCachedWorkflow(config, 'build'))?.definition.steps.some((step) => step.model !== undefined)).toBe(false);
+  });
+});
+
+describe('workflow cache: scorers a step lists', () => {
+  const SCORER = '---\nlabels:\n  - { value: good, score: 1, description: Good. }\n  - { value: bad, score: 0, description: Bad. }\npassingScore: 1\n---\nJudge.\n';
+  const SCORED = `schemaVersion: v1alpha1
+name: ship
+description: Ship it.
+steps:
+  - id: plan
+    prompt: Plan it.
+    scorers: [quality, nope]
+  - id: check
+    needs: [plan]
+    workflow:
+      steps:
+        - id: review
+          prompt: Review it.
+          scorers: { names: [broken], batch: true }
+`;
+
+  it('caches a workflow that lists an unknown or invalid scorer, and names each one so the step runs without it', async () => {
+    const config = testConfig();
+    fs.mkdirSync(path.join(config.repo.localPath, 'scorers'));
+    fs.writeFileSync(path.join(config.repo.localPath, 'scorers', 'quality.md'), SCORER);
+    fs.writeFileSync(path.join(config.repo.localPath, 'scorers', 'broken.md'), '---\npassingScore: 1\n---\nJudge.\n');
+    writeWorkflow(config, 'ship', SCORED);
+
+    const result = await syncWorkflowDefinitions(config);
+
+    expect(result.cached).toEqual(['ship']);
+    expect(result.invalid).toEqual([]);
+    expect(result.unknownScorers.map(formatUnknownScorer)).toEqual([
+      'workflows/ship.yaml: step "plan" lists scorer "nope", which has no valid scorers/nope.md; the step runs without it',
+      'workflows/ship.yaml: step "check.review" lists scorer "broken", which has no valid scorers/broken.md; the step runs without it',
+    ]);
   });
 });

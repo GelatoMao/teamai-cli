@@ -43,6 +43,12 @@ const TRAILING_DOT_OR_SPACE = /[ .]$/;
 // accepted, and narrowing it would break manifests that parse today.
 const WINDOWS_DEVICE_NAME = /^(con|conin\$|conout\$|prn|aux|nul|(com|lpt)[1-9\u00b9\u00b2\u00b3])(\.|$)/i;
 
+/**
+ * A manifest this CLI reads from `manifest/`. Names the file in every error a
+ * manifest read or parse produces, so one spelling serves all of them.
+ */
+export type ManifestKind = 'projects' | 'roles' | 'members';
+
 /** True if `seg` is safe to use as a single path segment (no separators, no `..`). */
 export function isSafeNamespaceSegment(seg: string): boolean {
   return seg.length > 0
@@ -58,9 +64,9 @@ export const NAMESPACE_RULE = "resource namespace must be a single path segment 
  * message quotes the value (JSON-escaped, so a control character shows): the
  * issue path names the entry, but an admin fixing it looks for the text.
  */
-export const NamespaceSegmentSchema = z.string().min(1).refine(isSafeNamespaceSegment, (value) => ({
-  message: `${NAMESPACE_RULE}; got ${JSON.stringify(value)}`,
-}));
+export const NamespaceSegmentSchema = z.string().min(1).refine(isSafeNamespaceSegment, {
+  error: (issue) => `${NAMESPACE_RULE}; got ${JSON.stringify(issue.input)}`,
+});
 
 /**
  * The `resources:` types an admin declares by hand (#707): `roles add` and
@@ -71,7 +77,17 @@ export const NamespaceSegmentSchema = z.string().min(1).refine(isSafeNamespaceSe
  * writes back carries one only when an admin declared it. A new type is one
  * entry here plus one line in the shape below.
  */
-export const HAND_DECLARED_RESOURCE_TYPES = ['env', 'hooks', 'mcp', 'models', 'docs', 'wiki'] as const;
+export const HAND_DECLARED_RESOURCE_TYPES = [
+  'env',
+  'hooks',
+  'mcp',
+  'models',
+  'docs',
+  'wiki',
+  'workflows',
+  'prompts',
+  'scorers',
+] as const;
 
 export type HandDeclaredResourceType = typeof HAND_DECLARED_RESOURCE_TYPES[number];
 
@@ -87,9 +103,7 @@ export const RESERVED_DOCS_DIR = 'team-codebase';
 
 const DocsNamespaceList = z.array(NamespaceSegmentSchema.refine(
   (value) => caseFoldKey(value) !== RESERVED_DOCS_DIR,
-  (value) => ({
-    message: `"${value}" cannot be a docs namespace: docs/${RESERVED_DOCS_DIR}/ is reserved for the legacy codebase output. Pick another name and move its directory`,
-  }),
+  { error: (issue) => `"${String(issue.input)}" cannot be a docs namespace: docs/${RESERVED_DOCS_DIR}/ is reserved for the legacy codebase output. Pick another name and move its directory` },
 )).optional();
 
 /** Spread into the roles and projects `resources:` schemas. */
@@ -105,6 +119,9 @@ export const HandDeclaredNamespacesShape = {
   // project id — a team picks one it already uses so declaring it needs no
   // new convention.
   wiki: OptionalNamespaceList,
+  workflows: OptionalNamespaceList,
+  prompts: OptionalNamespaceList,
+  scorers: OptionalNamespaceList,
 } satisfies Record<HandDeclaredResourceType, z.ZodOptional<z.ZodArray<z.ZodType<string>>>>;
 
 /**
@@ -158,7 +175,7 @@ export function fallbackNamespaceError(ids: string[], source: string): string | 
  * it do: one line naming the offending entry. A raw ZodError reaches the CLI as
  * an object dump, which tells an admin nothing about which line to edit.
  */
-export function parseManifest<S extends z.ZodTypeAny>(schema: S, raw: unknown, kind: 'projects' | 'roles'): z.infer<S> {
+export function parseManifest<S extends z.ZodType>(schema: S, raw: unknown, kind: ManifestKind): z.infer<S> {
   const parsed = schema.safeParse(raw);
   if (parsed.success) return parsed.data;
 
@@ -200,7 +217,7 @@ async function danglingLinkOnPath(target: string): Promise<string | null> {
  * then drop its filtering because the file is unreadable or empty — the fail-open
  * direction. Absence returns `null` here; anything else throws.
  */
-export async function readManifestFile(manifestPath: string, kind: 'projects' | 'roles'): Promise<string | null> {
+export async function readManifestFile(manifestPath: string, kind: ManifestKind): Promise<string | null> {
   // `repo.localPath` is documented as `~/.teamai/...`; the helpers this replaced
   // expanded it, and a path left unexpanded would be searched under the current
   // directory, read as absent, and relax the filtering.
@@ -212,14 +229,20 @@ export async function readManifestFile(manifestPath: string, kind: 'projects' | 
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       const dangling = await danglingLinkOnPath(resolvedPath);
       if (!dangling) return null;
-      throw new Error(`The ${kind} manifest ${resolvedPath} could not be read: ${dangling} is a symbolic link with no target. Point the link at the manifest file, or replace the link with the file itself.`);
+      throw new Error(`The ${kind} manifest ${resolvedPath} could not be read: ${dangling} is a symbolic link with no target. Point the link at the manifest file, or replace the link with the file itself.`, { cause: error });
     }
-    throw new Error(`The ${kind} manifest ${resolvedPath} could not be read: ${(error as Error).message}. Make it a readable file, then retry.`);
+    throw new Error(`The ${kind} manifest ${resolvedPath} could not be read: ${(error as Error).message}. Make it a readable file, then retry.`, { cause: error });
   }
-  if (content.trim() === '') {
-    throw new Error(`Invalid ${kind} manifest: ${resolvedPath} is empty. Give it a version and a ${kind} list; deleting it instead turns ${kind} filtering off for the whole team.`);
-  }
+  if (content.trim() === '') throw emptyManifestError(kind, resolvedPath);
   return content;
+}
+
+/** An empty manifest is invalid, not absent: absence is the only thing that relaxes anything. */
+export function emptyManifestError(kind: ManifestKind, where: string): Error {
+  const consequence = kind === 'members'
+    ? 'deleting it instead hands role selection back to each member'
+    : `deleting it instead turns ${kind} filtering off for the whole team`;
+  return new Error(`Invalid ${kind} manifest: ${where} is empty. Give it a version and a ${kind} list; ${consequence}.`);
 }
 
 const parsedManifests = new Map<string, { content: string; manifest: unknown }>();

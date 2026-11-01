@@ -2,16 +2,17 @@
 import fs from 'fs-extra';
 import { loadRepoList } from './repo-list/store.js';
 import { isOrgEntry, type RepoListEntry } from './repo-list/schema.js';
-import { importFromRepo } from './import-repo.js';
-import { publishTeamwikiViaMR, refreshTeamwikiIndexes } from './import-codebase.js';
+import { importFromRepo, repoSlugForUrl } from './import-repo.js';
+import { failIncompleteDeepEnrich, publishTeamwikiViaMR, refreshTeamwikiIndexes } from './import-codebase.js';
 import { log } from './utils/logger.js';
+import { DetachedTeamRepoError } from './utils/git.js';
 import { lockTeamwiki, resolveTeamwiki, type TeamwikiTarget } from './utils/teamwiki-root.js';
 
 /** importFromRepoList 入参。 */
 export interface ImportFromRepoListOptions {
     /** 白名单 yaml 路径 */
     listPath: string;
-    /** 并发数，默认 3 */
+    /** Maximum concurrent imports: a positive safe integer, default 3. */
     concurrency?: number;
     /** 强制 SSH clone */
     forceSsh?: boolean;
@@ -75,6 +76,10 @@ export async function importFromRepoList(
         maxFiles,
     } = opts;
 
+    if (!Number.isSafeInteger(concurrency) || concurrency < 1) {
+        throw new Error('--concurrency must be a positive safe integer');
+    }
+
     // 1. 加载白名单
     const repoListFile = await loadRepoList(listPath);
 
@@ -114,7 +119,7 @@ export async function importFromRepoList(
         const entryForceSsh = entry.auth === 'ssh' || forceSsh;
 
         try {
-            await importFromRepo({
+            const deepEnrichComplete = await importFromRepo({
                 url: entry.url,
                 forceSsh: entryForceSsh,
                 forceAnonymous: isPublic,
@@ -126,6 +131,12 @@ export async function importFromRepoList(
                 skipEnrich,
                 maxFiles,
             });
+            if (!deepEnrichComplete) {
+                failIncompleteDeepEnrich({
+                    slug: repoSlugForUrl(entry.url),
+                    output,
+                });
+            }
             succeeded.push(1);
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
@@ -165,6 +176,7 @@ export async function importFromRepoList(
         try {
             await publishTeamwikiViaMR(target.team, '[teamai] Batch import: graph');
         } catch (e) {
+            DetachedTeamRepoError.rethrow(e);
             log.warn(`[git] batch push failed (non-blocking): ${(e as Error).message}`);
         }
     }

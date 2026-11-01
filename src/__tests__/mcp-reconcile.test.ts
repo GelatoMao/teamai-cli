@@ -55,11 +55,15 @@ vi.mock('../utils/fs.js', async (importOriginal) => {
   };
 });
 
-import { reconcileMcpForConfig, releaseCleanMcpGitExcludes, resolveMcpTargets, spliceCodexBlock, codexServerNames, writeCodexAtomic } from '../mcp-reconcile.js';
+import { _setExcludeLockRetryMs } from '../git-exclude.js';
+import { reconcileMcpForConfig, releaseCleanMcpGitExcludes, resolveMcpTargets, spliceCodexBlock, codexBlockIn, codexServerNames, writeCodexAtomic } from '../mcp-reconcile.js';
 import { acquireLock, releaseLock } from '../update.js';
 import { log } from '../utils/logger.js';
 import { resetWarnOnce } from '../utils/warn-once.js';
 import { TeamaiConfigSchema, type TeamaiConfig, type LocalConfig } from '../types.js';
+
+// The held-lock cases here wait out the whole retry budget; none races a writer.
+_setExcludeLockRetryMs(1);
 
 const TOOL_PATHS = {
   claude: { skills: '.claude/skills', settings: '.claude/settings.json', mcp: '.claude.json', mcpProject: '.mcp.json' },
@@ -205,6 +209,7 @@ servers:
   it.each([
     ['no config.toml', null],
     ['a config.toml of the member\'s', 'model = "gpt-5"\n'],
+    ['a config.toml with a UTF-8 BOM and CRLF', '\uFEFF# member settings\r\nmodel = "gpt-5"\r\n'],
   ])('is idempotent for Codex — a second run over %s changes nothing', async (_label, initial) => {
     const configToml = path.join(homeDir, '.codex', 'config.toml');
     await fse.ensureDir(path.join(homeDir, '.codex', 'skills'));
@@ -219,6 +224,7 @@ servers:
 
     expect((await reconcileMcpForConfig(teamConfig, localConfig)).wrote).toBe(true);
     const written = await fse.readFile(configToml, 'utf-8');
+    if (initial !== null) expect(written.startsWith(initial)).toBe(true);
 
     const second = await reconcileMcpForConfig(teamConfig, localConfig);
     expect(second.changes).toEqual([]);
@@ -355,15 +361,15 @@ servers:
 `;
     await writeMcpYaml(`servers:${temp}`);
     await reconcileMcpForConfig(teamConfig, localConfig);
-    const { log } = await import('../utils/logger.js');
-    vi.mocked(log.warn).mockClear();
+    const { log: freshLog } = await import('../utils/logger.js');
+    vi.mocked(freshLog.warn).mockClear();
 
     await writeMcpYaml(`server:${temp}`);
     const { changes } = await reconcileMcpForConfig(teamConfig, localConfig);
 
     expect(changes).toEqual([]);
     expect((await fse.readJson(path.join(homeDir, '.claude.json'))).mcpServers.temp).toBeDefined();
-    const warnings = vi.mocked(log.warn).mock.calls.map(([m]) => String(m));
+    const warnings = vi.mocked(freshLog.warn).mock.calls.map(([m]) => String(m));
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain('mcp/mcp.yaml');
     expect(warnings[0]).toContain('`server`');
@@ -474,15 +480,15 @@ servers:
     transport: http
     url: https://example.com/shared
 `);
-      const { log } = await import('../utils/logger.js');
-      vi.mocked(log.warn).mockClear();
+      const { log: freshLog } = await import('../utils/logger.js');
+      vi.mocked(freshLog.warn).mockClear();
 
       await reconcileMcpForConfig(teamConfig, { ...localConfig, primaryRole: 'frontend', additionalRoles: [] });
 
       expect(Object.keys(await claudeServers())).toEqual(['shared']);
       await reconcileMcpForConfig(teamConfig, { ...localConfig, primaryRole: 'frontend', additionalRoles: [] });
 
-      const warnings = vi.mocked(log.warn).mock.calls.map(([m]) => String(m)).filter((m) => /frontned/.test(m));
+      const warnings = vi.mocked(freshLog.warn).mock.calls.map(([m]) => String(m)).filter((m) => /frontned/.test(m));
       expect(warnings).toHaveLength(1);
       expect(warnings[0]).toContain('mcp/mcp.yaml: server "typo" is scoped with per-entry `roles:`, which is deprecated');
       // No such role, so no declared namespace: the warning says what to declare.
@@ -554,15 +560,15 @@ servers:
     transport: http
     url: https://billing.example.com/orders
 `);
-      const { log } = await import('../utils/logger.js');
-      vi.mocked(log.warn).mockClear();
+      const { log: freshLog } = await import('../utils/logger.js');
+      vi.mocked(freshLog.warn).mockClear();
       resetWarnOnce();
 
       const { changes } = await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['checkout', 'billing'] });
 
       expect(changes).toEqual([]);
       expect(await claudeServers()).toEqual(before);
-      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(
+      expect(freshLog.warn).toHaveBeenCalledWith(expect.stringContaining(
         'server "orders" is defined in both mcp/checkout/mcp.yaml and mcp/billing/mcp.yaml',
       ));
     });
@@ -590,13 +596,13 @@ servers:
     transport: http
     url: https://example.com/shared-again
 `);
-      const { log } = await import('../utils/logger.js');
+      const { log: freshLog } = await import('../utils/logger.js');
       resetWarnOnce();
 
       await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['checkout'] });
 
       expect(await claudeServers()).toEqual(before);
-      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('mcp/mcp.yaml defines server "shared" more than once'));
+      expect(freshLog.warn).toHaveBeenCalledWith(expect.stringContaining('mcp/mcp.yaml defines server "shared" more than once'));
     });
 
     it('keeps a 0.25 file that repeats one server under different roles: working as 0.25 did', async () => {
@@ -630,13 +636,13 @@ servers:
     transport: http
     url: https://example.com/shared
 `);
-      const { log } = await import('../utils/logger.js');
+      const { log: freshLog } = await import('../utils/logger.js');
       resetWarnOnce();
 
       await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['billing'] });
 
       expect(Object.keys(await claudeServers()).sort()).toEqual(['shared']);
-      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(
+      expect(freshLog.warn).toHaveBeenCalledWith(expect.stringContaining(
         'mcp/mcp.yaml: server "checkout-db" is scoped with per-entry `projects:`, which this version no longer reads, '
         + 'so it reaches nobody. Move it to mcp/checkout/mcp.yaml and drop the key.',
       ));
@@ -644,8 +650,8 @@ servers:
 
     // A typo of a scoping key (#822) must not widen who gets the server.
     const warningsAbout = async (file: string, server: string): Promise<string[]> => {
-      const { log } = await import('../utils/logger.js');
-      return vi.mocked(log.warn).mock.calls.map(([m]) => String(m))
+      const { log: freshLog } = await import('../utils/logger.js');
+      return vi.mocked(freshLog.warn).mock.calls.map(([m]) => String(m))
         .filter((m) => m.includes(file) && m.includes(`"${server}"`));
     };
 
@@ -660,8 +666,8 @@ servers:
     transport: http
     url: https://example.com/shared
 `);
-      const { log } = await import('../utils/logger.js');
-      vi.mocked(log.warn).mockClear();
+      const { log: freshLog } = await import('../utils/logger.js');
+      vi.mocked(freshLog.warn).mockClear();
       resetWarnOnce();
 
       await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['billing'] });
@@ -680,8 +686,8 @@ servers:
     url: https://checkout.example.com/db
     role: [frontend]
 `);
-      const { log } = await import('../utils/logger.js');
-      vi.mocked(log.warn).mockClear();
+      const { log: freshLog } = await import('../utils/logger.js');
+      vi.mocked(freshLog.warn).mockClear();
       resetWarnOnce();
 
       await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['checkout'] });
@@ -708,8 +714,8 @@ servers:
     tools: [claude]
     roles: [frontend]
 `);
-      const { log } = await import('../utils/logger.js');
-      vi.mocked(log.warn).mockClear();
+      const { log: freshLog } = await import('../utils/logger.js');
+      vi.mocked(freshLog.warn).mockClear();
       resetWarnOnce();
 
       await reconcileMcpForConfig(teamConfig, { ...localConfig, projects: ['billing'] });
@@ -869,8 +875,7 @@ servers:
 
     const targets = await resolveMcpTargets(defaults, projectConfig);
     expect(targets.find((target) => target.tool === 'codebuddy')?.file).toBe(projectFile);
-    expect(targets.find((target) => target.tool === 'workbuddy')?.file)
-      .toBe(path.join(projectRoot, '.workbuddy', 'mcp.json'));
+    expect(targets.find((target) => target.tool === 'workbuddy')?.file).toBe(projectFile);
     const userTargets = await resolveMcpTargets(defaults, localConfig);
     expect(userTargets.find((target) => target.tool === 'codebuddy')?.file).toBe(userFile);
 
@@ -2410,6 +2415,7 @@ servers:
       beforeEach(() => {
         vi.mocked(log.info).mockClear();
         vi.mocked(log.debug).mockClear();
+        vi.mocked(log.warn).mockClear();
       });
 
       afterEach(() => {
@@ -2433,6 +2439,16 @@ servers:
         // The member never saw the line go in, so its rollback is not news.
         expect(vi.mocked(log.info).mock.calls.flat().join('\n')).not.toMatch(/Removed/);
         expect(vi.mocked(log.debug).mock.calls.flat().join('\n')).toMatch(/\/\.mcp\.json/);
+      });
+
+      it('says teamai left its MCP servers unchanged when the config does not parse', async () => {
+        await pulledBefore();
+        await fse.writeFile(mcpJson(), '{ "mcpServers": ');
+        await writeMcpYaml(withSecret);
+
+        await reconcileMcpForConfig(unmovedConfig(), claudeOnly());
+
+        expect(vi.mocked(log.warn)).toHaveBeenCalledWith(expect.stringContaining('left its MCP servers'));
       });
 
       it.each([false, true])('handles a failed ownership write after adding a credential, restoration fails=%s', async (restoreFails) => {
@@ -3768,20 +3784,29 @@ servers:
     expect(after).toContain('command = "my-mcp"');
   });
 
-  it('leaves an unparseable config file alone rather than clobbering it', async () => {
-    const claudeJson = path.join(homeDir, '.claude.json');
-    await fse.writeFile(claudeJson, '{ this is not valid json');
+  it.each([
+    ['claude', '.claude.json', '{ this is not valid json'],
+    ['codex', '.codex/config.toml', 'model = ['],
+    ['codex', '.codex/config.toml', '\uFEFFmodel = ['],
+  ])('leaves an unparseable %s config alone and reports an incomplete reconcile', async (tool, relativePath, broken) => {
+    const file = path.join(homeDir, relativePath);
+    await fse.ensureDir(path.dirname(file));
+    await fse.writeFile(file, broken);
 
     await writeMcpYaml(`
 servers:
   - name: s1
     transport: http
     url: https://example.com/mcp
-    tools: [claude]
+    tools: [${tool}]
 `);
 
-    await reconcileMcpForConfig(teamConfig, localConfig);
-    expect(await fse.readFile(claudeJson, 'utf-8')).toBe('{ this is not valid json');
+    const result = await reconcileMcpForConfig(teamConfig, localConfig);
+    expect(result.unparsed).toBe(true);
+    expect(await fse.readFile(file, 'utf-8')).toBe(broken);
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(
+      `${tool === 'codex' ? 'Could not read or parse' : 'Could not parse'} ${file}`,
+    ));
   });
 
   it('enforces the allowedHosts policy', async () => {
@@ -4138,8 +4163,8 @@ servers:
       expect({ changes, wrote, unresolved }).toEqual({ changes: [], wrote: false, unresolved: true });
       expect(await fse.readFile(claudeJson(), 'utf-8')).toBe(jsonBefore);
       expect(await fse.readFile(codexToml(), 'utf-8')).toBe(tomlBefore);
-      const { log } = await import('../utils/logger.js');
-      expect(vi.mocked(log.warn).mock.calls.map(([m]) => String(m)).join('\n')).toContain('env/secrets.yaml');
+      const { log: freshLog } = await import('../utils/logger.js');
+      expect(vi.mocked(freshLog.warn).mock.calls.map(([m]) => String(m)).join('\n')).toContain('env/secrets.yaml');
     });
 
     it('still removes a server whose missing variable is not declared as a secret', async () => {
@@ -4338,6 +4363,17 @@ servers:
 });
 
 describe('spliceCodexBlock', () => {
+  it('replaces the first MCP block in a BOM-prefixed config without adding a duplicate', () => {
+    const src = '\uFEFF[mcp_servers.a]\ncommand = "old"\n';
+
+    const out = spliceCodexBlock(src, 'a', '[mcp_servers.a]\ncommand = "new"\n');
+
+    expect(out.startsWith('\uFEFF')).toBe(true);
+    expect(out).toContain('command = "new"');
+    expect(out).not.toContain('command = "old"');
+    expect([...out.matchAll(/\[mcp_servers\.a\]/g)]).toHaveLength(1);
+  });
+
   it('replaces a block and its nested env sub-table, leaving neighbours intact', () => {
     const src = [
       '# header comment',
@@ -4367,6 +4403,50 @@ describe('spliceCodexBlock', () => {
     const src = '[mcp_servers.a]\ncommand = "x"\n\n[projects."/y"]\ntrust_level = "trusted"\n';
     const out = spliceCodexBlock(src, 'a', null);
     expect(out).not.toContain('mcp_servers.a');
+    expect(out).toContain('[projects."/y"]');
+  });
+
+  it('deletes only the server block, preserving blank lines in other TOML values', () => {
+    const before = 'developer_instructions = """first\n\n\nlast"""\n\n';
+    const after = '[projects."/y"]\ntrust_level = "trusted"\n';
+    const src = `${before}[mcp_servers.a]\ncommand = "x"\n\n${after}`;
+
+    expect(spliceCodexBlock(src, 'a', null)).toBe(before + after);
+  });
+
+  it('keeps a member comment that follows the block when deleting it', () => {
+    const src = '[mcp_servers.a]\ncommand = "x"\n\n# note: keep this\n[projects."/y"]\ntrust_level = "trusted"\n';
+    const out = spliceCodexBlock(src, 'a', null);
+    expect(out).not.toContain('mcp_servers.a');
+    expect(out).toContain('# note: keep this');
+    expect(out).toContain('[projects."/y"]');
+  });
+
+  it('keeps a member comment that follows the block when replacing it', () => {
+    const src =
+      '[mcp_servers.a]\ncommand = "old"\n\n# note: keep this\n[projects."/y"]\ntrust_level = "trusted"\n';
+    const out = spliceCodexBlock(src, 'a', '[mcp_servers.a]\ncommand = "new"\n');
+    expect(out).toContain('command = "new"');
+    expect(out).not.toContain('command = "old"');
+    expect(out).toContain('# note: keep this');
+    expect(out).toContain('[projects."/y"]');
+    expect(spliceCodexBlock(out, 'a', '[mcp_servers.a]\ncommand = "new"\n')).toBe(out);
+  });
+
+  it('drops CRLF blank lines when deleting a block before a member comment', () => {
+    const src =
+      '[mcp_servers.a]\r\ncommand = "x"\r\n\r\n# note: keep this\r\n[projects."/y"]\r\ntrust_level = "trusted"\r\n';
+    expect(spliceCodexBlock(src, 'a', null)).toBe(
+      '# note: keep this\r\n[projects."/y"]\r\ntrust_level = "trusted"\r\n',
+    );
+  });
+
+  it('removes a comment between the block own keys with the block', () => {
+    const src =
+      '[mcp_servers.a]\ncommand = "x"\n# why this command\nargs = ["--flag"]\n\n[projects."/y"]\ntrust_level = "trusted"\n';
+    const out = spliceCodexBlock(src, 'a', null);
+    expect(out).not.toContain('mcp_servers.a');
+    expect(out).not.toContain('why this command');
     expect(out).toContain('[projects."/y"]');
   });
 
@@ -4414,5 +4494,58 @@ describe('spliceCodexBlock', () => {
   it('lists existing server names', () => {
     const src = '[mcp_servers.a]\n\n[mcp_servers.b]\n\n[mcp_servers.b.env]\nX = "1"\n';
     expect(codexServerNames(src).sort()).toEqual(['a', 'b']);
+  });
+
+  it.each(['  ', '\t', ' \t'])('finds and replaces a server with leading whitespace %j', (indent) => {
+    const src = `${indent}[mcp_servers.a]\ncommand = "old"\n${indent}[mcp_servers.a.env]\nOLD = "1"\n`;
+    const block = '[mcp_servers.a]\ncommand = "new"\n';
+    expect(codexServerNames(src)).toEqual(['a']);
+    const out = spliceCodexBlock(src, 'a', block);
+    expect(out).toBe(`${block}\n`);
+    expect(spliceCodexBlock(out, 'a', block)).toBe(out);
+  });
+
+  it.each(['  ', '\t'])('preserves a following table with leading whitespace %j', (indent) => {
+    const after = `${indent}[projects."/work"]\r\ntrust_level = "trusted"\r\n`;
+    const src = `[mcp_servers.a]\r\ncommand = "old"\r\n\r\n${after}`;
+    expect(spliceCodexBlock(src, 'a', null)).toBe(after);
+    expect(spliceCodexBlock(src, 'a', '[mcp_servers.a]\ncommand = "new"\n')).toContain(after);
+  });
+
+  it.each(['', '  '])('does not treat an example with indent %j in multiline instructions as a server', (indent) => {
+    const instructions = `developer_instructions = """\nExample:\n${indent}[mcp_servers.a]\n${indent}command = "example"\n"""\n\n`;
+    const src = `${instructions}[mcp_servers.a]\ncommand = "old"\n`;
+    const block = '[mcp_servers.a]\ncommand = "new"\n';
+    expect(spliceCodexBlock(src, 'a', block)).toBe(`${instructions}${block}\n`);
+    expect(spliceCodexBlock(instructions, 'a', block)).toBe(`${instructions}${block}\n`);
+    expect(codexServerNames(instructions)).toEqual([]);
+  });
+
+  it.each(['', '  '])('does not end a server at an example with indent %j inside its multiline value', (indent) => {
+    const block = `[mcp_servers.a]\ncommand = """\nexample\n${indent}[projects.example]\n"""\n`;
+    const src = `${block}\n[projects.real]\nvalue = 1\n`;
+    expect(codexBlockIn(src, 'a')).toBe(block);
+    expect(spliceCodexBlock(src, 'a', null)).toBe('[projects.real]\nvalue = 1\n');
+  });
+
+  it('preserves an unindented example in a CRLF multiline literal string', () => {
+    const instructions = "developer_instructions = '''\r\n[mcp_servers.a]\r\ncommand = \"example\"\r\n'''\r\n\r\n";
+    const block = '[mcp_servers.a]\ncommand = "new"\n';
+    const out = spliceCodexBlock(instructions, 'a', block);
+    expect(codexServerNames(instructions)).toEqual([]);
+    expect(codexServerNames(out)).toEqual(['a']);
+    expect(spliceCodexBlock(out, 'a', null)).toBe(instructions + '\n');
+  });
+
+  it.each([
+    ['a comment after the header', '[mcp_servers.a] # mine'],
+    ['spaces inside the brackets', '[ mcp_servers.a ]'],
+    ['a quoted name', '[mcp_servers."a"]'],
+  ])('finds and replaces a header written with %s', (_label, header) => {
+    const src = `model = "gpt-5"\n\n${header}\ncommand = "old"\n`;
+    expect(codexServerNames(src)).toEqual(['a']);
+    const out = spliceCodexBlock(src, 'a', '[mcp_servers.a]\ncommand = "new"\n');
+    expect(out).not.toContain('command = "old"');
+    expect(out.match(/mcp_servers/g)).toHaveLength(1);
   });
 });

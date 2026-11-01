@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import fse from 'fs-extra';
 import os from 'node:os';
 import path from 'node:path';
@@ -18,6 +18,8 @@ vi.mock('../utils/logger.js', () => ({
     debug: vi.fn(), error: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn(), dim: vi.fn(), persist: vi.fn(),
   },
   setStderrOnly: vi.fn(),
+  isSilent: () => false,
+  setSilent: vi.fn(),
 }));
 
 import { autoDetectInit, loadLocalConfig, loadTeamConfig, requireInit } from '../config.js';
@@ -135,7 +137,7 @@ describe('a missing declared secret tells the member what to run', () => {
     await write('mcp/mcp.yaml', GITHUB_SERVER.replace('${GITHUB_TOKEN}', '${github_token}'));
     const original = process.platform;
     Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-    let spy: ReturnType<typeof vi.spyOn> | undefined;
+    let spy: MockInstance<typeof console.log> | undefined;
     try {
       await quietly(() => mcpList({}));
       expect(warned()).toContain(GITHUB_LINE);

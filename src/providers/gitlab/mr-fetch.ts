@@ -2,10 +2,14 @@ import { type MRData, type MRFetchOptions, type MRThread } from '../../types.js'
 import { log } from '../../utils/logger.js';
 import { pruneThreads } from '../mr-threads.js';
 import { getGitLabToken, gitlabBaseUrl } from './gitlab-api.js';
-import { GITLAB_HOST } from './repo-url.js';
+import { resolveGitLabHost } from './repo-url.js';
+
+const REQUEST_TIMEOUT_MS = 30_000;
+const COMMIT_PAGE_SIZE = 50;
+const MAX_COMMIT_PAGES = 100;
 
 /** GitLab MR URL 解析结果 */
-interface ParsedGitLabMR {
+export interface ParsedGitLabMR {
   /** API base derived from the MR URL's own origin, e.g. https://host/api/v4 */
   apiBase: string;
   projectPath: string;
@@ -18,8 +22,11 @@ interface ParsedGitLabMR {
  * 支持格式：https://<host>/<group>/<project>/-/merge_requests/<id>
  * group 可以是多级路径（如 group/subgroup）。
  * 解析失败时抛出 Error。
+ *
+ * Exported for the CI comment path (ci/mr-comment.ts): it needs the same
+ * host-matching guard so a crafted MR URL cannot receive the PAT.
  */
-function parseGitLabMRUrl(url: string): ParsedGitLabMR {
+export function parseGitLabMRUrl(url: string): ParsedGitLabMR {
   const match = url.match(/^(https?):\/\/([^/]+)\/(.+?)\/-\/merge_requests\/(\d+)/i);
   if (!match) {
     throw new Error(`Invalid GitLab MR URL: ${url}`);
@@ -39,7 +46,7 @@ function parseGitLabMRUrl(url: string): ParsedGitLabMR {
   if (!hostMatchesConfigured(host)) {
     throw new Error(
       `Refusing to fetch GitLab MR from "${host}": it does not match the configured ` +
-        `GitLab instance "${GITLAB_HOST}". Set GITLAB_URL / TEAMAI_GITLAB_HOST to this ` +
+        `GitLab instance "${resolveGitLabHost()}". Set GITLAB_URL / TEAMAI_GITLAB_HOST to this ` +
         `instance if it is trusted.`,
     );
   }
@@ -71,7 +78,9 @@ function normalizeHost(host: string): string {
  * as the configured GITLAB_HOST. GITLAB_HOST may itself carry a port.
  */
 function hostMatchesConfigured(urlHost: string): boolean {
-  return normalizeHost(urlHost) === normalizeHost(GITLAB_HOST);
+  // Resolved lazily so a changed GITLAB_URL / TEAMAI_GITLAB_HOST (or a test
+  // stubbing it) takes effect without re-importing this module.
+  return normalizeHost(urlHost) === normalizeHost(resolveGitLabHost());
 }
 
 /** GitLab REST API 返回的 MR 元信息（仅使用的字段） */
@@ -153,7 +162,7 @@ async function fetchGitLabDiscussions(
   for (let page = 1; page <= MAX_DISCUSSION_PAGES; page++) {
     const resp = await fetch(
       `${apiBase}/projects/${enc}/merge_requests/${mrIid}/discussions?per_page=100&page=${page}`,
-      { headers, redirect: 'manual' },
+      { headers, redirect: 'manual', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) },
     );
     if (!resp.ok) {
       throw new Error(`GitLab API error ${resp.status}`);
@@ -196,6 +205,7 @@ export async function fetchGitLabMR(url: string, opts: MRFetchOptions = {}): Pro
   const resp = await fetch(`${apiBase}/projects/${enc}/merge_requests/${mrIid}`, {
     headers,
     redirect: 'manual',
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!resp.ok) {
     throw new Error(`GitLab API error ${resp.status}: ${await resp.text()}`);
@@ -205,14 +215,25 @@ export async function fetchGitLabMR(url: string, opts: MRFetchOptions = {}): Pro
   // ── 2. 获取提交列表（失败非致命） ──────────────────────────
   let commits: Array<{ hash: string; message: string }> = [];
   try {
-    const commitsResp = await fetch(
-      `${apiBase}/projects/${enc}/merge_requests/${mrIid}/commits?per_page=50`,
-      { headers, redirect: 'manual' },
-    );
-    if (commitsResp.ok) {
+    const fetched: GitLabCommit[] = [];
+    let page = 1;
+    while (page <= MAX_COMMIT_PAGES) {
+      const suffix = page === 1 ? '' : `&page=${page}`;
+      const commitsResp = await fetch(
+        `${apiBase}/projects/${enc}/merge_requests/${mrIid}/commits?per_page=${COMMIT_PAGE_SIZE}${suffix}`,
+        { headers, redirect: 'manual', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) },
+      );
+      if (!commitsResp.ok) throw new Error(`GitLab API error ${commitsResp.status}`);
       const raw = (await commitsResp.json()) as GitLabCommit[];
-      commits = raw.map((c) => ({ hash: c.id, message: c.title }));
+      if (!Array.isArray(raw)) throw new Error('GitLab API returned no commit list');
+      fetched.push(...raw);
+      const next = commitsResp.headers.get('x-next-page');
+      if (next && Number(next) !== page + 1) throw new Error(`Invalid GitLab commit page: ${next}`);
+      if (!next && raw.length < COMMIT_PAGE_SIZE) break;
+      page++;
     }
+    if (page > MAX_COMMIT_PAGES) throw new Error('GitLab commit page limit reached');
+    commits = fetched.map((c) => ({ hash: c.id, message: c.title }));
   } catch (err) {
     log.debug(`GitLab MR commits 获取异常，commits 将为空：${(err as Error).message}`);
   }
@@ -222,7 +243,7 @@ export async function fetchGitLabMR(url: string, opts: MRFetchOptions = {}): Pro
   try {
     const diffResp = await fetch(
       `${apiBase}/projects/${enc}/merge_requests/${mrIid}/changes`,
-      { headers, redirect: 'manual' },
+      { headers, redirect: 'manual', signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) },
     );
     if (diffResp.ok) {
       const diffData = (await diffResp.json()) as GitLabChangesResponse;

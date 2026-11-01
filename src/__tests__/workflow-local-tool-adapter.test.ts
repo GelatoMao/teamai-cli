@@ -1,13 +1,14 @@
+import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
-import { createLocalToolAdapter, type ToolSpawn } from '../workflow/local-tool-adapter.js';
+import { createLocalToolAdapter, type ToolSpawn } from '../workflow/drivers/local/local-tool-adapter.js';
 
 const files: string[] = [];
 
-function child(stdout: string) {
+function child(stdout: string | Buffer[]) {
   const stdoutEmitter = new EventEmitter();
   const stderr = Object.assign(new EventEmitter(), { resume: () => undefined });
   const childProcess = new EventEmitter() as EventEmitter & { stdout: EventEmitter; stderr: EventEmitter };
@@ -15,7 +16,7 @@ function child(stdout: string) {
   childProcess.stderr = stderr;
   queueMicrotask(() => {
     childProcess.emit('spawn');
-    stdoutEmitter.emit('data', Buffer.from(stdout));
+    for (const chunk of typeof stdout === 'string' ? [Buffer.from(stdout)] : stdout) stdoutEmitter.emit('data', chunk);
     childProcess.emit('close', 0);
   });
   return childProcess;
@@ -32,6 +33,20 @@ afterEach(async () => {
 });
 
 describe('local tool adapter', () => {
+  it('preserves UTF-8 split across stdout chunks in the result and persisted fallback', async () => {
+    const resultPath = path.join(os.tmpdir(), `teamai-workflow-utf8-${Date.now()}.json`);
+    files.push(resultPath);
+    const output = { summary: '检查完成 café 😀' };
+    const bytes = Buffer.from(claudeStream('claude-sonnet', { result: JSON.stringify(output) }));
+    const chunks = Array.from(bytes, (_byte, index) => bytes.subarray(index, index + 1));
+    const adapter = createLocalToolAdapter(() => child(chunks) as ReturnType<ToolSpawn>, () => 'claude');
+
+    const result = await adapter.run('claude', { prompt: 'Review.', cwd: os.tmpdir(), resultPath });
+
+    expect(result).toMatchObject({ started: true, exitCode: 0, output });
+    expect(JSON.parse(await fs.readFile(resultPath, 'utf8'))).toEqual({ output });
+  });
+
   it('starts the resolved executable and ignores token counts written into result.json', async () => {
     const resultPath = path.join(os.tmpdir(), `teamai-workflow-result-${Date.now()}.json`);
     files.push(resultPath);
@@ -72,6 +87,62 @@ describe('local tool adapter', () => {
       output: { ok: true },
       tokens: { input: 999, output: 999 },
     });
+  });
+
+  it('runs a WorkBuddy step on CodeBuddy\'s Claude-like flags, without --effort, and reads its session and tokens', async () => {
+    const resultPath = path.join(os.tmpdir(), `teamai-workflow-codebuddy-${Date.now()}.json`);
+    files.push(resultPath);
+    const spawnTool = vi.fn(() => child(claudeStream('glm-5', { session_id: 'session-2', usage: { input_tokens: 7, output_tokens: 3 }, result: JSON.stringify({ ok: true }) }))) as unknown as ToolSpawn;
+    const adapter = createLocalToolAdapter(spawnTool, () => '/bin/workbuddy');
+
+    const result = await adapter.run('workbuddy', { prompt: 'Review.', cwd: os.tmpdir(), resultPath, model: { name: 'glm-5', effort: 'high' }, resume: 'session-1', maxTurns: 3 });
+
+    const args = vi.mocked(spawnTool).mock.calls[0]?.[1] ?? [];
+    expect(args.slice(0, 1)).toEqual(['-p']);
+    for (const [flag, value] of [['--output-format', 'stream-json'], ['--model', 'glm-5'], ['--resume', 'session-1'], ['--max-turns', '3']]) {
+      expect(args[args.indexOf(flag) + 1]).toBe(value);
+    }
+    expect(args).toContain('--verbose');
+    expect(args).not.toContain('--effort');
+    expect(result).toMatchObject({ output: { ok: true }, session: 'session-2', tokens: { input: 7, output: 3 } });
+  });
+
+  it('runs an agy step in print mode with its model, effort, agent and conversation, and reads its stream-json events', async () => {
+    const resultPath = path.join(os.tmpdir(), `teamai-workflow-agy-${Date.now()}.json`);
+    files.push(resultPath);
+    // As agy 1.4.8 prints `--output-format=stream-json`: the init event names the model, the result the conversation and usage.
+    const stdout = [
+      { event: 'init', conversation_id: 'conv-2', init: { model: 'gemini-3.8-flash-high', cwd: os.tmpdir() } },
+      { event: 'step_update', step_update: { conversation_id: 'conv-2', step_index: 3, state: 'DONE', step_type: 'agent_response', text_delta: '{"ok":true}' } },
+      { event: 'result', result: { conversation_id: 'conv-2', status: 'SUCCESS', response: '{"ok":true}', usage: { input_tokens: 15000, output_tokens: 40, cache_read_tokens: 9000 } } },
+    ].map((event) => JSON.stringify(event)).join('\n') + '\n';
+    const spawnTool = vi.fn(() => child(stdout)) as unknown as ToolSpawn;
+    const adapter = createLocalToolAdapter(spawnTool, () => '/bin/agy');
+
+    const result = await adapter.run('agy', {
+      prompt: 'Review.', cwd: os.tmpdir(), resultPath, model: { name: 'gemini-3.8-flash', effort: 'high' }, resume: 'conv-1',
+      agent: { name: 'reviewer', instructions: 'Review the change.' },
+    });
+
+    const args = vi.mocked(spawnTool).mock.calls[0]?.[1] ?? [];
+    for (const [flag, value] of [['--model', 'gemini-3.8-flash'], ['--effort', 'high'], ['--conversation', 'conv-1'], ['--agent', 'reviewer']]) {
+      expect(args[args.indexOf(flag) + 1]).toBe(value);
+    }
+    expect(args).toContain('--output-format=stream-json');
+    // `--print=` keeps the prompt attached: agy takes a bare `-p`'s next argument as the prompt even when it is a flag.
+    expect(args.at(-1)).toMatch(/^--print=Review\.\n\nWrite the workflow result as JSON to /);
+    expect(result).toMatchObject({ output: { ok: true }, model: 'gemini-3.8-flash-high', session: 'conv-2', tokens: { input: 15000, output: 40, cachedInput: 9000 } });
+  });
+
+  it('passes maxTurns to headless Claude as --max-turns', async () => {
+    const resultPath = path.join(os.tmpdir(), `teamai-workflow-turns-${Date.now()}.json`);
+    files.push(resultPath);
+    const spawnTool = vi.fn(() => child(claudeStream('claude-sonnet', { result: JSON.stringify({ ok: true }) }))) as unknown as ToolSpawn;
+    const adapter = createLocalToolAdapter(spawnTool, () => 'claude');
+
+    await adapter.run('claude', { prompt: 'Plan.', cwd: os.tmpdir(), resultPath, maxTurns: 3 });
+
+    expect(spawnTool).toHaveBeenCalledWith('claude', expect.arrayContaining(['-p', '--max-turns', '3']), expect.anything());
   });
 
   it('writes the Claude stdout fallback when the tool does not write result.json', async () => {
@@ -292,4 +363,88 @@ process.exit(1);
 
     expect(result).toMatchObject({ started: true, applied: 'main', failure: { code: 'tool_failed' } });
   });
+});
+
+describe('interactive tool invocations', () => {
+  it.each(['claude', 'codex', 'opencode', 'agy'] as const)('opens %s in the foreground with the initial prompt and optional result file', async (tool) => {
+    const resultPath = path.join(os.tmpdir(), `teamai-interactive-${tool}-${Date.now()}.json`);
+    files.push(resultPath);
+    const spawnTool = vi.fn(() => child('')) as unknown as ToolSpawn;
+    const adapter = createLocalToolAdapter(spawnTool, () => tool);
+    expect(await adapter.runInteractive(tool, { prompt: 'Work with me.', cwd: os.tmpdir(), resultPath, model: { name: 'example', effort: 'high' } })).toMatchObject({ started: true, exitCode: 0 });
+    const args = vi.mocked(spawnTool).mock.calls[0]![1];
+    expect(args).toContain('--model');
+    expect(args).toContain('example');
+    expect(args.at(-1)).toContain('Work with me.');
+    expect(args.at(-1)).toContain(resultPath);
+    expect(args).not.toContain('exec');
+    expect(args).not.toContain('-p');
+    expect(args).not.toContain('run');
+    if (tool === 'opencode') expect(args).toContain('--prompt');
+    if (tool === 'agy') expect(args).toContain('--prompt-interactive');
+    if (tool === 'codex') expect(args).toContain('model_reasoning_effort=high');
+    expect(vi.mocked(spawnTool).mock.calls[0]![2]).toMatchObject({ cwd: os.tmpdir(), stdio: 'inherit', detached: false });
+  });
+
+  it.each(['claude', 'codex'] as const)('resumes an interactive %s session', async (tool) => {
+    const resultPath = path.join(os.tmpdir(), `teamai-interactive-resume-${tool}-${Date.now()}.json`);
+    files.push(resultPath);
+    const spawnTool = vi.fn(() => child('')) as unknown as ToolSpawn;
+    const adapter = createLocalToolAdapter(spawnTool, () => tool);
+    expect(await adapter.runInteractive(tool, { prompt: 'Again.', cwd: os.tmpdir(), resultPath, resume: 'sess-1' })).toMatchObject({ started: true, exitCode: 0 });
+    const args = vi.mocked(spawnTool).mock.calls[0]![1] as string[];
+    expect(args).toContain('sess-1');
+    expect(args).toContain(tool === 'claude' ? '--resume' : 'resume');
+    expect(args).not.toContain('exec');
+    expect(args).not.toContain('-p');
+  });
+});
+
+
+it.each([undefined, 'SIGINT', 'SIGQUIT', 'SIGTERM', 'SIGHUP'])('stops a headless prompt with SIGTERM when aborted with %s', async (reason) => {
+  const resultPath = path.join(os.tmpdir(), `teamai-abort-tool-${reason}-${Date.now()}.json`);
+  files.push(resultPath);
+  const controller = new AbortController();
+  let stopped: NodeJS.Signals | null = null;
+  const spawnTool: ToolSpawn = (_command, _args, options) => {
+    const tool = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], options);
+    tool.on('spawn', () => controller.abort(reason));
+    tool.on('close', (_code, signal) => { stopped = signal; });
+    return tool;
+  };
+  const adapter = createLocalToolAdapter(spawnTool, () => process.execPath);
+  expect(await adapter.run('codex', { prompt: 'Wait.', cwd: os.tmpdir(), resultPath }, controller.signal)).toMatchObject({ started: true, exitCode: 1 });
+  expect(stopped).toBe('SIGTERM');
+});
+
+
+it('reports an interactive tool exit status without requiring a result file', async () => {
+  const resultPath = path.join(os.tmpdir(), `teamai-interactive-failure-${Date.now()}.json`);
+  files.push(resultPath);
+  const spawnTool = vi.fn(() => {
+    const tool = new EventEmitter();
+    queueMicrotask(() => { tool.emit('spawn'); tool.emit('close', 7); });
+    return tool;
+  }) as unknown as ToolSpawn;
+  const adapter = createLocalToolAdapter(spawnTool, () => 'claude');
+  expect(await adapter.runInteractive('claude', { prompt: 'Pair.', cwd: os.tmpdir(), resultPath })).toMatchObject({
+    started: true, exitCode: 7, failure: { code: 'tool_failed', message: 'claude exited with status 7' },
+  });
+});
+
+
+it.each(['SIGTERM', 'SIGHUP'] as const)('passes %s through to an attached interactive child', async (signalName) => {
+  const resultPath = path.join(os.tmpdir(), `teamai-interactive-signal-${signalName}-${Date.now()}.json`);
+  files.push(resultPath);
+  const controller = new AbortController();
+  let stopped: NodeJS.Signals | null = null;
+  const spawnTool: ToolSpawn = (_command, _args, options) => {
+    const tool = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], options);
+    tool.on('spawn', () => controller.abort(signalName));
+    tool.on('close', (_code, signal) => { stopped = signal; });
+    return tool;
+  };
+  const adapter = createLocalToolAdapter(spawnTool, () => process.execPath);
+  expect(await adapter.runInteractive('claude', { prompt: 'Wait.', cwd: os.tmpdir(), resultPath }, controller.signal)).toMatchObject({ started: true, exitCode: 1 });
+  expect(stopped).toBe(signalName);
 });

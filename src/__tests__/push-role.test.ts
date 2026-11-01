@@ -235,12 +235,14 @@ describe('push namespace routing', () => {
       availableUpdate: null,
     });
     mockSaveStateForScope.mockResolvedValue(undefined);
-    // Default manifest: role "hai" has namespaces [common, hai]
+    // Default manifest: role "hai" has namespaces [common, hai]. Every
+    // namespace a test names with --role is one a role declares (#1101).
     mockLoadRolesManifest.mockResolvedValue({
       version: 1,
       roles: [
         { id: 'hai', description: 'HyperAI', resources: { knowledge: ['common', 'hai'], skills: ['common', 'hai'], agents: [] } },
         { id: 'pm', description: 'Product Manager', resources: { knowledge: ['common', 'pm'], skills: ['common', 'pm'], agents: [] } },
+        { id: 'backend', description: 'Backend', resources: { knowledge: [], skills: ['backend'], agents: [] } },
       ],
     });
     readlineAnswer = '1';
@@ -299,8 +301,8 @@ describe('push namespace routing', () => {
     expect(askQuestion).not.toHaveBeenCalled();
     expect(pushedItems).toHaveLength(0);
     expect(process.exitCode).toBe(2);
-    const { log } = await import('../utils/logger.js');
-    const said = vi.mocked(log.error).mock.calls.flat().join(' ');
+    const { log: pushLog } = await import('../utils/logger.js');
+    const said = vi.mocked(pushLog.error).mock.calls.flat().join(' ');
     expect(said).toContain('common, hai');
     expect(said).toContain('--role <ns>');
   });
@@ -386,6 +388,32 @@ describe('push namespace routing', () => {
       expect.stringMatching(/Invalid role id used as a skills namespace "CON"/),
     );
     expect(mockPushRepoBranch).not.toHaveBeenCalled();
+  });
+
+  it('places new resources at the shared root only when explicitly requested', async () => {
+    const pushedItems: Array<Record<string, unknown>> = [];
+    mockAutoDetectInit.mockResolvedValue({ localConfig: makeLocalConfig(), teamConfig: makeTeamConfig() });
+    mockSkillHandler(pushedItems);
+    await push({ all: true, shared: true });
+    expect(pushedItems[0].namespace).toBeUndefined();
+    expect(pushedItems[0].relativePath).toBe('skills/skill-a');
+  });
+
+  it.each([{ role: 'hai' }, { project: 'svc-a' }])('rejects --shared combined with %j before touching the install', async flags => {
+    mockAutoDetectInit.mockClear();
+    await push({ all: true, shared: true, ...flags });
+    expect(process.exitCode).toBe(2);
+    expect(mockAutoDetectInit).not.toHaveBeenCalled();
+  });
+
+  it('lets the interactive namespace menu explicitly select the shared root', async () => {
+    const pushedItems: Array<Record<string, unknown>> = [];
+    mockAutoDetectInit.mockResolvedValue({ localConfig: makeLocalConfig(), teamConfig: makeTeamConfig() });
+    mockSkillHandler(pushedItems);
+    readlineAnswer = '3';
+    await push({ all: true });
+    expect(pushedItems[0].namespace).toBeUndefined();
+    expect(pushedItems[0].relativePath).toBe('skills/skill-a');
   });
 
   it('explicit --role flag bypasses namespace resolution', async () => {
@@ -526,8 +554,7 @@ describe('push namespace routing', () => {
       pushItem: vi.fn(),
     });
 
-    // --role "unknown" → used directly as namespace, no manifest validation
-    // (validation happens downstream in pushItem)
+    // --role "unknown" names no declared namespace, but nothing here needs placing.
     await push({ all: true, role: 'unknown' });
 
     // No items to push, so pushRepoBranch should not be called
@@ -1046,6 +1073,8 @@ describe('push namespace routing for rules and agents', () => {
       version: 1,
       roles: [
         { id: 'hai', description: 'HyperAI', resources: { knowledge: ['common', 'hai'], skills: ['common', 'hai'], agents: [] } },
+        // The namespaces the tests below name with --role (#1101).
+        { id: 'pm', description: 'Product Manager', resources: { knowledge: ['pm', 'fe-know'], skills: ['pm'], agents: ['pm', 'be-agents'] } },
       ],
     });
     readlineAnswer = '1';
@@ -1070,6 +1099,32 @@ describe('push namespace routing for rules and agents', () => {
     // The agent keeps the extension its handler chose.
     expect(agent?.relativePath).toBe('agents/pm/vr.yaml');
     expect(agent?.namespace).toBe('pm');
+  });
+
+  it('--role places a root scorer, and a scorer in a scorers/<dir>/ no role or project declares stays shared', async () => {
+    const pushedItems: Array<Record<string, unknown>> = [];
+    mockLoadRolesManifest.mockResolvedValue({
+      version: 1,
+      roles: [{ id: 'ops', description: '', resources: { knowledge: [], skills: [], agents: [], scorers: ['ops'] } }],
+    });
+    mockAutoDetectInit.mockResolvedValue({ localConfig: makeLocalConfig({ primaryRole: 'ops' }), teamConfig: makeTeamConfig() });
+    const scorer = (relativePath: string) => ({
+      name: relativePath.slice('scorers/'.length), type: 'scorers', sourcePath: `/tmp/${relativePath}`, relativePath, status: 'new',
+    });
+    mockGetHandler.mockImplementation((type: string) => ({
+      scanLocalForPush: vi.fn().mockResolvedValue(type === 'scorers' ? [scorer('scorers/z.md'), scorer('scorers/shared/x.md'), scorer('scorers/ops/y.md')] : []),
+      pushItem: vi.fn().mockImplementation(async (item: Record<string, unknown>) => {
+        pushedItems.push(item);
+      }),
+    }));
+
+    await push({ all: true, role: 'ops' });
+
+    expect(Object.fromEntries(pushedItems.map((item) => [item.name, item.relativePath]))).toEqual({
+      'z.md': 'scorers/ops/z.md',
+      'shared/x.md': 'scorers/shared/x.md',
+      'ops/y.md': 'scorers/ops/y.md',
+    });
   });
 
   it.each(silentPlacementCases)('$name', async ({ resource, setup, expected, error, root }) => {
@@ -1110,8 +1165,8 @@ describe('push namespace routing for rules and agents', () => {
     expect(process.exitCode).toBe(2);
     expect(pushedItems).toHaveLength(0);
     // The flag is the problem, and this push carries no skill at all.
-    const { log } = await import('../utils/logger.js');
-    expect(vi.mocked(log.error).mock.calls.flat().join(' ')).toContain('--role');
+    const { log: pushLog } = await import('../utils/logger.js');
+    expect(vi.mocked(pushLog.error).mock.calls.flat().join(' ')).toContain('--role');
   });
 
   it('--project resolves each type from its own axis, not from skills', async () => {
@@ -1155,8 +1210,8 @@ describe('push namespace routing for rules and agents', () => {
 
     expect(process.exitCode).toBe(2);
     expect(pushedItems).toHaveLength(0);
-    const { log } = await import('../utils/logger.js');
-    expect(vi.mocked(log.error).mock.calls.flat().join(' ')).toContain('your role could not be resolved');
+    const { log: pushLog } = await import('../utils/logger.js');
+    expect(vi.mocked(pushLog.error).mock.calls.flat().join(' ')).toContain('your role could not be resolved');
   });
 
   it('reports a projects manifest that cannot be loaded for --project instead of throwing', async () => {
@@ -1172,8 +1227,8 @@ describe('push namespace routing for rules and agents', () => {
 
     expect(process.exitCode).toBe(2);
     expect(pushedItems).toHaveLength(0);
-    const { log } = await import('../utils/logger.js');
-    expect(vi.mocked(log.error).mock.calls.flat().join(' ')).toContain('Cannot resolve --project destinations');
+    const { log: pushLog } = await import('../utils/logger.js');
+    expect(vi.mocked(pushLog.error).mock.calls.flat().join(' ')).toContain('Cannot resolve --project destinations');
   });
 
   it('refuses to push to the shared root when the project declares no namespace for the type', async () => {
@@ -1306,8 +1361,8 @@ describe('push namespace routing for rules and agents', () => {
     expect(process.exitCode).toBe(2);
     expect(pushedItems).toHaveLength(0);
     expect(mockPushRepoBranch).not.toHaveBeenCalled();
-    const { log } = await import('../utils/logger.js');
-    expect(vi.mocked(log.error).mock.calls.flat().join(' ')).toContain('agents namespace');
+    const { log: pushLog } = await import('../utils/logger.js');
+    expect(vi.mocked(pushLog.error).mock.calls.flat().join(' ')).toContain('agents namespace');
   });
 
   it('still pushes an unrelated rule when the only skipped agent needs a destination the project lacks', async () => {
@@ -1338,8 +1393,8 @@ describe('push namespace routing for rules and agents', () => {
 
     expect(process.exitCode).not.toBe(2);
     expect(pushedItems.map((i) => i.relativePath)).toEqual(['rules/docs-know/my-rule.md']);
-    const { log } = await import('../utils/logger.js');
-    expect(vi.mocked(log.warn).mock.calls.flat().join(' ')).toContain('agents namespace');
+    const { log: pushLog } = await import('../utils/logger.js');
+    expect(vi.mocked(pushLog.warn).mock.calls.flat().join(' ')).toContain('agents namespace');
   });
 
   it('lets a modified namespaced agent through a project whose agents axis is empty', async () => {
@@ -1455,8 +1510,8 @@ describe('push namespace routing for rules and agents', () => {
     expect(process.exitCode).toBe(2);
     expect(pushedItems).toHaveLength(0);
     expect(mockPushRepoBranch).not.toHaveBeenCalled();
-    const { log } = await import('../utils/logger.js');
-    expect(vi.mocked(log.error).mock.calls.flat().join(' ')).toContain('agents namespace');
+    const { log: pushLog } = await import('../utils/logger.js');
+    expect(vi.mocked(pushLog.error).mock.calls.flat().join(' ')).toContain('agents namespace');
   });
 
   it('still fails when the skill lacking a project namespace is selected', async () => {
@@ -1501,8 +1556,8 @@ describe('push namespace routing for rules and agents', () => {
 
     expect(pushedItems[0]?.relativePath).toBe('rules/my-rule.md');
     // Reaching the whole team is the outcome worth naming out loud.
-    const { log } = await import('../utils/logger.js');
-    const said = [...vi.mocked(log.info).mock.calls, ...vi.mocked(log.warn).mock.calls]
+    const { log: pushLog } = await import('../utils/logger.js');
+    const said = [...vi.mocked(pushLog.info).mock.calls, ...vi.mocked(pushLog.warn).mock.calls]
       .flat().join(' ');
     expect(said).toContain('rules/my-rule.md');
     expect(said).toMatch(/everyone|whole team|shared/i);
@@ -1560,8 +1615,8 @@ describe('push namespace routing for rules and agents', () => {
     expect(process.exitCode).toBe(1);
     expect(pushedItems).toHaveLength(0);
     expect(mockPushRepoBranch).not.toHaveBeenCalled();
-    const { log } = await import('../utils/logger.js');
-    expect(vi.mocked(log.error).mock.calls.flat().join(' ')).toContain('could not be refreshed');
+    const { log: pushLog } = await import('../utils/logger.js');
+    expect(vi.mocked(pushLog.error).mock.calls.flat().join(' ')).toContain('could not be refreshed');
   });
 
   it('stops placing a new resource on a stale clone even when that clone has no roles manifest', async () => {
@@ -1579,8 +1634,8 @@ describe('push namespace routing for rules and agents', () => {
 
     expect(process.exitCode).toBe(1);
     expect(pushedItems).toHaveLength(0);
-    const { log } = await import('../utils/logger.js');
-    expect(vi.mocked(log.error).mock.calls.flat().join(' ')).toContain('could not be refreshed');
+    const { log: pushLog } = await import('../utils/logger.js');
+    expect(vi.mocked(pushLog.error).mock.calls.flat().join(' ')).toContain('could not be refreshed');
   });
 
   it('stops the push when the reconciled placement records cannot be saved', async () => {
@@ -1603,8 +1658,8 @@ describe('push namespace routing for rules and agents', () => {
 
     expect(process.exitCode).toBe(1);
     expect(pushedItems).toHaveLength(0);
-    const { log } = await import('../utils/logger.js');
-    expect(vi.mocked(log.error).mock.calls.flat().join(' ')).toContain('Nothing was pushed');
+    const { log: pushLog } = await import('../utils/logger.js');
+    expect(vi.mocked(pushLog.error).mock.calls.flat().join(' ')).toContain('Nothing was pushed');
   });
 
   it('turns a placement into a record only once its file is on the default branch, before scanning', async () => {
@@ -1717,6 +1772,40 @@ describe('push namespace routing for rules and agents', () => {
     expect(pushedItems).toHaveLength(0);
   });
 
+  it('places new rules and agents at root while existing namespaced edits keep their path', async () => {
+    const pushedItems: Array<Record<string, unknown>> = [];
+    mockAutoDetectInit.mockResolvedValue({ localConfig: makeLocalConfig(), teamConfig: makeTeamConfig() });
+    mockHandlers({ rules: [{ ...newRule }], agents: [{ ...newAgent }], skills: [{ name: 'edit', type: 'skills', sourcePath: '/tmp/edit', relativePath: 'skills/hai/edit', namespace: 'hai', status: 'modified' }] }, pushedItems);
+    await push({ all: true, shared: true });
+    expect(pushedItems.map(item => item.relativePath)).toEqual(expect.arrayContaining(['rules/my-rule.md', 'agents/vr.yaml', 'skills/hai/edit']));
+  });
+
+  it('refuses to overwrite an existing root skill with an unrelated new copy', async () => {
+    const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-shared-collide-'));
+    fs.mkdirSync(path.join(repoDir, 'skills/skill-a'), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, 'skills/skill-a/SKILL.md'), 'existing shared skill');
+    try {
+      const pushedItems: Array<Record<string, unknown>> = [];
+      mockAutoDetectInit.mockResolvedValue({ localConfig: makeLocalConfig({ repo: { localPath: repoDir, remote: 'fixture' } }), teamConfig: makeTeamConfig() });
+      mockHandlers({ skills: [{ name: 'skill-a', type: 'skills', sourcePath: '/tmp/skill-a', relativePath: 'skills/skill-a', status: 'new' }] }, pushedItems);
+      await push({ all: true, shared: true });
+      expect(process.exitCode).toBe(2);
+      expect(pushedItems).toHaveLength(0);
+      expect(fs.readFileSync(path.join(repoDir, 'skills/skill-a/SKILL.md'), 'utf8')).toBe('existing shared skill');
+    } finally { fs.rmSync(repoDir, { recursive: true, force: true }); }
+  });
+
+  it('leaves a pending namespaced skill review intact when a new shared root is requested', async () => {
+    const pushedItems: Array<Record<string, unknown>> = [];
+    mockAutoDetectInit.mockResolvedValue({ localConfig: makeLocalConfig(), teamConfig: makeTeamConfig() });
+    mockLoadStateForScope.mockResolvedValue({ lastPush: null, lastPull: null, pushedRules: [], pushedSkills: [], pushedEnvVars: [], lastUpdateCheck: null, availableUpdate: null,
+      pendingPushes: [{ branch: 'teamai/push/test/old', createdAt: '2026-01-01T00:00:00.000Z', items: [{ type: 'skills', name: 'skill-a', relativePath: 'skills/js/skill-a', namespace: 'js' }] }] });
+    mockHandlers({ skills: [{ name: 'skill-a', type: 'skills', sourcePath: '/tmp/skill-a', relativePath: 'skills/js/skill-a', namespace: 'js', status: 'new' }] }, pushedItems);
+    await push({ all: true, shared: true });
+    expect(pushedItems[0].relativePath).toBe('skills/skill-a');
+    expect(vi.mocked(log.warn).mock.calls.flat().join(' ')).toContain('separate PR');
+  });
+
   it('keeps the namespace an open PR recorded for a skill even under --role', async () => {
     const pushedItems: Array<Record<string, unknown>> = [];
     mockAutoDetectInit.mockResolvedValue({
@@ -1746,8 +1835,8 @@ describe('push namespace routing for rules and agents', () => {
     // decides, the open PR is left alone, and the collision is reported.
     expect(pushedItems[0]?.relativePath).toBe('skills/pm/skill-a');
     expect(pushedItems[0]?.namespace).toBe('pm');
-    const { log } = await import('../utils/logger.js');
-    const said = vi.mocked(log.warn).mock.calls.flat().join(' ');
+    const { log: pushLog } = await import('../utils/logger.js');
+    const said = vi.mocked(pushLog.warn).mock.calls.flat().join(' ');
     expect(said).toContain('awaiting review at skills/js/skill-a');
     expect(said).toContain('separate PR');
   });
@@ -1865,8 +1954,8 @@ describe('push namespace routing for rules and agents', () => {
     // namespace for a rule.
     expect(process.exitCode).toBe(2);
     expect(pushedItems).toHaveLength(0);
-    const { log } = await import('../utils/logger.js');
-    expect(vi.mocked(log.error).mock.calls.flat().join(' ')).toContain('foo/bar');
+    const { log: pushLog } = await import('../utils/logger.js');
+    expect(vi.mocked(pushLog.error).mock.calls.flat().join(' ')).toContain('foo/bar');
   });
 
   it('detects a pending namespace recorded only in the path', async () => {
@@ -1893,8 +1982,8 @@ describe('push namespace routing for rules and agents', () => {
     await push({ all: true, role: 'be-agents' });
 
     expect(pushedItems[0]?.relativePath).toBe('agents/be-agents/vr.yaml');
-    const { log } = await import('../utils/logger.js');
-    expect(vi.mocked(log.warn).mock.calls.flat().join(' '))
+    const { log: pushLog } = await import('../utils/logger.js');
+    expect(vi.mocked(pushLog.warn).mock.calls.flat().join(' '))
       .toContain('awaiting review at agents/fe-agents/vr.yaml');
   });
 
@@ -1926,8 +2015,8 @@ describe('push namespace routing for rules and agents', () => {
     // A new branch, never the pending one.
     const branches = mockPushRepoBranch.mock.calls.map((call) => call[3]);
     expect(branches).not.toContain('teamai/push/test/20260101-000000');
-    const { log } = await import('../utils/logger.js');
-    const said = vi.mocked(log.warn).mock.calls.flat().join(' ');
+    const { log: pushLog } = await import('../utils/logger.js');
+    const said = vi.mocked(pushLog.warn).mock.calls.flat().join(' ');
     expect(said).toContain('awaiting review at rules/my-rule.md');
     expect(said).toContain('separate PR');
   });
@@ -1959,8 +2048,8 @@ describe('push namespace routing for rules and agents', () => {
 
     expect(pushedItems).toHaveLength(0);
     expect(mockPushRepoBranch).not.toHaveBeenCalled();
-    const { log } = await import('../utils/logger.js');
-    expect(vi.mocked(log.warn).mock.calls.flat().join(' ')).toContain('rules/my-rule.md now exists at the shared root');
+    const { log: pushLog } = await import('../utils/logger.js');
+    expect(vi.mocked(pushLog.warn).mock.calls.flat().join(' ')).toContain('rules/my-rule.md now exists at the shared root');
   });
 
   it('keeps updating the open PR of a resource the flag does not move', async () => {
@@ -1994,8 +2083,8 @@ describe('push namespace routing for rules and agents', () => {
     expect(pushedItems[0]?.relativePath).toBe('rules/fe-know/my-rule.md');
     const branches = mockPushRepoBranch.mock.calls.map((call) => call[3]);
     expect(branches).toEqual(['teamai/push/test/20260101-000000']);
-    const { log } = await import('../utils/logger.js');
-    expect(vi.mocked(log.warn).mock.calls.flat().join(' ')).not.toContain('separate PR');
+    const { log: pushLog } = await import('../utils/logger.js');
+    expect(vi.mocked(pushLog.warn).mock.calls.flat().join(' ')).not.toContain('separate PR');
   });
 
   it('--dry-run reports the same destination the real push would use', async () => {
@@ -2019,8 +2108,8 @@ describe('push namespace routing for rules and agents', () => {
 
     await push({ dryRun: true, role: 'pm' });
 
-    const { log } = await import('../utils/logger.js');
-    const said = vi.mocked(log.info).mock.calls.flat().join(' ');
+    const { log: pushLog } = await import('../utils/logger.js');
+    const said = vi.mocked(pushLog.info).mock.calls.flat().join(' ');
     expect(said).toContain('rules/pm/my-rule.md');
     expect(said).not.toContain('rules/fe-know/my-rule.md');
     expect(mockPushRepoBranch).not.toHaveBeenCalled();
@@ -2085,8 +2174,8 @@ describe('push namespace routing for rules and agents', () => {
       expect(mockPushRepoBranch).not.toHaveBeenCalled();
       expect(fs.readFileSync(path.join(repoDir, 'rules/pm', 'my-rule.md'), 'utf-8'))
         .toBe('the team rule');
-      const { log } = await import('../utils/logger.js');
-      expect(vi.mocked(log.error).mock.calls.flat().join(' ')).toContain('rules/pm/my-rule.md');
+      const { log: pushLog } = await import('../utils/logger.js');
+      expect(vi.mocked(pushLog.error).mock.calls.flat().join(' ')).toContain('rules/pm/my-rule.md');
     } finally {
       fs.rmSync(repoDir, { recursive: true, force: true });
     }
@@ -2115,8 +2204,8 @@ describe('push namespace routing for rules and agents', () => {
       expect(process.exitCode).toBe(2);
       expect(pushedItems).toHaveLength(0);
       expect(fs.existsSync(path.join(repoDir, 'agents/pm', 'vr.md'))).toBe(false);
-      const { log } = await import('../utils/logger.js');
-      expect(vi.mocked(log.error).mock.calls.flat().join(' ')).toContain('agents/pm/vr.yaml');
+      const { log: pushLog } = await import('../utils/logger.js');
+      expect(vi.mocked(pushLog.error).mock.calls.flat().join(' ')).toContain('agents/pm/vr.yaml');
     } finally {
       fs.rmSync(repoDir, { recursive: true, force: true });
     }
@@ -2210,8 +2299,8 @@ describe('push namespace routing for rules and agents', () => {
     expect(process.exitCode).toBe(2);
     expect(pushedItems).toHaveLength(0);
     expect(mockPushRepoBranch).not.toHaveBeenCalled();
-    const { log } = await import('../utils/logger.js');
-    expect(vi.mocked(log.error).mock.calls.flat().join(' ')).toContain('Invalid roles manifest YAML');
+    const { log: pushLog } = await import('../utils/logger.js');
+    expect(vi.mocked(pushLog.error).mock.calls.flat().join(' ')).toContain('Invalid roles manifest YAML');
   });
 
   it('stops the push when the configured role is missing from the manifest', async () => {
@@ -2277,8 +2366,8 @@ describe('push namespace routing for rules and agents', () => {
 
     expect(pushedItems).toHaveLength(0);
     expect(mockPushRepoBranch).not.toHaveBeenCalled();
-    const { log } = await import('../utils/logger.js');
-    const said = vi.mocked(log.info).mock.calls.flat().join(' ');
+    const { log: pushLog } = await import('../utils/logger.js');
+    const said = vi.mocked(pushLog.info).mock.calls.flat().join(' ');
     expect(said).toContain('rules/fe-know/my-rule.md');
     expect(said).toContain('agents/fe-agents/vr.yaml');
   });
@@ -2301,7 +2390,7 @@ describe('push namespace routing for rules and agents', () => {
 
     // A dry run that called this viable would be worse than no dry run at all.
     expect(process.exitCode).toBe(2);
-    const { log } = await import('../utils/logger.js');
-    expect(vi.mocked(log.error).mock.calls.flat().join(' ')).toContain('knowledge');
+    const { log: pushLog } = await import('../utils/logger.js');
+    expect(vi.mocked(pushLog.error).mock.calls.flat().join(' ')).toContain('knowledge');
   });
 });

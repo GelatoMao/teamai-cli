@@ -148,15 +148,23 @@ export async function shareGate(cwd?: string, options: { dryRun?: boolean } = {}
 
 /** The share gate on a team already detected, for a command that needs the team too. */
 async function gateFor(team: TeamDetection): Promise<ShareGate> {
-  const { isRecallEnabled } = await import('./types.js');
   if (team.kind === 'none') return { block: null, config: null };
   if (team.kind === 'unusable') return { block: { reason: 'config', detail: team.detail }, config: null };
-  const { localConfig, teamConfig } = team.init;
+  const block = await shareBlock(team.init);
+  return block ? { block, config: null } : { block: null, config: team.init };
+}
+
+/**
+ * What withholds `share` from a team whose config is loaded, or null. `teamai pull` asks it too, so it offers no
+ * workflow skill whose learning step would reach a `share` that says no.
+ */
+export async function shareBlock({ localConfig, teamConfig }: TeamaiInit): Promise<SkillBlock | null> {
+  const { isRecallEnabled } = await import('./types.js');
   // `teamai contribute` refuses a read-only source (read-only.ts), so the
   // workflow would fail at its last step after the agent did all the work.
-  if (localConfig.repo?.kind === 'http') return { block: { reason: 'read-only' }, config: null };
-  if (!isRecallEnabled(localConfig, teamConfig)) return { block: { reason: 'recall' }, config: null };
-  return { block: null, config: team.init };
+  if (localConfig.repo?.kind === 'http') return { reason: 'read-only' };
+  if (!isRecallEnabled(localConfig, teamConfig)) return { reason: 'recall' };
+  return null;
 }
 
 /** The first line of an error, without the colon that introduces its code frame. */
@@ -325,10 +333,35 @@ export const BLOCK_NOTES: Record<SkillBlockReason, string> = {
   config: 'not available: the teamai config could not be loaded',
 };
 
-/** The two lines every command prints for a blocked skill. */
-export function blockMessage(name: string, block: SkillBlock): { headline: string; hint: string } {
+/**
+ * The `skill list` note for a blocked skill. Like {@link blockMessage}, it names
+ * `TEAMAI_RECALL_DISABLED` when that is what turns recall off, since
+ * `teamai recall enable` would not help.
+ */
+export function blockNote(reason: SkillBlockReason, env: NodeJS.ProcessEnv = process.env): string {
+  if (reason === 'recall' && env.TEAMAI_RECALL_DISABLED === '1') return 'needs recall — unset TEAMAI_RECALL_DISABLED';
+  return BLOCK_NOTES[reason];
+}
+
+/**
+ * The two lines every command prints for a blocked skill. With
+ * `TEAMAI_RECALL_DISABLED=1` recall is off whatever the config says, so the
+ * recall block names the variable: `teamai recall enable` would succeed and
+ * leave the skill blocked.
+ */
+export function blockMessage(
+  name: string,
+  block: SkillBlock,
+  env: NodeJS.ProcessEnv = process.env,
+): { headline: string; hint: string } {
   switch (block.reason) {
     case 'recall':
+      if (env.TEAMAI_RECALL_DISABLED === '1') {
+        return {
+          headline: `${name} needs recall, which TEAMAI_RECALL_DISABLED=1 turns off in this environment.`,
+          hint: 'Unset TEAMAI_RECALL_DISABLED to use it; `teamai recall enable` does not override the variable.',
+        };
+      }
       return {
         headline: `${name} needs recall, which is disabled for this team.`,
         hint: 'Turn it on with `teamai recall enable`, or ask your team admin to enable sharing.',

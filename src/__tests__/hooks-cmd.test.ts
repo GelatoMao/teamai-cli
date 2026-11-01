@@ -22,8 +22,11 @@ vi.mock('../hooks.js', async () => {
         sweepLegacyProjectHooks: vi.fn(),
         trustCodexForScope: vi.fn(),
         resolveMainCheckoutHooks: vi.fn(),
+        teamHookHistory: vi.fn(),
         // Keep the real report so assertions verify the actual wording.
         reportCodexTrust: actual.reportCodexTrust,
+        codexTrustPolicy: actual.codexTrustPolicy,
+        runsTeamHookOn: actual.runsTeamHookOn,
     };
 });
 
@@ -337,6 +340,28 @@ describe('hooksList', () => {
         expect(text).toContain('[lint] Stop');
         expect(text).toContain('npm run lint');
         expect(text).toContain('(tools: claude)');
+    });
+
+    it('says which tools run each team hook, and which have no hook on its event', async () => {
+        mockedParseTeamHooks.mockResolvedValue(hooksYaml([
+            { id: 'no-force-push', event: 'PreToolUse', matcher: 'Bash', command: 'scan-push', description: 'x' },
+            { id: 'lint', event: 'Stop', command: 'npm run lint', description: 'x', tools: ['cursor'] },
+        ]));
+        const out: string[] = [];
+        const spy = vi.spyOn(console, 'log').mockImplementation((m?: unknown) => { out.push(String(m)); });
+        try {
+            await hooksList({});
+        } finally {
+            spy.mockRestore();
+        }
+        const team = out.join('\n').split('Team hooks (B)')[1].split('\n');
+        const after = (id: string) => team.slice(team.findIndex((l) => l.includes(`[${id}]`)) + 1, team.findIndex((l) => l.includes(`[${id}]`)) + 3);
+        expect(after('no-force-push')).toEqual([
+            '      runs in: claude, claude-internal',
+            '      not in: cursor (no PreToolUse hook there)',
+        ]);
+        expect(after('lint')[0]).toBe('      runs in: cursor');
+        expect(after('lint')[1]).not.toContain('not in');
     });
 
     it('prints a deprecated roles restriction next to the tools one', async () => {
@@ -671,7 +696,7 @@ describe('hooksList', () => {
         const text = out.join('\n');
         const builtin = text.slice(text.indexOf('Built-in hooks (A)'), text.indexOf('Team hooks (B)'));
         const claude = builtinBlock(builtin, 'claude') ?? [];
-        expect(claude).toHaveLength(6);
+        expect(claude).toHaveLength(5);
         expect(claude.some((line) => line.startsWith('Stop  →'))).toBe(false);
     });
 
@@ -720,6 +745,7 @@ describe('hooksList', () => {
     });
 
     it('lists only the built-in hooks a tool actually receives (#717)', async () => {
+        await fse.ensureDir(path.join(os.homedir(), '.kiro'));
         const out: string[] = [];
         const consoleLog = vi.spyOn(console, 'log').mockImplementation((m?: unknown) => { out.push(String(m)); });
         mockedAutoDetectInit.mockResolvedValue({
@@ -732,7 +758,6 @@ describe('hooksList', () => {
                     hermes: { skills: '.hermes/skills' },
                     omp: { skills: '.omp/skills' },
                     openclaw: { skills: '.openclaw/skills' },
-                    // No built-in hook from the hook pipeline.
                     joycode: { skills: '.joycode/skills' },
                     kiro: { skills: '.kiro/skills', agents: '.kiro/agents' },
                 },
@@ -749,7 +774,7 @@ describe('hooksList', () => {
         const builtin = text.slice(text.indexOf('Built-in hooks (A)'), text.indexOf('Team hooks (B)'));
 
         // Claude is reconciled through its settings file: the whole set.
-        expect(builtinBlock(builtin, 'claude')).toHaveLength(7);
+        expect(builtinBlock(builtin, 'claude')).toHaveLength(6);
         // Hermes installs a single on_session_start script running the raw
         // dispatch command (hermes-hooks.ts).
         expect(builtinBlock(builtin, 'hermes')).toEqual([
@@ -767,11 +792,11 @@ describe('hooksList', () => {
             'SessionStart  →  teamai hook-dispatch session-start --tool <tool>',
             'UserPromptSubmit  →  teamai hook-dispatch prompt-submit --tool <tool>',
         ]);
-        // JoyCode has no hook surface, and Kiro's session-start command is
-        // embedded per agent by the agent sync instead of the hook pipeline:
-        // neither may be listed.
+        // JoyCode is not configured in this fixture; Kiro V3 has a standalone SessionStart hook.
         expect(builtinBlock(builtin, 'joycode')).toBeUndefined();
-        expect(builtinBlock(builtin, 'kiro')).toBeUndefined();
+        expect(builtinBlock(builtin, 'kiro')).toEqual([
+            'SessionStart  →  teamai hook-dispatch session-start --tool <tool>',
+        ]);
     });
 });
 
@@ -785,9 +810,24 @@ describe('hooksRemove', () => {
             expect.any(String),
             [],
             expect.stringContaining('managed-hooks.json'),
-            { removeAll: true, scope: 'user', installedBaseDir: undefined, teamHookProjectRoot: undefined, mainCheckout: null },
+            { removeAll: true, scope: 'user', installedBaseDir: undefined, teamHookProjectRoot: undefined, mainCheckout: null, keepRecordsFor: new Set(), unwritten: [], codexTrust: { kind: 'enabled', codexHome: expect.any(String) } },
         );
         expect(mockedLog.success).toHaveBeenCalledWith(expect.stringContaining('Hooks removed'));
+    });
+
+    it('exits 1 without the success line when the legacy project sweep leaves hooks behind', async () => {
+        mockedSweep.mockImplementationOnce(async (_toolPaths: unknown, _localConfig: unknown, _reconciled: unknown, unwritten: string[]) => {
+            unwritten.push('cursor');
+        });
+        try {
+            await hooksRemove({});
+
+            expect(process.exitCode).toBe(1);
+            expect(mockedLog.warn).toHaveBeenCalledWith(expect.stringContaining('Hooks remove incomplete'));
+            expect(mockedLog.success).not.toHaveBeenCalledWith(expect.stringContaining('Hooks removed'));
+        } finally {
+            process.exitCode = undefined;
+        }
     });
 
     it('removes from HOME and cleans up legacy projectRoot entries (#264)', async () => {
@@ -811,7 +851,7 @@ describe('hooksRemove', () => {
             '/home/testuser',
             [],
             expect.any(String),
-            { removeAll: true, scope: 'project', installedBaseDir: '/path/to/project', teamHookProjectRoot: '/path/to/project', mainCheckout: null },
+            { removeAll: true, scope: 'project', installedBaseDir: '/path/to/project', teamHookProjectRoot: '/path/to/project', mainCheckout: null, keepRecordsFor: new Set(), unwritten: [], codexTrust: { kind: 'enabled', codexHome: '/home/testuser/.codex' } },
         );
         const userManifest = mockedReconcile.mock.calls[0][3] as string;
         expect(userManifest).toContain('/home/testuser');
@@ -819,6 +859,7 @@ describe('hooksRemove', () => {
             mockTeamConfig.toolPaths,
             expect.objectContaining({ scope: 'project', projectRoot: '/path/to/project' }),
             reconciledMainTools,
+            [],
         );
     });
 
@@ -850,9 +891,10 @@ describe('hooksRemove', () => {
             [],
             expect.any(String),
             {
-                removeAll: true, scope: 'project', installedBaseDir: '/path/to/project', teamHookProjectRoot: undefined, mainCheckout: null,
+                removeAll: true, scope: 'project', installedBaseDir: '/path/to/project', teamHookProjectRoot: undefined, mainCheckout: null, keepRecordsFor: new Set(), unwritten: [],
                 // The team hooks in settings.local.json go too (#915).
                 selfLocalTeamHooks: { relocate: false },
+                codexTrust: { kind: 'enabled', codexHome: '/home/testuser/.codex' },
             },
         );
     });
@@ -872,6 +914,51 @@ describe('hooksRemove', () => {
             await hooksRemove({});
             expect(await fse.pathExists(globalPiHook)).toBe(false);
         } finally {
+            restoreHome();
+            await fse.remove(tmp);
+        }
+    });
+
+    it('also clears the CodeBuddy hooks an earlier release wrote in the default home (#1221)', async () => {
+        const tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-hooks-remove-cb-'));
+        const restoreHome = mockHome(tmp);
+        vi.stubEnv('CODEBUDDY_CONFIG_DIR', path.join(tmp, 'cb'));
+        const defaultSettings = path.join(tmp, '.codebuddy', 'settings.json');
+        await fse.outputJson(defaultSettings, { hooks: {} });
+        mockedAutoDetectInit.mockResolvedValue({
+            localConfig: mockLocalConfig,
+            teamConfig: { toolPaths: { codebuddy: { skills: '.codebuddy/skills', settings: '.codebuddy/settings.json' } } },
+        });
+
+        try {
+            await hooksRemove({});
+        } finally {
+            vi.unstubAllEnvs();
+            restoreHome();
+            await fse.remove(tmp);
+        }
+
+        expect(mockedReconcileStandalone).toHaveBeenCalledWith(defaultSettings, 'codebuddy', [], expect.objectContaining({ removeAll: true }));
+    });
+
+    it('also deletes the Pi extension an earlier release wrote in the default home (#1221)', async () => {
+        const tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-hooks-remove-pi-moved-'));
+        const restoreHome = mockHome(tmp);
+        vi.stubEnv('PI_CODING_AGENT_DIR', path.join(tmp, 'pi-agent'));
+        const movedPiHook = path.join(tmp, 'pi-agent', 'extensions', 'teamai-hooks.ts');
+        const defaultPiHook = path.join(tmp, '.pi', 'agent', 'extensions', 'teamai-hooks.ts');
+        for (const file of [movedPiHook, defaultPiHook]) await fse.outputFile(file, '// [teamai] hooks extension');
+        mockedAutoDetectInit.mockResolvedValue({
+            localConfig: mockLocalConfig,
+            teamConfig: { toolPaths: { pi: { skills: '.pi/skills' } } },
+        });
+
+        try {
+            await hooksRemove({});
+            expect(await fse.pathExists(movedPiHook)).toBe(false);
+            expect(await fse.pathExists(defaultPiHook)).toBe(false);
+        } finally {
+            vi.unstubAllEnvs();
             restoreHome();
             await fse.remove(tmp);
         }

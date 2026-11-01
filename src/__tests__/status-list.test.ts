@@ -28,6 +28,7 @@ vi.mock('../utils/logger.js', () => ({
 }));
 
 import { list, status } from '../status.js';
+import { syncWorkflowDefinitions } from '../workflow/cache.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 import { log } from '../utils/logger.js';
 import { resetWarnOnce } from '../utils/warn-once.js';
@@ -170,8 +171,8 @@ describe('teamai list / status resource coverage', () => {
   it('list env --reveal leaves out the env.yaml value of a key declared as a secret, and shows a team value as team', async () => {
     await fse.writeFile(path.join(repoPath, 'env', 'secrets.yaml'), 'secrets:\n  - key: SECRET_TOKEN\n');
     const { getTeamSecretsPath, writeSecretStore } = await import('../secret-store.js');
-    const { localConfig } = await mockAutoDetectInit() as { localConfig: LocalConfig };
-    await writeSecretStore(getTeamSecretsPath(localConfig), { SECRET_TOKEN: { value: 'fixture-team-value' } });
+    const { localConfig: mockedLocalConfig } = await mockAutoDetectInit() as { localConfig: LocalConfig };
+    await writeSecretStore(getTeamSecretsPath(mockedLocalConfig), { SECRET_TOKEN: { value: 'fixture-team-value' } });
 
     await list('env', { source: 'repo', reveal: true });
     const out = lines.join('\n');
@@ -183,8 +184,8 @@ describe('teamai list / status resource coverage', () => {
   // #875: list env is the listing env list prints, so it shows a member's override too.
   it('list env shows the member\'s value of an overridden variable, as team', async () => {
     const { getTeamSecretsPath, writeSecretStore } = await import('../secret-store.js');
-    const { localConfig } = await mockAutoDetectInit() as { localConfig: LocalConfig };
-    await writeSecretStore(getTeamSecretsPath(localConfig), { SECRET_TOKEN: { value: 'fixture-member-value', kind: 'variable' } });
+    const { localConfig: mockedLocalConfig } = await mockAutoDetectInit() as { localConfig: LocalConfig };
+    await writeSecretStore(getTeamSecretsPath(mockedLocalConfig), { SECRET_TOKEN: { value: 'fixture-member-value', kind: 'variable' } });
 
     await list('env', { source: 'repo', reveal: true });
     const out = lines.join('\n');
@@ -255,6 +256,41 @@ describe('teamai list / status resource coverage', () => {
     await list('mcp', { source: 'repo' });
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('server "hidden" has unknown key `role:`'));
     expect(lines.join('\n')).toContain('server "duplicate" is defined in both');
+  });
+
+  it('list workflows shows each by the alias that starts it, then its name, whether it runs the team\'s file or teamai\'s default, and which team files cannot run', async () => {
+    localConfig.dataHome = path.join(tmpDir, 'data');
+    const workflow = (name: string, extra = '') => `schemaVersion: v1alpha1\nname: ${name}\ndescription: Review it.\n${extra}steps:\n  - id: review\n    command: node review.js\n`;
+    await fse.outputFile(path.join(repoPath, 'workflows', 'review-and-fix.yaml'), workflow('review-and-fix', 'alias: fix\n'));
+    await fse.outputFile(path.join(repoPath, 'workflows', 'broken.yaml'), 'schemaVersion: v1alpha1\nname: broken\n');
+    await syncWorkflowDefinitions(localConfig);
+
+    await list('workflows', { source: 'repo' });
+    expect(lines).toEqual([
+      '', '=== REPO WORKFLOWS ===', '  broken  (not runnable)', '  fix (review-and-fix)  (team)', '  teamai-share-learnings  (default)', '  teamai-share-session  (default)', '',
+    ]);
+
+    await fse.outputFile(path.join(repoPath, 'workflows', 'teamai-share-session.yaml'), workflow('teamai-share-session', 'alias: share-session\n'));
+    await syncWorkflowDefinitions(localConfig);
+    lines.length = 0;
+
+    await list('workflows', { source: 'repo' });
+    expect(lines).toEqual([
+      '', '=== REPO WORKFLOWS ===', '  broken  (not runnable)', '  fix (review-and-fix)  (team)', '  teamai-share-learnings  (default)', '  share-session (teamai-share-session)  (team)', '',
+    ]);
+  });
+
+  it('status lists the scorers pull cached, next to the resource counts', async () => {
+    localConfig.dataHome = path.join(tmpDir, 'data');
+    const scorer = '---\nlabels:\n  - { value: good, score: 1, description: Good }\n  - { value: bad, score: 0, description: Bad }\npassingScore: 0.5\n---\nJudge.\n';
+    await fse.outputFile(path.join(repoPath, 'scorers', 'quality.md'), scorer);
+    await fse.outputFile(path.join(repoPath, 'scorers', 'tests.md'), scorer);
+    await fse.outputFile(path.join(repoPath, 'scorers', 'scoring.yaml'), 'batch: true\n');
+    await syncWorkflowDefinitions(localConfig);
+
+    await status({});
+
+    expect(lines.filter((line) => line.startsWith('  scorers: '))).toEqual(['  scorers: 2', '  scorers: 2 (quality, tests)']);
   });
 
   it('status counts nested rule files', async () => {

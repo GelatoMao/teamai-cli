@@ -21,6 +21,8 @@ export const ModelProtocolSchema = z.enum([
   'anthropic',
   'openai-responses',
   'openai-chat-completions',
+  // The Gemini API (`/v1beta/models/<model>:generateContent`), which Antigravity CLI speaks.
+  'gemini',
 ]);
 export type ModelProtocol = z.infer<typeof ModelProtocolSchema>;
 
@@ -33,6 +35,7 @@ export const ModelAgentSchema = z.enum([
   'pi',
   'omp',
   'muse',
+  'agy',
 ]);
 export type ModelAgent = z.infer<typeof ModelAgentSchema>;
 
@@ -99,8 +102,9 @@ export function profileAgents(profile: ModelProfile): ModelAgent[] {
   return ALL_MODEL_AGENTS.filter((agent) => {
     if (agent === 'claude') return !!routes.anthropic;
     if (agent === 'codex' || agent === 'muse') return !!routes['openai-responses'];
-    // OpenCode, Pi and OMP name an api per model, so any of them can serve any protocol.
-    if (agent === 'opencode' || agent === 'pi' || agent === 'omp') return true;
+    if (agent === 'agy') return !!routes.gemini;
+    // OpenCode, Pi and OMP name an api per model, so any of them can serve an Anthropic or OpenAI protocol.
+    if (agent === 'opencode' || agent === 'pi' || agent === 'omp') return !!(routes.anthropic || routes['openai-responses'] || routes['openai-chat-completions']);
     return !!routes['openai-chat-completions'];
   });
 }
@@ -149,7 +153,7 @@ const StoredModelInputSchema = z.object({
   value: z.string().optional(),
   env: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).optional(),
 }).strict();
-const StoredModelInputsSchema = z.record(z.object({ API_KEY: StoredModelInputSchema.optional() }).strict());
+const StoredModelInputsSchema = z.record(z.string(), z.object({ API_KEY: StoredModelInputSchema.optional() }).strict());
 
 export interface ResolvedModelRoute {
   base_url: string;
@@ -606,13 +610,13 @@ export async function loadModelInputs(filePath: string): Promise<StoredModelInpu
     content = await fs.promises.readFile(filePath, 'utf8');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
-    throw new Error(`Cannot read local model inputs at ${filePath}: ${(error as Error).message}`);
+    throw new Error(`Cannot read local model inputs at ${filePath}: ${(error as Error).message}`, { cause: error });
   }
   let raw: unknown;
   try {
     raw = JSON.parse(content) as unknown;
   } catch (error) {
-    throw new Error(`Cannot parse local model inputs at ${filePath}: ${(error as Error).message}`);
+    throw new Error(`Cannot parse local model inputs at ${filePath}: ${(error as Error).message}`, { cause: error });
   }
   const parsed = StoredModelInputsSchema.safeParse(raw);
   if (!parsed.success) {
@@ -788,7 +792,8 @@ export function resolveProfile(
   const routes = Object.fromEntries(Object.entries(profileRoutes(ref.profile)).map(([protocol, models]) => [
     protocol,
     {
-      base_url: protocol === 'anthropic' ? root : `${root}/v1`,
+      // Anthropic and Gemini clients add their own version path to the root.
+      base_url: protocol === 'anthropic' || protocol === 'gemini' ? root : `${root}/v1`,
       // The chosen default leads every route that serves it; other routes keep
       // the catalog order and default to their own first model.
       models: model && models.includes(model) ? [model, ...models.filter((item) => item !== model)] : models,

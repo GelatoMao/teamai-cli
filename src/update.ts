@@ -5,12 +5,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fse from 'fs-extra';
-import { loadState, saveState, loadLocalConfig, loadTeamConfig } from './config.js';
+import { loadState, saveState, loadLocalConfig, loadTeamConfig, resolveConfigForDir } from './config.js';
 import { resolveEffectiveUpdatePolicy } from './update-policy.js';
 import { resolveTeamaiEntryScript } from './builtin-hooks.js';
 import { log } from './utils/logger.js';
 import { expandHome, ensureDir } from './utils/fs.js';
-import { getTeamaiHomeDir, getUpdateLockPath } from './types.js';
+import { getTeamaiHomeDir, getUpdateLockPath, type LocalConfig } from './types.js';
 import { askConfirmation, isInteractive } from './utils/prompt.js';
 
 // `getCurrentVersion` and `getCurrentPackageName` live in `./package-info.ts`
@@ -116,6 +116,26 @@ export function prefixFromEntryPath(entry: string, posix: boolean): { prefix: st
  */
 function resolveInstallPrefix(): { prefix: string; global: boolean } | null {
   return prefixFromEntryPath(fileURLToPath(import.meta.url), process.platform !== 'win32');
+}
+
+/** `$VOLTA_HOME/tools/image/packages/<name>`, including the default `~/.volta` and `%LOCALAPPDATA%\\Volta` homes. */
+const VOLTA_PACKAGE_IMAGE = /(?:^|\/)\.?volta\/tools\/image\/packages\//i;
+
+/**
+ * A Volta package image is not an npm prefix. `npm install -g --prefix` there
+ * removes the current executable before the new one is in place.
+ * `voltaHome` defaults to `VOLTA_HOME`; pass `''` to ignore a custom home.
+ */
+export function isVoltaPackageImage(filePath: string, voltaHome = process.env.VOLTA_HOME): boolean {
+  if (voltaHome) {
+    const root = path.resolve(voltaHome, 'tools', 'image', 'packages');
+    const resolved = path.resolve(filePath);
+    const fold = (value: string) => process.platform === 'win32' ? value.toLowerCase() : value;
+    const file = fold(resolved);
+    const dir = fold(root);
+    if (file === dir || file.startsWith(dir.endsWith(path.sep) ? dir : dir + path.sep)) return true;
+  }
+  return VOLTA_PACKAGE_IMAGE.test(filePath.replace(/\\/g, '/'));
 }
 
 /**
@@ -472,6 +492,29 @@ export async function releaseLock(lockPath?: string): Promise<void> {
 }
 
 /**
+ * Run `body` holding `lockPath`, trying up to `wait.attempts` times with
+ * `wait.delayMs` between tries. `held: false` means the lock stayed busy and
+ * `body` did not run.
+ */
+export async function withFileLock<T>(
+  lockPath: string,
+  wait: { attempts: number; delayMs: number },
+  body: () => Promise<T>,
+): Promise<{ held: true; value: T } | { held: false }> {
+  for (let attempt = 0; attempt < wait.attempts; attempt++) {
+    if (await acquireLock(lockPath)) {
+      try {
+        return { held: true, value: await body() };
+      } finally {
+        await releaseLock(lockPath);
+      }
+    }
+    await new Promise((r) => setTimeout(r, wait.delayMs));
+  }
+  return { held: false };
+}
+
+/**
  * Synchronously remove the locks this process still holds when it exits —
  * the same owner-verified removal `releaseLock` does, but with sync fs calls,
  * because `process.on('exit')` handlers cannot await (#1027).
@@ -652,9 +695,11 @@ export async function checkForUpdate(options?: { force?: boolean; dryRun?: boole
 }
 
 /**
- * Perform the actual update (check + install based on policy)
+ * Perform the actual update (check + install based on policy). The CLI is
+ * shared by the whole machine, so one scope decides: the user scope when there
+ * is one, else `runningScope`, the scope the update runs in.
  */
-export async function doUpdate(): Promise<void> {
+export async function doUpdate(runningScope: LocalConfig | null): Promise<void> {
   const result = await checkForUpdate();
   if (!result.available) {
     log.info(`Already up to date (v${result.current})`);
@@ -663,7 +708,8 @@ export async function doUpdate(): Promise<void> {
 
   // Load configs for update policy. Team config is the default; local
   // config overrides (user always wins).
-  const localConfig = await loadLocalConfig();
+  // oxlint-disable-next-line teamai/config-load-options -- automatic update policy retains normal config migration and has no preview option
+  const localConfig = (await loadLocalConfig()) ?? runningScope;
   const teamConfig = localConfig
     ? await loadTeamConfig(localConfig.repo.localPath)
     : null;
@@ -693,6 +739,20 @@ export async function doUpdate(): Promise<void> {
       'it can update in place (for example an `npm link` checkout). For a checkout, pull ' +
       'and rebuild it; to switch to the published package, run ' +
       `"npm install -g ${pkgName} --registry=${registry}".`;
+    log.warn(message);
+    log.persist(message);
+    return;
+  }
+  const entry = fileURLToPath(import.meta.url);
+  if (isVoltaPackageImage(entry) || isVoltaPackageImage(target.prefix)) {
+    // Volta's image looks like a POSIX global prefix (<image>/lib/node_modules),
+    // so the check above accepts it. npm -g then deletes the live `teamai`
+    // executable before writing the new one.
+    const message =
+      `Self-update skipped: teamai at ${target.prefix} is managed by Volta. ` +
+      'npm install -g removes the current executable before the new one is installed, ' +
+      'so an interrupted update leaves the `teamai` command missing. ' +
+      `Upgrade with "volta install ${pkgName}@latest".`;
     log.warn(message);
     log.persist(message);
     return;
@@ -746,18 +806,18 @@ export async function doUpdate(): Promise<void> {
     );
     log.success(`Updated teamai to v${result.latest}`);
 
-    const entry = resolveTeamaiEntryScript();
+    const updatedEntry = resolveTeamaiEntryScript();
 
     // Verify the RUNNING install actually changed: a stale success message
     // here is exactly how self-update silently stops working.
-    if (entry) {
+    if (updatedEntry) {
       try {
         const installed = JSON.parse(fs.readFileSync(
-          path.join(path.dirname(path.dirname(entry)), 'package.json'), 'utf-8',
+          path.join(path.dirname(path.dirname(updatedEntry)), 'package.json'), 'utf-8',
         )) as { version?: string };
         if (installed.version !== result.latest) {
           log.warn(
-            `The running install at ${path.dirname(path.dirname(entry))} is still ` +
+            `The running install at ${path.dirname(path.dirname(updatedEntry))} is still ` +
             `v${installed.version ?? 'unknown'} (expected v${result.latest}) — it may need a manual update.`,
           );
         }
@@ -769,8 +829,8 @@ export async function doUpdate(): Promise<void> {
     // run the resolved entry with the current Node binary — spawning the .js
     // directly only works behind a shebang + PATH on POSIX.
     try {
-      const refresh = entry
-        ? { cmd: process.execPath, args: [entry, 'hooks', 'inject', '--silent'] }
+      const refresh = updatedEntry
+        ? { cmd: process.execPath, args: [updatedEntry, 'hooks', 'inject', '--silent'] }
         : { cmd: 'teamai', args: ['hooks', 'inject', '--silent'] };
       await execFileAsync(refresh.cmd, refresh.args, {
         timeout: 15_000,
@@ -821,5 +881,5 @@ export async function update(options: UpdateOptions): Promise<void> {
     return;
   }
 
-  await doUpdate();
+  await doUpdate(await resolveConfigForDir());
 }

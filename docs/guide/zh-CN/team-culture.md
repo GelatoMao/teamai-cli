@@ -33,13 +33,20 @@ team:
 | Codex 系列 | `$CODEX_HOME/AGENTS.md` | session-start hook |
 | Cursor | `~/.cursor/rules/teamai-context.mdc`；工作区不在主目录下时由 session-start hook 加入 | `.cursor/rules/teamai-context.mdc` |
 | CodeBuddy、WorkBuddy | 各自的用户文件 | 共用 `.codebuddy/rules/teamai-context.md` |
-| OpenCode | `~/.config/opencode/teamai-context.md` | `.opencode/teamai-context.md` |
-| Pi、Oh My Pi | 各自的用户文件 | 扩展加进系统提示 |
+| Qoder | `~/.qoder/rules/teamai-context.md` | `.qoder/rules/teamai-context.md` |
+| Qoder CN | `~/.qoder-cn/rules/teamai-context.md` | 共用 `.qoder/rules/teamai-context.md` |
+| Kiro | `~/.kiro/steering/teamai-context.md` | `.kiro/steering/teamai-context.md` |
+| Trae | `~/.trae/user_rules/teamai-context.md` | `.trae/rules/teamai-context.md` |
+| Trae CN | `~/.trae-cn/user_rules/teamai-context.md` | 共用 `.trae/rules/teamai-context.md` |
+| OpenCode | 设置了 `$OPENCODE_CONFIG_DIR` 时为 `$OPENCODE_CONFIG_DIR/teamai-context.md`，否则为 `${XDG_CONFIG_HOME:-~/.config}/opencode/teamai-context.md` | `.opencode/teamai-context.md` |
+| Pi | 设置 `$PI_CODING_AGENT_DIR` 时，存在 override 则为 `$PI_CODING_AGENT_DIR/AGENTS.override.md`，否则为 `$PI_CODING_AGENT_DIR/AGENTS.md`；未设置时为 `~/.pi/agent` 下相同路径 | 扩展加进系统提示 |
+| Oh My Pi | 它的用户文件 | 扩展加进系统提示 |
 | Hermes | `$HERMES_HOME/SOUL.md` | Hermes 插件 |
-| ZCode | `~/.zcode/AGENTS.md` | 仅 `toolPaths` 里配置的 `claudemd` |
-| DeepSeek Harness | `$DSH_HOME/AGENTS.md`（未设置时 `~/.dsh/AGENTS.md`） | 仅 `toolPaths` 里配置的 `claudemd` |
-| JoyCode | `~/.joycode/rules.txt` | 仅 `toolPaths` 里配置的 `claudemd` |
-| Muse Code | `~/.config/muse/AGENTS.md` | 仅 `toolPaths` 里配置的 `claudemd` |
+| ZCode | `~/.zcode/AGENTS.md` | session-start hook |
+| DeepSeek Harness | `$DSH_HOME/AGENTS.md`（未设置时 `~/.dsh/AGENTS.md`） | session-start hook |
+| JoyCode | 设置 `$JOYCODE_HOME` 时为 `$JOYCODE_HOME/rules.txt`，否则为 `~/.joycode/rules.txt` | 无 |
+| Muse Code | `${XDG_CONFIG_HOME:-~/.config}/muse/AGENTS.md` | session-start hook |
+| Antigravity | `~/.gemini/config/rules/teamai-context.md` | `.agents/rules/teamai-context.md` |
 
 ## 查看效果
 

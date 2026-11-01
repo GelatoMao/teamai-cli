@@ -5,7 +5,7 @@ import { SkillsHandler } from './resources/skills.js';
 import { loadTagsConfig } from './utils/tags.js';
 import {
   buildClassifyContext,
-  classifySkill,
+  classifyInstalledSkill,
   formatSkillSource,
   readSkillDescription,
   truncate,
@@ -14,7 +14,7 @@ import {
 import { detectInstalledAgents, type ResolvedAgent } from './known-agents.js';
 import { LEGACY_BUILTIN_SKILL_NAMES } from './builtin-skills.js';
 import {
-  BLOCK_NOTES,
+  blockNote,
   detectTeam,
   refuseBlocked,
   resolveServableSkill,
@@ -114,7 +114,7 @@ export async function skillShow(name: string, options: GlobalOptions): Promise<v
   // only knows the deployed stub, so classifying by name would call `core` local-only.
   const source: SkillSource = resolved.primaryOrigin === 'builtin'
     ? { kind: 'builtin' }
-    : classifySkill(resolvedName, await buildClassifyContext(localConfig), resolved.primaryPath);
+    : await classifyInstalledSkill(resolvedName, await buildClassifyContext(localConfig), resolved.primaryPath);
 
   const description = truncate(await readSkillDescription(path.join(resolved.primaryPath, 'SKILL.md')), DESCRIPTION_MAX);
   const contributors = await SkillsHandler.readContributors(resolved.primaryPath);
@@ -180,7 +180,7 @@ export async function skillList(options: GlobalOptions & { json?: boolean }): Pr
     console.log('  (none — the installed package ships no skill content)');
   } else {
     for (const entry of catalog) {
-      console.log(`  ${entry.name}${entry.blockedBy ? `  (${BLOCK_NOTES[entry.blockedBy]})` : ''}`);
+      console.log(`  ${entry.name}${entry.blockedBy ? `  (${blockNote(entry.blockedBy)})` : ''}`);
       console.log(`    ${truncate(entry.description, DESCRIPTION_MAX) || '(no description)'}`);
       console.log(`    teamai skill get ${entry.name}`);
     }

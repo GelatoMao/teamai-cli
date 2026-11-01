@@ -15,7 +15,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { installFakeCodex } from '../helpers/fake-codex.js';
-import { trackDetachedProcesses } from '../helpers/detached-processes.js';
+import { waitForDetachedChildren } from '../helpers/detached-processes.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..', '..');
@@ -34,7 +34,6 @@ interface Run { code: number | null; output: string }
 let sandbox: string;
 let home: string;
 let fakeCodexDir: string;
-let detached: ReturnType<typeof trackDetachedProcesses>;
 
 function env(): NodeJS.ProcessEnv {
   const base: NodeJS.ProcessEnv = {
@@ -46,7 +45,6 @@ function env(): NodeJS.ProcessEnv {
     GIT_CONFIG_NOSYSTEM: '1',
     CODEX_HOME: path.join(home, '.codex'),
     PATH: `${fakeCodexDir}${path.delimiter}${process.env.PATH ?? ''}`,
-    NODE_OPTIONS: [process.env.NODE_OPTIONS, detached.nodeOptions].filter(Boolean).join(' '),
     FORCE_COLOR: '0',
   };
   delete base.CLAUDE_CONFIG_DIR;
@@ -108,9 +106,9 @@ function repo(name: string, files: Record<string, string>, commit: string[] = []
 }
 
 /** Make `link` a symlink to `target`. */
-function link(link: string, target: string): void {
-  fs.mkdirSync(path.dirname(link), { recursive: true });
-  fs.symlinkSync(target, link);
+function link(linkPath: string, target: string): void {
+  fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+  fs.symlinkSync(target, linkPath);
 }
 
 function init(t: Team, dir: string, agents: string): Run {
@@ -152,12 +150,11 @@ describe('an MCP config that is a symlink (#993)', () => {
     home = path.join(sandbox, 'home');
     fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
     fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
-    fakeCodexDir = installFakeCodex();
-    detached = trackDetachedProcesses(sandbox);
+    fakeCodexDir = installFakeCodex({ version: '9999.0.0' });
   });
 
   afterAll(async () => {
-    if (detached) await detached.waitForExit();
+    await waitForDetachedChildren();
     if (sandbox) fs.rmSync(sandbox, { recursive: true, force: true });
     if (fakeCodexDir) fs.rmSync(fakeCodexDir, { recursive: true, force: true });
   });

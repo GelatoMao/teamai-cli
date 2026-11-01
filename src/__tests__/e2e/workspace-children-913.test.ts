@@ -47,6 +47,48 @@ function git(args: string[], cwd: string, home?: string): string {
   }).trim();
 }
 
+function cloneBare(seed: string, bare: string): void {
+  // Copy Git objects, not transient files a concurrent repack may remove.
+  git(['clone', '-q', '--bare', '--no-local', seed, bare], path.dirname(bare));
+}
+
+describe('workspace bare-repo fixtures', () => {
+  it('transfers both branches without copying temporary pack indexes', () => {
+    const sandbox = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-bare-fixture-')));
+    const seed = path.join(sandbox, 'seed');
+    const bare = path.join(sandbox, 'team.git');
+    try {
+      fs.mkdirSync(seed);
+      git(['init', '-q', '-b', 'main'], seed);
+      fs.writeFileSync(path.join(seed, 'teamai.yaml'), 'team: fixture\n');
+      git(['add', '-A'], seed);
+      git(['commit', '-q', '-m', 'knowledge'], seed);
+      git(['checkout', '-q', '--orphan', 'teamai-learnings'], seed);
+      git(['rm', '-rfq', '.'], seed);
+      fs.writeFileSync(path.join(seed, 'lesson.md'), '# Fixture learning\n');
+      git(['add', '-A'], seed);
+      git(['commit', '-q', '-m', 'learning'], seed);
+      git(['checkout', '-q', 'main'], seed);
+
+      const temporaryIndex = path.join('objects', 'pack', 'tmp_idx_fixture');
+      const sourceIndex = path.join(seed, '.git', temporaryIndex);
+      fs.mkdirSync(path.dirname(sourceIndex), { recursive: true });
+      fs.writeFileSync(sourceIndex, 'An in-progress pack index is not a Git object.\n');
+
+      cloneBare(seed, bare);
+
+      expect(fs.existsSync(path.join(bare, temporaryIndex))).toBe(false);
+      for (const ref of ['main', 'teamai-learnings']) {
+        expect(git(['rev-parse', ref], bare)).toBe(git(['rev-parse', ref], seed));
+      }
+      expect(git(['show', 'main:teamai.yaml'], bare)).toBe('team: fixture');
+      expect(git(['show', 'teamai-learnings:lesson.md'], bare)).toBe('# Fixture learning');
+    } finally {
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+});
+
 function installGitRemoteGetUrlWrapper(binDir: string): string {
   fs.mkdirSync(binDir, { recursive: true });
   const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
@@ -115,9 +157,12 @@ describe('a workspace delivers what the repos inside it select (#913)', () => {
   let cliEnv: Record<string, string>;
 
   const run = (args: string[], cwd: string): Promise<RunResult> => runCLI(args, cwd, home, cliEnv);
+  // The team's skills the selection delivers: teamai's own, the CLI's and those pull generates from workflows, are left out.
   const skillsIn = (root: string): string[] => {
     const dir = path.join(root, '.claude', 'skills');
-    return fs.existsSync(dir) ? fs.readdirSync(dir).filter((name) => !name.startsWith('teamai')).sort() : [];
+    return fs.existsSync(dir)
+      ? fs.readdirSync(dir).filter((name) => !name.startsWith('teamai') && !name.startsWith('workflow-')).sort()
+      : [];
   };
   const setUpRepo = async (dir: string, args: string[], url = FAKE_URL): Promise<void> => {
     fs.mkdirSync(path.join(dir, '.claude'), { recursive: true });
@@ -152,7 +197,7 @@ describe('a workspace delivers what the repos inside it select (#913)', () => {
       git(['commit', '-q', '-m', 'learnings'], seed);
       git(['checkout', '-q', 'main'], seed);
       const bare = path.join(sandbox, `${name}.git`);
-      git(['clone', '-q', '--bare', seed, bare], sandbox);
+      cloneBare(seed, bare);
       git(['config', '--global', `url.${bare}.insteadOf`, url], sandbox, home);
     }
     cliEnv = { PATH: `${installGitRemoteGetUrlWrapper(path.join(sandbox, 'bin'))}${path.delimiter}${process.env.PATH ?? ''}` };
@@ -727,7 +772,7 @@ describe('a workspace keeps what is installed for a name it holds back (#913)', 
     git(['add', '-A'], seed);
     git(['commit', '-q', '-m', 'seed'], seed);
     const bare = path.join(sandbox, 'team.git');
-    git(['clone', '-q', '--bare', seed, bare], sandbox);
+    cloneBare(seed, bare);
     git(['config', '--global', `url.${bare}.insteadOf`, FAKE_URL], sandbox, home);
     cliEnv = { PATH: `${installGitRemoteGetUrlWrapper(path.join(sandbox, 'bin'))}${path.delimiter}${process.env.PATH ?? ''}` };
 
@@ -1158,8 +1203,8 @@ describe('a workspace keeps what is installed for a name it holds back (#913)', 
 
   it('keeps a held Cursor hook whose command runs teamai', async () => {
     const command = 'echo before && teamai env exec -- node check.js';
-    const hook = (seed: string, namespace: string, run: string): void => {
-      writeEntries(seed, 'hooks', namespace, { hooks: [{ id: 'marked-hook', description: 'fixture', event: 'Stop', command: run, tools: ['cursor'] }] });
+    const hook = (seed: string, namespace: string, hookCommand: string): void => {
+      writeEntries(seed, 'hooks', namespace, { hooks: [{ id: 'marked-hook', description: 'fixture', event: 'Stop', command: hookCommand, tools: ['cursor'] }] });
     };
     publish('platform defines marked-hook, which runs teamai', (seed) => hook(seed, 'platform', command));
     expect((await run(['pull'], ws)).code).toBe(0);
@@ -1180,8 +1225,8 @@ describe('a workspace keeps what is installed for a name it holds back (#913)', 
     const config = YAML.parse(fs.readFileSync(configFile, 'utf8'));
     fs.writeFileSync(configFile, YAML.stringify({ ...config, enabledAgents: [...config.enabledAgents, 'dsh'] }));
     const bridge = (): string => fs.readFileSync(path.join(home, '.teamai', 'dsh', 'hooks.json'), 'utf8');
-    const hook = (seed: string, namespace: string, run: string): void => {
-      writeEntries(seed, 'hooks', namespace, { hooks: [{ id: 'bridge-hook', description: 'fixture', event: 'Stop', command: run, tools: ['dsh'] }] });
+    const hook = (seed: string, namespace: string, hookCommand: string): void => {
+      writeEntries(seed, 'hooks', namespace, { hooks: [{ id: 'bridge-hook', description: 'fixture', event: 'Stop', command: hookCommand, tools: ['dsh'] }] });
     };
     publish('platform defines bridge-hook', (seed) => hook(seed, 'platform', 'echo prior-dsh'));
     expect((await run(['pull'], ws)).code).toBe(0);

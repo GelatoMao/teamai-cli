@@ -37,8 +37,8 @@ vi.mock('../config.js', async (importOriginal) => ({
 vi.mock('../providers/github/mr-fetch.js', () => ({
   fetchGitHubPR: vi.fn(async (url: string) => ({ title: 'Retry budget', description: '', commits: [], diff: '', url })),
 }));
-vi.mock('../utils/ai-client.js', () => ({
-  callClaude: vi.fn(async () => `---\ntitle: Retry budget\n---\n${DRAFT_BODY}\n`),
+vi.mock('../tool-launch/call.js', () => ({
+  callTool: vi.fn(async () => ({ text: `---\ntitle: Retry budget\n---\n${DRAFT_BODY}\n`, tool: 'claude' })),
 }));
 const { question } = vi.hoisted(() => ({ question: vi.fn(async (_prompt: string) => 'n') }));
 vi.mock('node:readline/promises', () => ({
@@ -48,7 +48,7 @@ vi.mock('node:readline/promises', () => ({
 import { importFromMR, parseLearningDraft } from '../import-mr.js';
 import { importCmd } from '../import.js';
 import { log, setSilent } from '../utils/logger.js';
-import { callClaude } from '../utils/ai-client.js';
+import { callTool } from '../tool-launch/call.js';
 import { fetchGitHubPR } from '../providers/github/mr-fetch.js';
 
 describe('parseLearningDraft', () => {
@@ -79,6 +79,53 @@ describe('parseLearningDraft', () => {
     const { data } = parseLearningDraft(raw);
     expect(data['title']).toBe('Y');
   });
+});
+
+describe('importFromMR AI draft metadata', () => {
+  let root: string;
+  const url = 'https://github.com/o/r/pull/1';
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-import-mr-metadata-'));
+    vi.mocked(log.info).mockClear();
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it.each([
+    { tags: 'agent', displayed: undefined },
+    { tags: 42, displayed: undefined },
+    { tags: { topic: 'agent' }, displayed: undefined },
+    { tags: ['agent', null, 42, { topic: 'retry' }, ['nested'], 'retry'], displayed: 'agent, retry' },
+    { tags: ['agent', 'retry'], displayed: 'agent, retry' },
+  ])('saves the original draft when tags are $tags', async ({ tags, displayed }) => {
+    const content = `---\ntitle: Retry budget\ntags: ${JSON.stringify(tags)}\n---\n${DRAFT_BODY}\n`;
+    vi.mocked(callTool).mockResolvedValueOnce({ text: content, tool: 'claude' });
+
+    const result = await importFromMR({ url, all: true, learningsDirs: [], outputDir: root });
+
+    expect(result.learning).toEqual({ title: 'Retry budget', content });
+    expect(result.learningFile).toBe(path.join(root, 'learning.md'));
+    expect(fs.readFileSync(result.learningFile!, 'utf8')).toBe(content);
+    expect(vi.mocked(log.info).mock.calls.map(([message]) => String(message)).filter((message) => message.startsWith('   Tags:')))
+      .toEqual(displayed ? [`   Tags: ${displayed}`] : []);
+  });
+
+  it.each([{ title: 42 }, { title: true }, { title: { text: 'Retry budget' } }, { title: ['Retry budget'] }])(
+    'uses the MR title to queue a draft with a non-string title $title', async ({ title }) => {
+      const content = `---\ntitle: ${JSON.stringify(title)}\ntags: [agent]\n---\n${DRAFT_BODY}\n`;
+      vi.mocked(callTool).mockResolvedValueOnce({ text: content, tool: 'claude' });
+      const queueLearning = vi.fn(async (filename: string) => path.join(root, filename));
+
+      const result = await importFromMR({ url, all: true, learningsDirs: [], queueLearning });
+
+      expect(result.learning).toEqual({ title: 'Retry budget', content });
+      expect(queueLearning).toHaveBeenCalledWith(expect.stringMatching(/^retry-budget-.*\.md$/), content);
+      expect(result.learningFile).toBe(await queueLearning.mock.results[0].value);
+    },
+  );
 });
 
 /**
@@ -227,7 +274,7 @@ describe('teamai import --from-mr <url...> (#1104)', () => {
     vi.mocked(log.warn).mockClear();
     vi.mocked(log.info).mockClear();
     vi.mocked(log.error).mockClear();
-    vi.mocked(callClaude).mockClear();
+    vi.mocked(callTool).mockClear();
     vi.mocked(fetchGitHubPR).mockClear();
     exitCode = process.exitCode;
   });
@@ -246,7 +293,7 @@ describe('teamai import --from-mr <url...> (#1104)', () => {
     }
 
     expect(vi.mocked(fetchGitHubPR).mock.calls.map(([url]) => url)).toEqual(urls);
-    expect(callClaude).toHaveBeenCalledTimes(2);
+    expect(callTool).toHaveBeenCalledTimes(2);
     expect(infos()).toContainEqual(`[1/2] ${urls[0]}`);
     expect(infos()).toContainEqual(`[2/2] ${urls[1]}`);
   });
@@ -274,7 +321,7 @@ describe('teamai import --from-mr <url...> (#1104)', () => {
       write.mockRestore();
     }
 
-    expect(vi.mocked(callClaude).mock.calls[0][0]).toContain('Write in English');
+    expect(vi.mocked(callTool).mock.calls[0][0]).toContain('Write in English');
   });
 
   it('keeps going when one MR fails, reports it and exits non-zero', async () => {
@@ -286,7 +333,7 @@ describe('teamai import --from-mr <url...> (#1104)', () => {
       write.mockRestore();
     }
 
-    expect(callClaude).toHaveBeenCalledTimes(1);
+    expect(callTool).toHaveBeenCalledTimes(1);
     expect(warnings()).toContainEqual(expect.stringContaining(`${urls[0]}`) && expect.stringContaining('MR not found'));
     expect(infos()).toContainEqual('Import from MR complete: 1 succeeded, 1 failed');
     expect(process.exitCode).toBe(1);

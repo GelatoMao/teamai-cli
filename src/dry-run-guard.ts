@@ -4,6 +4,8 @@ import type { Command } from 'commander';
  * `--dry-run` promises that nothing changes. A command that does not keep that
  * promise refuses the flag instead of running for real (#900). The guard reads
  * only this allowlist, so a new command is refused until it is listed here.
+ * Caches in the temporary directory (Node's compile cache, the git answers of
+ * src/utils/git-answers.ts) are not something a dry run changes.
  *
  * Keyed by full command path: leaf names collide (`add`, `remove`, `init`).
  * A path belongs here when its action honors `--dry-run` (forwards it and
@@ -124,9 +126,16 @@ export const NO_DRY_RUN_PREVIEW: Readonly<Record<string, string>> = {
   'contribute-check': 'hook-only',
   'todowrite-hint': 'hook-only',
   'mr-hint': 'hook-only',
+  'score-sessions': 'hook-only',
   'workflow start': 'creates a run and, with --driver local, runs its commands',
+  score: 'leases judge work, runs judges, writes labels and, with --push, publishes them',
   'workflow next': 'leases a step and writes the run',
   'workflow report': 'writes the reported step outcome',
+  'workflow respond': 'writes a HITL request answer',
+  'workflow retry': 'reopens steps and writes a new revision',
+  'workflow cancel': 'cancels steps or the run',
+  'workflow resume': 'runs the local driver and writes the run',
+  'workflow publish': 'writes the run to teamai-reports',
 };
 
 /** The refusal printed when a command has no `--dry-run` preview. */

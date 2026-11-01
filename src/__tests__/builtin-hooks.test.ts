@@ -1,16 +1,27 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
-import { builtinHookDefs, applyBuiltinOverride } from '../builtin-hooks.js';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { builtinHookDefs, applyBuiltinOverride, _resetShellCache } from '../builtin-hooks.js';
+
+beforeEach(() => _resetShellCache());
+afterEach(() => _resetShellCache());
 
 describe('builtinHookDefs — unified built-in hook model', () => {
-  it('returns 7 built-in defs for Claude in canonical order, all tagged source=builtin', () => {
+  it('returns 6 built-in defs for Claude in canonical order, all tagged source=builtin', () => {
     const defs = builtinHookDefs('claude');
-    expect(defs).toHaveLength(7);
+    expect(defs).toHaveLength(6);
     expect(defs.every((d) => d.source === 'builtin')).toBe(true);
     expect(defs.map((d) => d.event)).toEqual([
       'SessionStart', 'Stop',
-      'PostToolUse', 'PostToolUse', 'PostToolUse',
+      'PostToolUse', 'PostToolUse',
       'UserPromptSubmit', 'SubagentStop',
     ]);
+  });
+
+  it('installs no matcher-scoped Skill pass: the wildcard post-tool-use pass tracks skill use (#1221)', () => {
+    for (const tool of ['claude', 'cursor', 'copilot', 'codex', 'muse', 'zcode']) {
+      const defs = builtinHookDefs(tool);
+      expect(defs.some((d) => d.key === 'Hook dispatch post-tool-use Skill' || d.command.includes('--matcher Skill'))).toBe(false);
+      expect(defs.filter((d) => d.event === 'PostToolUse').map((d) => d.matcher)).toEqual(['*', 'TodoWrite']);
+    }
   });
 
   it('adds SubagentStop only for the agents that fire it (#884)', () => {
@@ -49,7 +60,7 @@ describe('builtinHookDefs — unified built-in hook model', () => {
 
   it('adds a lifecycle-complete SessionEnd hook only for Copilot', () => {
     const defs = builtinHookDefs('copilot');
-    expect(defs).toHaveLength(7);
+    expect(defs).toHaveLength(6);
     expect(defs.at(-1)).toEqual(expect.objectContaining({
       event: 'SessionEnd',
       matcher: '*',
@@ -64,9 +75,6 @@ describe('builtinHookDefs — unified built-in hook model', () => {
     const cursor = builtinHookDefs('cursor');
     expect(cursor.find((d) => d.key === 'Hook dispatch session-start')?.timeout).toBe(15);
     expect(cursor.find((d) => d.key === 'Hook dispatch post-tool-use TodoWrite')?.timeout).toBe(3);
-    const cursorSkill = cursor.find((d) => d.key === 'Hook dispatch post-tool-use Skill');
-    expect(cursorSkill?.matcher).toBe('Read');
-    expect(cursorSkill?.command).toContain('--matcher Skill');
     for (const tool of ['codex', 'codex-internal', 'tcodex']) {
       const codex = builtinHookDefs(tool);
       expect(codex.find((d) => d.key === 'Hook dispatch session-start')?.timeout).toBe(15);
@@ -84,7 +92,7 @@ describe('builtinHookDefs — unified built-in hook model', () => {
 // DSH's Windows hook runner is PowerShell (@deepseek-ai/dsh-pwsh-local), so the
 // POSIX `bash -lc "…"` wrapper is a ParserError there and every dsh hook failed
 // silently (issue #1005). The rendered command has to be PowerShell syntax on
-// Windows and keep the bash form everywhere else.
+// Windows and use the PATH wrapper on POSIX.
 describe('builtinHookDefs — dsh shell syntax by platform (#1005)', () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -111,18 +119,19 @@ describe('builtinHookDefs — dsh shell syntax by platform (#1005)', () => {
     const windows = builtinHookDefs('dsh');
     expect(windows.map((d) => d.key)).toEqual(posix.map((d) => d.key));
     windows.forEach((def, i) => {
-      const dispatch = posix[i].command.replace(/^bash -lc "(.+) 2>\/dev\/null" \|\| true$/, '$1');
+      const dispatch = posix[i].command.replace(/^PATH="\$HOME\/\.teamai\/bin:\$PATH" (.+) 2>\/dev\/null \|\| true$/, '$1');
       expect(dispatch).not.toBe(posix[i].command);
       expect(def.command).toBe(`${dispatch} 2>$null; exit 0`);
     });
   });
 
-  it('keeps the bash form on non-Windows platforms', () => {
+  it('uses the managed PATH wrapper without a login shell on POSIX', () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
     const defs = builtinHookDefs('dsh');
     expect(defs.length).toBeGreaterThan(0);
     for (const def of defs) {
-      expect(def.command).toContain('-lc');
+      expect(def.command).not.toContain('-lc');
+      expect(def.command).toContain('PATH="$HOME/.teamai/bin:$PATH" teamai');
       expect(def.command).toContain('2>/dev/null');
       expect(def.command).toContain('|| true');
       expect(def.command).not.toContain('2>$null');

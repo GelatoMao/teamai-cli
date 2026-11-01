@@ -192,14 +192,15 @@ describe('pre-push sync in single-repo mode (#823 items 2 and 10)', () => {
     expect(fs.readFileSync(activeRule(), 'utf8')).toBe(R1);
   });
 
-  it('still lists a genuine edit of a stale .teamai/rules copy as modified (#823 item 10)', async () => {
+  it('refuses a genuine edit of a stale .teamai/rules copy rather than push it over the teammate\'s update (#823 item 10)', async () => {
     await run(['pull']);
     teammateLandsOnMain('.teamai/rules/team-rule.md', R2);
     fs.writeFileSync(activeRule(), `${R1}\nA local edit.\n`);
 
-    const push = await run(['--dry-run', 'push']);
-    expect(push).toContain('[rules] team-rule (modified)');
-    expect(push).not.toContain(HELD);
+    const push = await runCLI(['--dry-run', 'push'], projectRoot, home);
+    expect(push.code, push.output).toBe(2);
+    expect(push.output).toContain('.teamai/rules/team-rule.md changed both here and on origin/main');
+    expect(push.output).not.toContain(HELD);
   });
 
   it('holds a stale .teamai/skills copy on a branch behind a teammate\'s update (#823 item 10)', async () => {
@@ -223,7 +224,7 @@ describe('pre-push sync in single-repo mode (#823 items 2 and 10)', () => {
     expect(push).toContain(`[skills] Skipped team-skill: .teamai/skills/team-skill is an older version of skills/team-skill, ${HELD}`);
   });
 
-  it('still lists a stale .teamai/skills copy whose branch file the member deleted as modified (#823 item 10)', async () => {
+  it('refuses a stale skill with a locally deleted branch file without resurrecting it (#823 item 10)', async () => {
     await run(['pull']);
     // The member's branch has the teammate's file, then falls behind again.
     teammateLandsOnMain('.teamai/skills/team-skill/reference.md', 'On the branch.\n');
@@ -231,19 +232,23 @@ describe('pre-push sync in single-repo mode (#823 items 2 and 10)', () => {
     teammateLandsOnMain('.teamai/skills/team-skill/SKILL.md', S1.replace('Version one.', 'Version two, from a teammate.'));
     fs.rmSync(path.join(activeSkill(), 'reference.md'));
 
-    const push = await run(['--dry-run', 'push']);
-    expect(push).toContain('[skills] team-skill (modified)');
-    expect(push).not.toContain(HELD);
+    const pushed = await runCLI(['--dry-run', 'push'], projectRoot, home);
+    expect(pushed.code, pushed.output).toBe(2);
+    expect(pushed.output).toContain('changed both here and on origin/main');
+    expect(pushed.output).toContain('Nothing was pushed');
+    expect(fs.existsSync(path.join(activeSkill(), 'reference.md'))).toBe(false);
   });
 
-  it('still lists a genuine edit of a stale .teamai/skills copy as modified (#823 item 10)', async () => {
+  it('refuses conflicting genuine skill edits and preserves the member copy (#823 item 10)', async () => {
     await run(['pull']);
     teammateLandsOnMain('.teamai/skills/team-skill/SKILL.md', S1.replace('Version one.', 'Version two, from a teammate.'));
     fs.writeFileSync(path.join(activeSkill(), 'SKILL.md'), `${S1}\nA local edit.\n`);
 
-    const push = await run(['--dry-run', 'push']);
-    expect(push).toContain('[skills] team-skill (modified)');
-    expect(push).not.toContain(HELD);
+    const pushed = await runCLI(['--dry-run', 'push'], projectRoot, home);
+    expect(pushed.code, pushed.output).toBe(2);
+    expect(pushed.output).toContain('changed both here and on origin/main');
+    expect(pushed.output).toContain('Nothing was pushed');
+    expect(fs.readFileSync(path.join(activeSkill(), 'SKILL.md'), 'utf8')).toBe(`${S1}\nA local edit.\n`);
   });
 });
 
@@ -406,11 +411,14 @@ describe('push base in user scope (#823 item 4)', () => {
 
   it('keeps comparing with the last pull\'s revision in an install no pull has recorded', async () => {
     await run(['pull']);
-    // An install upgraded from a CLI that kept no user-scope record.
-    const statePath = path.join(home, '.teamai', 'state.json');
-    const { lastPullByWorkspace: _dropped, ...unrecorded } = userState();
-    fs.writeFileSync(statePath, `${JSON.stringify(unrecorded, null, 2)}\n`);
-    expect(await run(['pull'])).toContain('Already synced');
+    // An install upgraded from a CLI that kept no user-scope record. It has no
+    // record of where skills went either, so its first pull syncs in full and
+    // records one (#1221); the push below runs without it again.
+    dropUserRecord();
+    const pull = await run(['pull']);
+    expect(pull).not.toContain('Already synced');
+    expect(pull).toContain('Team repo: already up to date');
+    dropUserRecord();
 
     const R2 = '# Team rule\n\nVersion two, from a teammate.\n';
     teammatePublishes(R2);
@@ -556,7 +564,7 @@ describe('placed agent in a stale linked worktree (#823 item 3)', () => {
     const published = await runCLI(['push', '--project', 'front-app', '--all'], projectRoot, home);
     expect(published.output).toContain('[agents] vr → agents/fe-agents/vr.yaml');
     const branch = git(['for-each-ref', '--format=%(refname:short)', 'refs/heads/teamai/'], remote)
-      .split('\n').filter(Boolean).at(-1) ?? '';
+      .split('\n').findLast(Boolean) ?? '';
     expect(branch).not.toBe('');
     onMain((clone) => {
       git(['merge', '--no-edit', '-q', `origin/${branch}`], clone);

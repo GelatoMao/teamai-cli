@@ -22,6 +22,8 @@ vi.mock('../utils/logger.js', () => ({
     debug: vi.fn(), error: vi.fn(), info: vi.fn(), success: vi.fn(), warn: vi.fn(), dim: vi.fn(),
   },
   setStderrOnly: vi.fn(),
+  isSilent: () => false,
+  setSilent: vi.fn(),
 }));
 
 import { loadLocalConfig, loadStateForScope, loadTeamConfig, saveStateForScope } from '../config.js';
@@ -177,6 +179,29 @@ describe('doctor — how agents resolved their model alias', () => {
       ].join('\n'),
     ]);
     expect(check(doctorReport, CHECK)).toEqual({ name: CHECK, ok: true });
+  });
+
+  it('says the Cursor CLI does not read the user agents it checks for Cursor (#1218)', async () => {
+    await agent({ name: 'plain' });
+
+    const doctorReport = await report();
+
+    expect(check(doctorReport,
+      'Agents delivered to cursor (the Cursor IDE reads them; the Cursor CLI reads agents only from the workspace)',
+    )).toBeDefined();
+    expect(check(doctorReport, 'Agents delivered to cursor')).toBeUndefined();
+    expect(doctorReport.notes?.some((note) => note.startsWith('Cursor:'))).toBe(false);
+  });
+
+  it('keeps the Cursor agents check unqualified in project scope (#1218)', async () => {
+    localConfig.scope = 'project';
+    localConfig.projectRoot = homeDir;
+    await agent({ name: 'plain' });
+
+    const doctorReport = await report();
+
+    expect(doctorReport.checks.filter((c) => c.name.startsWith('Agents delivered to cursor')).map((c) => c.name))
+      .toEqual(['Agents delivered to cursor']);
   });
 
   it('shows a switched Codex, the member\'s override, and what the last pull deployed until pull updates it', async () => {

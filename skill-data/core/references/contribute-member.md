@@ -16,9 +16,9 @@ thing now.
 ## Which kind of contribution?
 
 - **A learning** (a lesson, a gotcha, how you solved something) → this is
-  **automatic** once recall is on (off by default) and the teamai config loads: TeamAI prompts at the end of a session worth sharing and the
-  dedicated `share` workflow (`teamai skill get share`) takes over (it summarizes the
-  session and runs `teamai contribute`). The user does not come through this flow
+  **automatic** once recall is on (off by default) and the teamai config loads: TeamAI prompts at the end of a session worth sharing and
+  offers the `teamai-share-learnings` workflow, whose learning step runs the `share` skill
+  (`teamai skill get share`) to summarize the session before `teamai contribute`. The user does not come through this flow
   for it. (Step A below is only a manual fallback for while recall is off.)
 - **A reusable skill** (a `SKILL.md` others invoke) → author the skill, then
   `teamai push` (Step B — the main purpose of this reference).
@@ -102,7 +102,10 @@ The doc lands in the team's `learnings/` and appears for teammates on their next
    stays at the shared root and reaches the whole team. When an active project
    cannot be resolved (not in `manifest/projects.yaml`, or that file is
    missing), push stops with exit 2 until you fix it or pass `--role` /
-   `--project`. An edit of a skill, rule or agent you received from a namespace
+   `--project`, or explicitly choose the shared root with `--shared`. This flag
+   places new resources at the shared root even when namespaces exist and
+   cannot combine with `--role` or `--project`. Shared-root skills retain the
+   existing tag-subscription delivery rules. An edit of a skill, rule or agent you received from a namespace
    goes back to that namespace, even when it replaces a shared item of the same
    name; the shared one is left as it is. A delivered skill copy is pushed only
    when its recorded version matches exactly one current team skill, using that
@@ -120,6 +123,12 @@ The doc lands in the team's `learnings/` and appears for teammates on their next
    pushing it would revert a teammate's update. To publish an edit of it, bring
    the current version in first (`git fetch origin && git merge origin/<default>`,
    or copy the team's current file over it), redo the edit on top, and push again.
+   Any other team file under `.teamai/` that the default branch changed since
+   your branch left it is left out of the push when you did not edit it. A file
+   you edited too stops the push with exit 2; merge the default branch and push
+   again. Skills are checked as whole directories, including reference files
+   and deletions: a skill edit stops when it would replace any changed upstream
+   file with a stale local copy, even if you edited a different file.
 
 ## After contributing
 
@@ -129,7 +138,7 @@ The doc lands in the team's `learnings/` and appears for teammates on their next
 Before listing rules, `push` refreshes copies whose bodies still match a recorded
 sync revision. The header teamai generates for a tool's own rules format
 (Cursor `.mdc`, JoyCode's own `.mdc`, Copilot `applyTo`, Kiro `inclusion`, Qoder
-`trigger`, Trae `globs`/`alwaysApply`, CodeBuddy and WorkBuddy `alwaysApply`, Oh My Pi `alwaysApply`/`globs`) does not count as a local edit: unedited old copies update in that
+`trigger`, Trae `globs`/`alwaysApply`, CodeBuddy and WorkBuddy `alwaysApply`, Oh My Pi `alwaysApply`/`globs`, Antigravity `trigger`) does not count as a local edit: unedited old copies update in that
 format, including under `COPILOT_HOME` in user scope. Genuine local body edits remain push candidates.
 Rule pre-sync leaves tools excluded by `enabledAgents` or `disabledAgents` untouched.
 When only team `paths` change, `applyTo` refreshes if the local file still matches
@@ -146,7 +155,7 @@ team repo, then run `teamai pull`. Doctor also reports team-owned OpenCode globs
 or inline blocks left after the last rule is removed.
 
 A new file in the rules directory of a tool with a rules format of its own
-(Cursor, JoyCode, Copilot, Kiro, Qoder, Trae, CodeBuddy, WorkBuddy, Oh My Pi) is the
+(Cursor, JoyCode, Copilot, Kiro, Qoder, Trae, CodeBuddy, WorkBuddy, Oh My Pi, Antigravity) is the
 member's own rule in that tool's format: push never offers it, and pull leaves
 it. To author a new team rule, write it as a plain `.md` in `.claude/rules/`
 (scope it with `paths:` frontmatter, which teamai renders into each tool's

@@ -143,8 +143,11 @@ beforeEach(() => {
   for (const dir of [
     ['.claude', 'projects'],
     ['.claude-internal', 'projects'],
+    ['.qoder', 'projects'],
+    ['.qoder-cn', 'projects'],
     ['.codebuddy', 'projects'],
     ['.codex', 'sessions'],
+    ['.joycode', 'sessions'],
     ['.cursor', 'projects'],
     ['.local', 'share', 'opencode'],
     ['.workbuddy', 'projects'],
@@ -540,7 +543,7 @@ describe('a Codex copy that was archived', () => {
     const copied = await AgentSession.copy({ from, to });
     const id = copied.status === 'done' ? copied.sessionId : 'none';
     const sessionsDir = path.join(mocks.home, '.codex', 'sessions');
-    const [rel] = (fs.readdirSync(sessionsDir, { recursive: true }) as string[]).filter((f) => f.endsWith(`${id}.jsonl`));
+    const rel = (fs.readdirSync(sessionsDir, { recursive: true }) as string[]).find((f) => f.endsWith(`${id}.jsonl`))!;
     const archived = path.join(mocks.home, '.codex', 'archived_sessions', path.basename(rel));
     fs.mkdirSync(path.dirname(archived), { recursive: true });
     fs.renameSync(path.join(sessionsDir, rel), archived);

@@ -33,13 +33,20 @@ They are not written into the project's `AGENTS.md`. Each tool gets its own file
 | Codex family | `$CODEX_HOME/AGENTS.md` | session-start hook |
 | Cursor | `~/.cursor/rules/teamai-context.mdc`; in a workspace outside the home directory, the session-start hook | `.cursor/rules/teamai-context.mdc` |
 | CodeBuddy, WorkBuddy | each tool's user file | one shared `.codebuddy/rules/teamai-context.md` |
-| OpenCode | `~/.config/opencode/teamai-context.md` | `.opencode/teamai-context.md` |
-| Pi, Oh My Pi | each tool's user file | an extension adds them to the system prompt |
+| Qoder | `~/.qoder/rules/teamai-context.md` | `.qoder/rules/teamai-context.md` |
+| Qoder CN | `~/.qoder-cn/rules/teamai-context.md` | shared `.qoder/rules/teamai-context.md` |
+| Kiro | `~/.kiro/steering/teamai-context.md` | `.kiro/steering/teamai-context.md` |
+| Trae | `~/.trae/user_rules/teamai-context.md` | `.trae/rules/teamai-context.md` |
+| Trae CN | `~/.trae-cn/user_rules/teamai-context.md` | shared `.trae/rules/teamai-context.md` |
+| OpenCode | `$OPENCODE_CONFIG_DIR/teamai-context.md` when set, otherwise `${XDG_CONFIG_HOME:-~/.config}/opencode/teamai-context.md` | `.opencode/teamai-context.md` |
+| Pi | `$PI_CODING_AGENT_DIR/AGENTS.override.md` when set and present, otherwise `$PI_CODING_AGENT_DIR/AGENTS.md`; the same paths under `~/.pi/agent` when unset | an extension adds them to the system prompt |
+| Oh My Pi | its user file | an extension adds them to the system prompt |
 | Hermes | `$HERMES_HOME/SOUL.md` | the Hermes plugin |
-| ZCode | `~/.zcode/AGENTS.md` | only a `claudemd` named in `toolPaths` |
-| DeepSeek Harness | `$DSH_HOME/AGENTS.md` (`~/.dsh/AGENTS.md` when unset) | only a `claudemd` named in `toolPaths` |
-| JoyCode | `~/.joycode/rules.txt` | only a `claudemd` named in `toolPaths` |
-| Muse Code | `~/.config/muse/AGENTS.md` | only a `claudemd` named in `toolPaths` |
+| ZCode | `~/.zcode/AGENTS.md` | session-start hook |
+| DeepSeek Harness | `$DSH_HOME/AGENTS.md` (`~/.dsh/AGENTS.md` when unset) | session-start hook |
+| JoyCode | `$JOYCODE_HOME/rules.txt` when set, otherwise `~/.joycode/rules.txt` | none |
+| Muse Code | `${XDG_CONFIG_HOME:-~/.config}/muse/AGENTS.md` | session-start hook |
+| Antigravity | `~/.gemini/config/rules/teamai-context.md` | `.agents/rules/teamai-context.md` |
 
 ## Viewing the result
 

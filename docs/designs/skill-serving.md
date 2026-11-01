@@ -76,7 +76,7 @@ path (measured here from a 77-character one).
   `references/phases/`); a single-level scan would serve an incomplete skill.
 - **The stub lands where team skills land.** Deploy, the legacy prune,
   `recall disable` and `uninstall` resolve the skills directory through
-  `skillsDirForTool`, the resolver team-skill sync uses, so OpenClaw gets it in
+  `locate`, the resolver team-skill sync uses, so OpenClaw gets it in
   its workspace and Hermes under `HERMES_HOME` rather than under a tool root
   that agent never reads. The link guard walks from the scope root (home, or
   the project root) when the skills directory is under it, else from just above
@@ -127,7 +127,10 @@ path (measured here from a 77-character one).
   `team-wiki-codebase` and `teamai-share-learnings` classify as `[builtin]` and
   are skipped by the push scan by name alone (`isCliOwnedSkillName`), because a
   tree with that name is one a pre-stub release wrote until the first pull has
-  pruned it. That rule retires with `LEGACY_BUILTIN_SKILL_NAMES`.
+  pruned it. That rule retires with `LEGACY_BUILTIN_SKILL_NAMES`. A tree whose
+  SKILL.md carries the generated-workflow marker classifies as `[workflow]`
+  first: pull now writes the default workflow `teamai-share-learnings` under
+  that name.
 - **`skill get` has no `--json`.** #678 sketched one; the content is markdown for
   an agent to read, and the machine-readable half is `skill list --json`. An
   unknown flag on `skill get`, `--json` included, is warned about on stderr and
@@ -141,21 +144,21 @@ path (measured here from a 77-character one).
 
 ## Drift guards
 
-Two tests, both in the unit suite:
+`node scripts/check-docs.mjs` runs these checks as part of `npm run lint`:
 
-- `commands-reference.test.ts` renders `skill-data/core/references/commands.md`
+- `scripts/commands-reference.ts` renders `skill-data/core/references/commands.md`
   from the Commander table and diffs it. Regenerate with
-  `npx vitest run commands-reference -u`.
-- `skill-commands-exist.test.ts` resolves every `teamai …` string written
+  `node scripts/check-docs.mjs --write`.
+- `scripts/doc-checks/skill-commands-exist.ts` resolves every `teamai …` string written
   anywhere under `skill-data/` against that same table, and fails on an unknown
-  command, subcommand or flag. It carries cases proving it catches
+  command, subcommand or flag. The command tests prove it catches
   `teamai extract graph`, the command the wiki skill advertised for four
   releases, and a misspelled subcommand inside a group (`teamai skill gett`).
 
-A third, in `skill-content.test.ts`, asserts through `npm pack` that both
+A package acceptance test in `skill-content.test.ts` asserts through `npm pack` that both
 `skills/` and `skill-data/` are in the published tarball. Without it, a missing
 `package.json` "files" entry passes every other test and serves nothing once
-installed. The same file fails on Chinese text under `skills/` or `skill-data/`:
+installed. The documentation command also fails on Chinese text under `skills/` or `skill-data/`:
 both reach the agent as CLI output, which the repo keeps English.
 
 ## Migration

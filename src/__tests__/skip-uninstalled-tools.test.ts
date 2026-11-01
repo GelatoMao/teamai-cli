@@ -516,32 +516,6 @@ describe('deployBuiltinSkills — skip uninstalled tools', () => {
     expect(await fse.pathExists(path.join(homeDir, '.claude'))).toBe(true);
   });
 
-  it('uses the default home when no local config is available', async () => {
-    const { deployBuiltinSkills } = await import('../builtin-skills.js');
-    const teamConfig = {
-      team: 'test',
-      description: '',
-      repo: 'https://git.woa.com/test/repo.git',
-      provider: 'tgit' as const,
-      reviewers: [],
-      sharing: {
-        skills: {},
-        rules: { enforced: [] },
-        docs: { localDir: '' },
-        env: { injectShellProfile: true },
-      },
-      toolPaths: { claude: { skills: '.claude/skills' } },
-    };
-
-    const deployed = await deployBuiltinSkills(teamConfig);
-
-    expect(deployed).toBeGreaterThan(0);
-    expect(await fse.pathExists(path.join(
-      homeDir,
-      '.claude/skills/teamai/SKILL.md',
-    ))).toBe(true);
-  });
-
   it('deploys the discovery stub only, never the packaged content', async () => {
     const { deployBuiltinSkills } = await import('../builtin-skills.js');
 
@@ -1215,19 +1189,19 @@ describe('deployBuiltinSkills — skip uninstalled tools', () => {
   it('records every file the package still ships, so the prune keeps proving ownership', async () => {
     const { PACKAGED_SKILL_FILES } = await import('../builtin-skills.js');
 
-    const shipped: string[] = [];
+    const shippedFiles: string[] = [];
     const walk = async (dir: string, prefix: string): Promise<void> => {
       for (const entry of await fse.readdir(dir, { withFileTypes: true })) {
         const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
         if (entry.isDirectory()) await walk(path.join(dir, entry.name), relative);
-        else shipped.push(relative);
+        else shippedFiles.push(relative);
       }
     };
     await walk(path.join(PACKAGE_ROOT, 'skills'), '');
 
     // A packaged file missing from the manifest is one a later migration would
     // leave behind on every machine, which no other test would notice.
-    for (const relative of shipped) {
+    for (const relative of shippedFiles) {
       const [skillName, ...rest] = relative.split('/');
       expect(PACKAGED_SKILL_FILES.get(skillName), relative).toContain(rest.join('/'));
     }

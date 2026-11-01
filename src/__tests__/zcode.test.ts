@@ -5,9 +5,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { builtinHookDefs } from '../builtin-hooks.js';
 import { KNOWN_AGENTS } from '../known-agents.js';
 import { getHookStatus, hasTeamaiHooks, reconcileHooks } from '../hooks.js';
-import { agentFileExtensionForTool, ALL_SUPPORTED_TOOLS } from '../resources/agent-format.js';
-import { detectMcpFormat } from '../resources/mcp-format.js';
+import { agentFileExtensionForTool } from '../resources/agent-format.js';
 import { HookDef, TeamaiConfigSchema } from '../types.js';
+import { AGENT_TOOLS } from '../tools.js';
 
 describe('ZCode support', () => {
   afterEach(() => vi.unstubAllEnvs());
@@ -19,7 +19,8 @@ describe('ZCode support', () => {
       skills: '.zcode/skills',
       agents: '.zcode/agents',
       settings: '.zcode/cli/config.json',
-      mcp: '.agents/mcp.json',
+      mcp: '.zcode/cli/config.json',
+      mcpProject: '.zcode/config.json',
     });
   });
 
@@ -28,9 +29,8 @@ describe('ZCode support', () => {
       displayName: 'ZCode',
       skillsPath: '.zcode/skills',
     });
-    expect(ALL_SUPPORTED_TOOLS).toContain('zcode');
+    expect(AGENT_TOOLS).toContain('zcode');
     expect(agentFileExtensionForTool('zcode')).toBe('.md');
-    expect(detectMcpFormat('zcode')).toBe('claude');
   });
 
   it('generates raw (unwrapped) dispatch commands for ZCode', () => {
@@ -40,7 +40,7 @@ describe('ZCode support', () => {
     for (const def of defs) {
       // Process-type entries get their shell wrapper added by the ZCode writer
       // (bash + args), so the command itself must be wrapper-free.
-      expect(def.command.startsWith('teamai hook-dispatch ')).toBe(true);
+      expect(def.command).toMatch(/^(?:PATH="\$HOME\/\.teamai\/bin:\$PATH" )?teamai hook-dispatch /);
       expect(def.command).toContain('--tool zcode');
       expect(def.command).not.toContain('bash -lc');
     }
@@ -85,7 +85,7 @@ describe('ZCode support', () => {
           } else {
             // POSIX has no console-flash problem: the tail runs directly.
             expect(hook.command).toBe('bash');
-            expect(hook.args?.[0]).toBe('-lc');
+            expect(hook.args?.[0]).toBe('-c');
           }
           // The command tail is the LAST argv slot on every platform, stored
           // verbatim for managed-entry detection and the manifest.
@@ -175,11 +175,11 @@ describe('ZCode support', () => {
       // The legacy entry must be recognized as managed and replaced, not
       // kept alongside a fresh copy. The fresh entry carries the tail as its
       // LAST argv slot on every platform ([launcherPath, tail] on win32,
-      // ['-lc', tail] on POSIX) and no mode slot.
+      // ['-c', tail] on POSIX) and no mode slot.
       expect(withPayload).toHaveLength(1);
       const fresh = withPayload[0].hooks[0].args ?? [];
       expect(fresh).toHaveLength(2);
-      expect(fresh[1]).toBe('teamai hook-dispatch session-start --tool zcode');
+      expect(fresh[1]).toBe(builtinHookDefs('zcode').find((def) => def.event === 'SessionStart')!.command);
       expect(fresh.some((a) => a === 'wait')).toBe(false);
     } finally {
       await fse.remove(home);

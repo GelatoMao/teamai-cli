@@ -60,8 +60,13 @@ function fixture(agent: keyof typeof agents, provider: string, team: Record<stri
         tokens: { input: 10, output: 5, cacheRead: 0, cacheCreation: 0 }, dataHomeKey: key },
     ].map((e) => JSON.stringify(e)).join('\n') + '\n');
   }
-  function receiver(mode: 'slow' | 'reject' | 'normal') {
-    fs.writeFileSync(path.join(remote, 'hooks/update'), `#!/bin/sh\nif [ "$1" = "refs/heads/teamai-reports" ]; then\n  ${mode === 'slow' ? 'sleep 7' : mode === 'reject' ? 'exit 1' : ':'}\nfi\nexit 0\n`, { mode: 0o755 });
+  function receiver(mode: 'slow' | 'reject' | 'normal' | 'slow-reject') {
+    // Only the first rejection must outlast pull's wait; later report writes can reject immediately.
+    const delay = mode === 'slow-reject'
+      ? 'if [ ! -f hooks/rejection-delayed ]; then : > hooks/rejection-delayed; sleep 7; fi'
+      : 'sleep 7';
+    const action = `${mode.startsWith('slow') ? `${delay}\n` : ''}${mode.endsWith('reject') ? 'exit 1' : ':'}`;
+    fs.writeFileSync(path.join(remote, 'hooks/update'), `#!/bin/sh\nif [ "$1" = "refs/heads/teamai-reports" ]; then\n  ${action}\nfi\nexit 0\n`, { mode: 0o755 });
   }
   async function pull(onPending?: () => void) {
     return new Promise<string>((resolve, reject) => {
@@ -103,7 +108,14 @@ function fixture(agent: keyof typeof agents, provider: string, team: Record<stri
   function run(args: string[]) {
     return execFileSync(process.execPath, [cli, ...args], { cwd: sandbox, env, encoding: 'utf8', windowsHide: true });
   }
-  return { home, env, clone, usage, usageLine, dashboard, seedEvents, receiver, pull, stats, snapshot, run, runId };
+  /** The detached background pass that a host's SessionStart hook spawns, which runs the pull. */
+  function sessionStart() {
+    return execFileSync(process.execPath, [cli, 'hook-dispatch', 'session-start', '--tool', agent, '--bg-only'], {
+      cwd: sandbox, env, encoding: 'utf8', windowsHide: true, timeout: 45_000,
+      input: JSON.stringify({ cwd: sandbox, session_id: 's2' }),
+    });
+  }
+  return { home, env, clone, usage, usageLine, dashboard, seedEvents, receiver, pull, stats, snapshot, run, sessionStart, runId };
 }
 
 afterAll(() => {
@@ -118,35 +130,35 @@ describe('real CLI report completion', () => {
   for (const provider of ['git', 'gitlab', 'github']) {
     for (const agent of Object.keys(agents) as Array<keyof typeof agents>) {
       // Concurrent: each case mostly waits out the remote's slow push, in its own sandbox.
-      it.concurrent(`acknowledges slow pushes once: ${provider}/${agent}`, async ({ expect }) => {
+      it.concurrent(`acknowledges slow pushes once: ${provider}/${agent}`, async ({ expect: concurrentExpect }) => {
         const f = fixture(agent, provider);
         await f.pull(); // Warm reports worktree without any session data.
         await f.seedEvents();
         f.receiver('slow');
         const output = await f.pull(() => {
-          expect(fs.readFileSync(f.usage, 'utf8')).toBe(f.usageLine);
-          expect(f.snapshot('prompt-tokens')[f.runId]).toBeUndefined();
-          expect(fs.existsSync(path.join(f.home, '.teamai/.sync-lock'))).toBe(true);
+          concurrentExpect(fs.readFileSync(f.usage, 'utf8')).toBe(f.usageLine);
+          concurrentExpect(f.snapshot('prompt-tokens')[f.runId]).toBeUndefined();
+          concurrentExpect(fs.existsSync(path.join(f.home, '.teamai/.sync-lock'))).toBe(true);
           // An event arriving during the push must survive cleanup of the batch.
           fs.appendFileSync(f.usage, f.usageLine);
         });
-        expect(output).toContain('Auto-report is still running after 5s');
-        expect(f.stats().skills.review.count).toBe(1);
-        expect(fs.readFileSync(f.usage, 'utf8')).toBe(f.usageLine);
+        concurrentExpect(output).toContain('Auto-report is still running after 5s');
+        concurrentExpect(f.stats().skills.review.count).toBe(1);
+        concurrentExpect(fs.readFileSync(f.usage, 'utf8')).toBe(f.usageLine);
         for (const name of ['interventions', 'prompt-tokens', 'daily-sessions']) {
-          expect(f.snapshot(name)[f.runId]).toBeDefined();
+          concurrentExpect(f.snapshot(name)[f.runId]).toBeDefined();
         }
-        expect(fs.existsSync(path.join(f.home, '.teamai/.sync-lock'))).toBe(false);
+        concurrentExpect(fs.existsSync(path.join(f.home, '.teamai/.sync-lock'))).toBe(false);
         f.receiver('normal');
         await f.pull();
         const stats = f.stats();
-        expect(stats.skills.review.count).toBe(2);
-        expect(stats.prompts).toBe(1);
-        expect(stats.tokens.input).toBe(10);
-        expect(stats.interventions.sessions).toBe(1);
-        expect(fs.readFileSync(f.usage, 'utf8')).toBe('');
+        concurrentExpect(stats.skills.review.count).toBe(2);
+        concurrentExpect(stats.prompts).toBe(1);
+        concurrentExpect(stats.tokens.input).toBe(10);
+        concurrentExpect(stats.interventions.sessions).toBe(1);
+        concurrentExpect(fs.readFileSync(f.usage, 'utf8')).toBe('');
         await f.pull();
-        expect(f.stats()).toEqual(stats);
+        concurrentExpect(f.stats()).toEqual(stats);
       }, 60_000);
     }
   }
@@ -154,18 +166,96 @@ describe('real CLI report completion', () => {
   it('retains a rejected report and retries its committed tree without counting twice', async () => {
     const f = fixture('codex', 'git');
     await f.pull();
+    expect(f.run(['status'])).not.toContain('auto-report:');
     await f.seedEvents();
     f.receiver('reject');
     await f.pull();
+    const statePath = path.join(f.home, '.teamai/state.json');
+    const since = JSON.parse(fs.readFileSync(statePath, 'utf8')).autoReportPendingSince;
+    expect(since).toEqual(expect.any(String));
+    const pending = f.run(['status']);
+    expect(pending).toContain(`auto-report: pending since ${since}`);
+    expect(pending).toContain('teamai pull --verbose');
+    await f.pull();
+    expect(JSON.parse(fs.readFileSync(statePath, 'utf8')).autoReportPendingSince).toBe(since);
     expect(fs.readFileSync(f.usage, 'utf8')).toBe(f.usageLine);
     expect(f.snapshot('prompt-tokens')[f.runId]).toBeUndefined();
     f.receiver('normal');
     await f.pull();
+    expect(f.run(['status'])).not.toContain('auto-report:');
+    expect(JSON.parse(fs.readFileSync(statePath, 'utf8'))).not.toHaveProperty('autoReportPendingSince');
     const stats = f.stats();
     expect(stats.skills.review.count).toBe(1);
     expect(stats.prompts).toBe(1);
     expect(stats.tokens.input).toBe(10);
     expect(fs.readFileSync(f.usage, 'utf8')).toBe('');
+  }, 60_000);
+
+  // The dispatcher exits once its handlers settle, which must not cut the push the pull stopped waiting for (#1322).
+  it('publishes a slow push started by the session-start hook before the hook process exits', async () => {
+    const f = fixture('claude', 'git');
+    await f.pull(); // Warm reports worktree without any session data.
+    await f.seedEvents();
+    f.receiver('slow');
+    f.sessionStart();
+    expect(f.stats().skills.review.count).toBe(1);
+    expect(fs.readFileSync(f.usage, 'utf8')).toBe('');
+    expect(fs.existsSync(path.join(f.home, '.teamai/.sync-lock'))).toBe(false);
+  }, 60_000);
+
+  it('keeps a rejected session-start report retryable and releases its locks', async () => {
+    const f = fixture('claude', 'git');
+    await f.pull();
+    await f.seedEvents();
+    f.receiver('slow-reject');
+    f.sessionStart();
+    expect(f.run(['status'])).toMatch(/auto-report: pending since .*teamai pull --verbose/);
+    expect(fs.readFileSync(f.usage, 'utf8')).toBe(f.usageLine);
+    expect(f.snapshot('prompt-tokens')[f.runId]).toBeUndefined();
+    for (const lock of ['.reports-lock', '.sync-lock']) {
+      expect(fs.existsSync(path.join(f.home, '.teamai', lock)), lock).toBe(false);
+    }
+    f.receiver('normal');
+    await f.pull();
+    expect(f.run(['status'])).not.toContain('auto-report:');
+    const stats = f.stats();
+    expect(stats.skills.review.count).toBe(1);
+    expect(stats.prompts).toBe(1);
+    expect(stats.tokens.input).toBe(10);
+    expect(fs.readFileSync(f.usage, 'utf8')).toBe('');
+    expect(f.snapshot('prompt-tokens')[f.runId]).toBeDefined();
+    await f.pull();
+    expect(f.stats()).toEqual(stats);
+  }, 60_000);
+
+  it.each(['member', 'team'])('clears a pending report when the %s disables reporting after a rejection', async (optOut) => {
+    const f = fixture('claude', 'git');
+    await f.pull();
+    await f.seedEvents();
+    f.receiver('reject');
+    await f.pull();
+    expect(f.run(['status'])).toContain('auto-report: pending since');
+    const retainedUsage = fs.readFileSync(f.usage, 'utf8');
+
+    if (optOut === 'member') {
+      const configPath = path.join(f.home, '.teamai/config.yaml');
+      const config = YAML.parse(fs.readFileSync(configPath, 'utf8'));
+      fs.writeFileSync(configPath, YAML.stringify({ ...config, usageReportEnabled: false }));
+    } else {
+      const teamPath = path.join(f.clone, 'teamai.yaml');
+      const config = YAML.parse(fs.readFileSync(teamPath, 'utf8'));
+      fs.writeFileSync(teamPath, YAML.stringify({ ...config, usageReport: false }));
+      git(['add', 'teamai.yaml'], f.clone, f.env);
+      git(['commit', '-q', '-m', 'disable usage reporting'], f.clone, f.env);
+      git(['push', '-q', 'origin', 'HEAD:main'], f.clone, f.env);
+    }
+    await f.pull();
+
+    expect(f.run(['status'])).not.toContain('auto-report:');
+    expect(JSON.parse(fs.readFileSync(path.join(f.home, '.teamai/state.json'), 'utf8')))
+      .not.toHaveProperty('autoReportPendingSince');
+    expect(fs.readFileSync(f.usage, 'utf8')).toBe(retainedUsage);
+    expect(f.snapshot('prompt-tokens')[f.runId]).toBeUndefined();
   }, 60_000);
 
   it('does not report for a member who set usageReportEnabled: false', async () => {
@@ -177,6 +267,7 @@ describe('real CLI report completion', () => {
     await f.pull();
     expect(() => f.stats()).toThrow();
     expect(fs.readFileSync(f.usage, 'utf8')).toBe(f.usageLine);
+    expect(f.run(['status'])).not.toContain('auto-report:');
     expect(f.run(['stats'])).toMatch(/review\s+1 uses/);
   }, 60_000);
 });

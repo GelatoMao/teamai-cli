@@ -3,12 +3,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import YAML from 'yaml';
 import { parse as parseToml } from 'smol-toml';
+import { withoutTomlBom } from '../utils/toml.js';
 import { getUserHome } from '../utils/home.js';
+import { agyGatewayOf, agyKeyFilePath, agyKeyFunction } from './agy-gateway.js';
+import { toolHome } from '../tool-home.js';
 import { pathExists, writeFileAtomic, writeJsonAtomic } from '../utils/fs.js';
 import { acquireLock, releaseLock } from '../update.js';
 import { entryHash } from '../resources/mcp-format.js';
 import { detectShellProfile, SHELL_PROFILE_CANDIDATE_NAMES, shellQuoteValue, toGeneratedForm } from '../utils/shell-profile.js';
-import type { LocalConfig } from '../types.js';
+import { resolveMemberToolRoots } from '../config.js';
+import { recordedToolRootDir, RELOCATABLE_TOOLS, type LocalConfig } from '../types.js';
 import { ALL_MODEL_AGENTS, type ModelAgent, type ModelProtocol, type ResolvedModelProfile, sameTeamIdentity } from './profile.js';
 
 export { ALL_MODEL_AGENTS } from './profile.js';
@@ -82,18 +86,36 @@ async function withManifestLock<T>(run: () => Promise<T>): Promise<T> {
   finally { await releaseLock(file); }
 }
 
-function claudeSettingsPath(): string {
-  return path.join(process.env.CLAUDE_CONFIG_DIR?.trim() || path.join(getUserHome(), '.claude'), 'settings.json');
+/** Claude's and Codex's roots, read once for one model operation (`agentRootsOf`). */
+type AgentRoots = { readonly claude: string; readonly codex: string };
+
+/**
+ * Claude's and Codex's roots: the shell's CLAUDE_CONFIG_DIR or CODEX_HOME when it sets one,
+ * as a switch made from that shell recorded; else the root `teamai init` recorded in the
+ * scope's config (the one `pull` passes, else `resolveMemberToolRoots`), so a shell without
+ * the variable still writes where the tool reads (#1221); else the default.
+ */
+async function agentRootsOf(localConfig: Pick<LocalConfig, 'toolRoots'> | undefined, dryRun: boolean | undefined): Promise<AgentRoots> {
+  const toolRoots = localConfig ? localConfig.toolRoots : await resolveMemberToolRoots(undefined, { dryRun });
+  const rootOf = (tool: 'claude' | 'codex'): string => {
+    const { envVar, defaultRoot } = RELOCATABLE_TOOLS[tool];
+    return process.env[envVar]?.trim() || recordedToolRootDir(tool, toolRoots) || path.join(getUserHome(), defaultRoot);
+  };
+  return { claude: rootOf('claude'), codex: rootOf('codex') };
 }
 
-function codexSettingsPath(): string {
-  return path.join(process.env.CODEX_HOME?.trim() || path.join(getUserHome(), '.codex'), 'config.toml');
+function claudeSettingsPath(roots: AgentRoots): string {
+  return path.join(roots.claude, 'settings.json');
+}
+
+function codexSettingsPath(roots: AgentRoots): string {
+  return path.join(roots.codex, 'config.toml');
 }
 
 function openCodeSettingsPath(): string {
   const custom = process.env.OPENCODE_CONFIG?.trim();
   if (custom) return custom;
-  return path.join(process.env.XDG_CONFIG_HOME?.trim() || path.join(getUserHome(), '.config'), 'opencode', 'opencode.json');
+  return path.join(toolHome('opencode'), 'opencode.json');
 }
 
 /**
@@ -103,16 +125,14 @@ function openCodeSettingsPath(): string {
  * deliberately never written.
  */
 function piSettingsPath(): string {
-  const dir = process.env.PI_CODING_AGENT_DIR?.trim() || path.join(getUserHome(), '.pi', 'agent');
-  return path.join(dir, 'models.json');
+  return path.join(toolHome('pi'), 'models.json');
 }
 
 /**
- * OMP (Oh My Pi) keeps its provider catalog in `models.yml` under the default
- * agent dir. Only that default layout is supported: `PI_CODING_AGENT_DIR`
- * relocates the agent dir and is honored for Pi above, so reading it here too
- * would send OMP's file into Pi's directory (or the reverse) on a machine that
- * sets it for either tool. The OMP hook adapter takes the same position.
+ * OMP (Oh My Pi) keeps its provider catalog in `models.yml` in its agent dir,
+ * which a profile or `PI_CONFIG_DIR` moves (`TOOLS.omp.home`). teamai does not
+ * follow `PI_CODING_AGENT_DIR` for OMP: it is honored for Pi above, so
+ * following it here too would send OMP's file into Pi's directory.
  *
  * The file is YAML, not JSON, and OMP only ever reads it — it rewrites neither
  * the file nor its layout, so TeamAI owns the bytes. An `apiKey` is used
@@ -120,26 +140,44 @@ function piSettingsPath(): string {
  * held in the environment cannot stay there and is written out resolved.
  */
 function ompSettingsPath(): string {
-  return path.join(getUserHome(), '.omp', 'agent', 'models.yml');
+  return path.join(toolHome('omp'), 'models.yml');
 }
 
 /** Muse Code reads `model` and `endpoint_transport` from its user settings.json. */
 function museSettingsPath(): string {
-  return path.join(getUserHome(), '.config', 'muse', 'settings.json');
+  return path.join(toolHome('muse'), 'settings.json');
 }
 
-function agentSettingsPath(agent: ModelAgent): string {
-  if (agent === 'claude') return claudeSettingsPath();
+/** Antigravity CLI keeps its settings beside its config root, in ~/.gemini/antigravity-cli. */
+function agySettingsPath(): string {
+  return path.join(toolHome('agy'), '..', 'antigravity-cli', 'settings.json');
+}
+
+function agentSettingsPath(agent: ModelAgent, roots: AgentRoots): string {
+  if (agent === 'claude') return claudeSettingsPath(roots);
+  if (agent === 'codex') return codexSettingsPath(roots);
+  return ownSettingsPath(agent);
+}
+
+/** The settings file of an agent no `toolRoots` entry moves. */
+function ownSettingsPath(agent: Exclude<ModelAgent, 'claude' | 'codex'>): string {
   if (agent === 'muse') return museSettingsPath();
-  if (agent === 'codex') return codexSettingsPath();
+  if (agent === 'agy') return agySettingsPath();
   if (agent === 'opencode') return openCodeSettingsPath();
   if (agent === 'pi') return piSettingsPath();
   if (agent === 'omp') return ompSettingsPath();
+  if (agent === 'codebuddy') return path.join(toolHome('codebuddy'), 'models.json');
   return path.join(getUserHome(), `.${agent}`, 'models.json');
 }
 
-function sameAgentSettingsPath(agent: ModelAgent, state: AgentState): boolean {
-  return !state.filePath || path.resolve(agentSettingsPath(agent)) === path.resolve(state.filePath);
+function sameAgentSettingsPath(agent: ModelAgent, state: AgentState, roots: AgentRoots): boolean {
+  return !state.filePath || path.resolve(agentSettingsPath(agent, roots)) === path.resolve(state.filePath);
+}
+
+/** Why a switch whose settings file is not the one the agent uses now is left alone, and how to undo it. */
+function movedSettingsMessage(agent: ModelAgent, state: AgentState, roots: AgentRoots): string {
+  return `${agent} uses ${agentSettingsPath(agent, roots)} now, but TeamAI switched ${state.filePath}; leaving both untouched. `
+    + `To undo that switch, run \`teamai models restore --agent ${agent}\` from a shell where ${agent} uses ${state.filePath}.`;
 }
 
 async function readOptionalFile(file: string): Promise<string | null> {
@@ -280,7 +318,7 @@ async function yamlObject(file: string): Promise<Record<string, unknown>> {
   try {
     parsed = YAML.parse(raw);
   } catch (error) {
-    throw new Error(`Cannot parse ${file}: ${(error as Error).message}`);
+    throw new Error(`Cannot parse ${file}: ${(error as Error).message}`, { cause: error });
   }
   if (parsed === null || parsed === undefined) return {};
   if (!isRecord(parsed)) {
@@ -307,7 +345,7 @@ async function jsonObject(file: string): Promise<Record<string, unknown>> {
   try {
     parsed = JSON.parse(raw);
   } catch (error) {
-    throw new Error(`Cannot parse ${file}: ${(error as Error).message}`);
+    throw new Error(`Cannot parse ${file}: ${(error as Error).message}`, { cause: error });
   }
   if (!isRecord(parsed)) {
     throw new Error(`Cannot update ${file}: the root must be a JSON object`);
@@ -315,15 +353,18 @@ async function jsonObject(file: string): Promise<Record<string, unknown>> {
   return parsed;
 }
 
-async function installed(agent: ModelAgent): Promise<boolean> {
-  return pathExists(path.dirname(agentSettingsPath(agent)));
+async function installed(agent: ModelAgent, roots: AgentRoots): Promise<boolean> {
+  return pathExists(path.dirname(agentSettingsPath(agent, roots)));
 }
 
 function supportedRoute(agent: ModelAgent, profile: ResolvedModelProfile): boolean {
   if (agent === 'claude') return !!profile.routes.anthropic;
   if (agent === 'codex' || agent === 'muse') return !!profile.routes['openai-responses'];
-  // OpenCode, Pi and OMP name an api per model, so any serves any protocol.
-  if (agent === 'opencode' || agent === 'pi' || agent === 'omp') return Object.keys(profile.routes).length > 0;
+  if (agent === 'agy') return !!profile.routes.gemini;
+  // OpenCode, Pi and OMP name an api per model, so any serves an Anthropic or OpenAI protocol.
+  if (agent === 'opencode' || agent === 'pi' || agent === 'omp') {
+    return !!(profile.routes.anthropic || profile.routes['openai-responses'] || profile.routes['openai-chat-completions']);
+  }
   return !!profile.routes['openai-chat-completions'];
 }
 
@@ -431,7 +472,7 @@ function piKeyOf(reference: unknown): string | null {
 
 /** The file and reader for the Pi-family agent whose provider TeamAI manages. */
 async function piDoc(agent: 'pi' | 'omp'): Promise<Record<string, unknown>> {
-  const file = agentSettingsPath(agent);
+  const file = ownSettingsPath(agent);
   const doc = agent === 'omp' ? await yamlObject(file) : await jsonObject(file);
   if (doc.providers !== undefined && !isRecord(doc.providers)) {
     throw new Error(`Cannot update ${file}: providers must be an object`);
@@ -448,7 +489,7 @@ async function piDoc(agent: 'pi' | 'omp'): Promise<Record<string, unknown>> {
  * does not use it, so re-pointing a profile at a different ref leaves no orphan.
  */
 async function writePi(agent: 'pi' | 'omp', snapshot: PiSnapshot, previousManaged?: unknown): Promise<void> {
-  const file = agentSettingsPath(agent);
+  const file = ownSettingsPath(agent);
   const doc = await piDoc(agent);
   const providers = { ...(isRecord(doc.providers) ? doc.providers : {}) };
   const managed = piKeyOf(previousManaged);
@@ -485,8 +526,8 @@ function claudeSnapshot(settings: Record<string, unknown>): ClaudeSnapshot {
   } as ClaudeSnapshot;
 }
 
-async function writeClaude(snapshot: ClaudeSnapshot): Promise<void> {
-  const file = claudeSettingsPath();
+async function writeClaude(snapshot: ClaudeSnapshot, roots: AgentRoots): Promise<void> {
+  const file = claudeSettingsPath(roots);
   const settings = await jsonObject(file);
   if (settings.env !== undefined && !isRecord(settings.env)) {
     throw new Error(`Cannot update ${file}: env must be an object`);
@@ -541,9 +582,9 @@ const CODEX_PROVIDER_BLOCK_RE = /^\[model_providers\.teamai\]\s*$[\s\S]*?(?=^\[(
 
 function parseCodex(source: string): Record<string, unknown> {
   try {
-    return parseToml(source) as Record<string, unknown>;
+    return parseToml(withoutTomlBom(source)) as Record<string, unknown>;
   } catch (error) {
-    throw new Error(`Cannot parse Codex config.toml: ${(error as Error).message}`);
+    throw new Error(`Cannot parse Codex config.toml: ${(error as Error).message}`, { cause: error });
   }
 }
 
@@ -557,7 +598,7 @@ function codexSnapshot(source: string): CodexSnapshot {
   return {
     model: parsed.model as string | undefined,
     model_provider: parsed.model_provider as string | undefined,
-    providerBlock: source.match(CODEX_PROVIDER_BLOCK_RE)?.[0].replace(/\n+$/, ''),
+    providerBlock: withoutTomlBom(source).match(CODEX_PROVIDER_BLOCK_RE)?.[0].replace(/\n+$/, ''),
   };
 }
 
@@ -567,21 +608,22 @@ function setTopLevelString(source: string, key: string, value: string | undefine
   const top = firstTable < 0 ? source : source.slice(0, firstTable);
   const tables = firstTable < 0 ? '' : source.slice(firstTable);
   if (re.test(top)) {
-    const updated = top.replace(re, (line, prefix: string, oldValue: string) => {
-      if (value === undefined) return '';
-      let quote: '"' | "'" | null = null;
-      let escaped = false;
-      let comment = '';
-      for (let i = 0; i < oldValue.length; i++) {
-        const char = oldValue[i];
-        if (escaped) { escaped = false; continue; }
-        if (quote === '"' && char === '\\') { escaped = true; continue; }
-        if (quote) { if (char === quote) quote = null; continue; }
-        if (char === '"' || char === "'") { quote = char; continue; }
-        if (char === '#') { comment = oldValue.slice(i).trimEnd(); break; }
-      }
-      return `${prefix}${JSON.stringify(value)}${comment ? ` ${comment}` : ''}`;
-    });
+    const updated = value === undefined
+      ? top.replace(new RegExp(`${re.source}(?:\\r?\\n|$)`, 'm'), '')
+      : top.replace(re, (line, prefix: string, oldValue: string) => {
+        let quote: '"' | "'" | null = null;
+        let escaped = false;
+        let comment = '';
+        for (let i = 0; i < oldValue.length; i++) {
+          const char = oldValue[i];
+          if (escaped) { escaped = false; continue; }
+          if (quote === '"' && char === '\\') { escaped = true; continue; }
+          if (quote) { if (char === quote) quote = null; continue; }
+          if (char === '"' || char === "'") { quote = char; continue; }
+          if (char === '#') { comment = oldValue.slice(i).trimEnd(); break; }
+        }
+        return `${prefix}${JSON.stringify(value)}${comment ? ` ${comment}` : ''}`;
+      });
     return updated + tables;
   }
   if (value === undefined) return source;
@@ -592,15 +634,18 @@ function setTopLevelString(source: string, key: string, value: string | undefine
 
 function setCodexProviderBlock(source: string, block: string | undefined): string {
   if (CODEX_PROVIDER_BLOCK_RE.test(source)) {
-    return source.replace(CODEX_PROVIDER_BLOCK_RE, block ? `${block}\n\n` : '');
+    const updated = source.replace(CODEX_PROVIDER_BLOCK_RE, block ? `${block}\n\n` : '');
+    return block === undefined ? updated.replace(/\n{2,}$/, '\n') : updated;
   }
   if (!block) return source;
   return `${source.trimEnd()}${source.trim() ? '\n\n' : ''}${block}\n`;
 }
 
-async function writeCodex(snapshot: CodexSnapshot): Promise<void> {
-  const file = codexSettingsPath();
+async function writeCodex(snapshot: CodexSnapshot, roots: AgentRoots): Promise<void> {
+  const file = codexSettingsPath(roots);
   let source = (await readOptionalFile(file)) ?? '';
+  const bom = source.startsWith('\uFEFF') ? '\uFEFF' : '';
+  source = withoutTomlBom(source);
   source = setTopLevelString(source, 'model', snapshot.model);
   source = setTopLevelString(source, 'model_provider', snapshot.model_provider);
   source = setCodexProviderBlock(source, snapshot.providerBlock);
@@ -610,7 +655,7 @@ async function writeCodex(snapshot: CodexSnapshot): Promise<void> {
   const unsafe = new Error(`Cannot safely update ${file}; set model, model_provider, and [model_providers.teamai] manually`);
   let parsed: Record<string, unknown>;
   try {
-    parsed = parseToml(source) as Record<string, unknown>;
+    parsed = parseToml(withoutTomlBom(source)) as Record<string, unknown>;
   } catch {
     throw unsafe;
   }
@@ -621,29 +666,82 @@ async function writeCodex(snapshot: CodexSnapshot): Promise<void> {
   if (parsed.model !== snapshot.model || parsed.model_provider !== snapshot.model_provider || !equal(providers.teamai, wantedProvider)) {
     throw unsafe;
   }
-  await writeFileAtomic(await writableTarget(file), source, { mode: 0o600 });
+  await writeFileAtomic(await writableTarget(file), bom + source, { mode: 0o600 });
 }
 
-// ─── Muse Code ────────────────────────────────────────────
+// ─── Key files: Muse Code, Antigravity CLI ────────────────
 //
-// Muse Code has no settings key for the API key: it reads META_API_KEY, else
-// the Meta credential it saved at login. So the key goes into a file of its
+// Muse Code and Antigravity CLI have no settings key for the API key: they
+// read it from the environment. So the key goes into a file of the agent's
 // own that a shell profile block sources, and only shells started after a
-// switch see it. The block has markers of its own: the team env block's
+// switch see it. Each block has markers of its own: the team env block's
 // markers belong to `teamai pull`, which rewrites or removes that block.
 
-const MUSE_KEY_BLOCK_START = '# [teamai:models:start]';
-const MUSE_KEY_BLOCK_END = '# [teamai:models:end]';
+/** An agent's file of exports, and the markers of the profile block that sources it. */
+interface KeyFile {
+  readonly path: () => string;
+  readonly start: string;
+  readonly end: string;
+}
+
+const MUSE_KEYS: KeyFile = {
+  path: () => path.join(getUserHome(), '.teamai', 'models', 'env.sh'),
+  start: '# [teamai:models:start]',
+  end: '# [teamai:models:end]',
+};
+
+const AGY_KEYS: KeyFile = {
+  path: agyKeyFilePath,
+  start: '# [teamai:models:agy:start]',
+  end: '# [teamai:models:agy:end]',
+};
+
+function withoutKeyBlock(content: string, keys: KeyFile): string {
+  const start = content.indexOf(keys.start);
+  if (start === -1) return content;
+  const end = content.indexOf(keys.end, start);
+  if (end === -1) return content;
+  const head = content.slice(0, start).replace(/\n$/, '');
+  const tail = content.slice(end + keys.end.length).replace(/^\n/, '');
+  return head && tail ? `${head}\n${tail}` : head ? `${head}\n` : tail;
+}
+
+/**
+ * Write `keyExport` to the agent's key file and source it from the shell profile,
+ * or with null remove both; `writeSettings` points the agent at the gateway after
+ * the key lands, and back before the key goes.
+ */
+async function writeKeyExport(keys: KeyFile, keyExport: string | null, writeSettings: () => Promise<void>): Promise<void> {
+  const keyFile = keys.path();
+  // The file the block goes in for zsh may be under ZDOTDIR.
+  const profiles = [...new Set([...SHELL_PROFILE_CANDIDATE_NAMES.map((name) => path.join(getUserHome(), name)), await detectShellProfile()])];
+  if (keyExport === null) {
+    await writeSettings();
+    await fs.promises.rm(keyFile, { force: true });
+    for (const profile of profiles) {
+      const content = await readOptionalFile(profile);
+      if (content !== null && content.includes(keys.start)) {
+        await writeFileAtomic(profile, withoutKeyBlock(content, keys));
+      }
+    }
+    return;
+  }
+  await writeFileAtomic(keyFile, keyExport, { mode: 0o600 });
+  await writeSettings();
+  const sourced = await Promise.all(profiles.map(async (profile) => (await readOptionalFile(profile))?.includes(keys.start)));
+  if (sourced.some(Boolean)) return;
+  const profile = await detectShellProfile();
+  const content = (await readOptionalFile(profile)) ?? '';
+  const quoted = shellQuoteValue(toGeneratedForm(keyFile));
+  const block = `${keys.start}\n[ -f ${quoted} ] && . ${quoted}\n${keys.end}\n`;
+  await writeFileAtomic(profile, `${content}${content && !content.endsWith('\n') ? '\n' : ''}${block}`);
+}
 
 interface MuseSnapshot {
   model?: unknown;
   endpoint_transport?: unknown;
-  /** The content of `museKeyFilePath()`; null when there is none. */
+  /** The content of Muse's key file; null when there is none. */
   keyExport: string | null;
-}
-
-function museKeyFilePath(): string {
-  return path.join(getUserHome(), '.teamai', 'models', 'env.sh');
 }
 
 async function museSnapshot(): Promise<MuseSnapshot> {
@@ -651,18 +749,8 @@ async function museSnapshot(): Promise<MuseSnapshot> {
   return {
     model: settings.model,
     endpoint_transport: settings.endpoint_transport,
-    keyExport: await readOptionalFile(museKeyFilePath()),
+    keyExport: await readOptionalFile(MUSE_KEYS.path()),
   };
-}
-
-function withoutMuseKeyBlock(content: string): string {
-  const start = content.indexOf(MUSE_KEY_BLOCK_START);
-  if (start === -1) return content;
-  const end = content.indexOf(MUSE_KEY_BLOCK_END, start);
-  if (end === -1) return content;
-  const head = content.slice(0, start).replace(/\n$/, '');
-  const tail = content.slice(end + MUSE_KEY_BLOCK_END.length).replace(/^\n/, '');
-  return head && tail ? `${head}\n${tail}` : head ? `${head}\n` : tail;
 }
 
 async function writeMuse(snapshot: MuseSnapshot): Promise<void> {
@@ -673,30 +761,35 @@ async function writeMuse(snapshot: MuseSnapshot): Promise<void> {
     if (snapshot[key] === undefined) delete settings[key];
     else settings[key] = snapshot[key];
   }
-  const keyFile = museKeyFilePath();
-  // The file the block goes in for zsh may be under ZDOTDIR.
-  const profiles = [...new Set([...SHELL_PROFILE_CANDIDATE_NAMES.map((name) => path.join(getUserHome(), name)), await detectShellProfile()])];
-  if (snapshot.keyExport === null) {
-    await writeAgentJson(file, settings);
-    await fs.promises.rm(keyFile, { force: true });
-    for (const profile of profiles) {
-      const content = await readOptionalFile(profile);
-      if (content !== null && content.includes(MUSE_KEY_BLOCK_START)) {
-        await writeFileAtomic(profile, withoutMuseKeyBlock(content));
-      }
-    }
-    return;
-  }
-  // The key lands before settings.json points Muse at the gateway.
-  await writeFileAtomic(keyFile, snapshot.keyExport, { mode: 0o600 });
-  await writeAgentJson(file, settings);
-  const sourced = await Promise.all(profiles.map(async (profile) => (await readOptionalFile(profile))?.includes(MUSE_KEY_BLOCK_START)));
-  if (sourced.some(Boolean)) return;
-  const profile = await detectShellProfile();
-  const content = (await readOptionalFile(profile)) ?? '';
-  const quoted = shellQuoteValue(toGeneratedForm(keyFile));
-  const block = `${MUSE_KEY_BLOCK_START}\n[ -f ${quoted} ] && . ${quoted}\n${MUSE_KEY_BLOCK_END}\n`;
-  await writeFileAtomic(profile, `${content}${content && !content.endsWith('\n') ? '\n' : ''}${block}`);
+  await writeKeyExport(MUSE_KEYS, snapshot.keyExport, () => writeAgentJson(file, settings));
+}
+
+/**
+ * Antigravity CLI uses a gateway when settings.json says `modelProvider: "gemini"`;
+ * the key comes from GEMINI_API_KEY and the endpoint from GOOGLE_GEMINI_BASE_URL.
+ * Its `model` names an entry of agy's own catalog by display name, and agy sends
+ * that entry's Gemini model id whatever the gateway serves, so it is left to the member.
+ */
+interface AgySnapshot {
+  modelProvider?: unknown;
+  /** The content of agy's key file; null when there is none. */
+  keyExport: string | null;
+}
+
+async function agySnapshot(): Promise<AgySnapshot> {
+  const settings = await jsonObject(agySettingsPath());
+  return { modelProvider: settings.modelProvider, keyExport: await readOptionalFile(AGY_KEYS.path()) };
+}
+
+/** Write a snapshot `agySnapshot` or `desiredSnapshot` made, read back from the manifest as it was saved. */
+async function writeAgy(snapshot: unknown): Promise<void> {
+  const recorded = isRecord(snapshot) ? snapshot : {};
+  const file = agySettingsPath();
+  const settings = await jsonObject(file);
+  if (recorded.modelProvider === undefined) delete settings.modelProvider;
+  else settings.modelProvider = recorded.modelProvider;
+  const keyExport = typeof recorded.keyExport === 'string' ? recorded.keyExport : null;
+  await writeKeyExport(AGY_KEYS, keyExport, () => writeAgentJson(file, settings));
 }
 
 // ─── OpenCode ─────────────────────────────────────────────
@@ -749,7 +842,7 @@ type BuddyAgent = 'codebuddy' | 'workbuddy';
 
 interface BuddySnapshot {
   entries: Record<string, unknown | null>;
-  allowed?: Record<string, boolean>;
+  allowed?: Record<string, boolean | undefined>;
 }
 
 async function buddyDoc(agent: BuddyAgent): Promise<{
@@ -758,12 +851,12 @@ async function buddyDoc(agent: BuddyAgent): Promise<{
   models: unknown[];
   availableModels?: string[];
 }> {
-  const file = agentSettingsPath(agent);
+  const file = ownSettingsPath(agent);
   const raw = await readOptionalFile(file);
   if (raw === null || raw.trim() === '') return { file, doc: {}, models: [] };
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch (error) {
-    throw new Error(`Cannot parse ${file}: ${(error as Error).message}`);
+    throw new Error(`Cannot parse ${file}: ${(error as Error).message}`, { cause: error });
   }
   if (Array.isArray(parsed)) return { file, doc: parsed, models: parsed };
   if (!isRecord(parsed)) throw new Error(`Cannot update ${file}: root must be an object or array`);
@@ -784,7 +877,7 @@ function buddyAllowed(availableModels: string[] | undefined, ids: string[]): Rec
   return Object.fromEntries(ids.map((id) => [id, availableModels?.includes(id) ?? false]));
 }
 
-function reconcileBuddyAllowed(availableModels: string[] | undefined, allowed: Record<string, boolean> | undefined): string[] | undefined {
+function reconcileBuddyAllowed(availableModels: string[] | undefined, allowed: Record<string, boolean | undefined> | undefined): string[] | undefined {
   if (!availableModels || !allowed) return availableModels;
   const next = availableModels.filter((id) => allowed[id] !== false);
   for (const [id, enabled] of Object.entries(allowed)) {
@@ -844,11 +937,12 @@ async function replaceBuddy(
  * Read the fields TeamAI manages for an agent. Buddy snapshots cover the
  * model IDs in `reference` (the last written or the desired snapshot).
  */
-async function currentSnapshot(agent: ModelAgent, reference?: unknown): Promise<unknown> {
-  if (agent === 'claude') return claudeSnapshot(await jsonObject(claudeSettingsPath()));
-  if (agent === 'codex') return codexSnapshot((await readOptionalFile(codexSettingsPath())) ?? '');
+async function currentSnapshot(agent: ModelAgent, roots: AgentRoots, reference?: unknown): Promise<unknown> {
+  if (agent === 'claude') return claudeSnapshot(await jsonObject(claudeSettingsPath(roots)));
+  if (agent === 'codex') return codexSnapshot((await readOptionalFile(codexSettingsPath(roots))) ?? '');
   if (agent === 'opencode') return openCodeSnapshot(await jsonObject(openCodeSettingsPath()));
   if (agent === 'muse') return museSnapshot();
+  if (agent === 'agy') return agySnapshot();
   if (agent === 'pi' || agent === 'omp') return piSnapshot(await piDoc(agent), reference);
   const written = reference as BuddySnapshot | undefined;
   const { models, availableModels } = await buddyDoc(agent);
@@ -861,15 +955,17 @@ async function currentSnapshot(agent: ModelAgent, reference?: unknown): Promise<
 
 async function writeSnapshot(
   agent: ModelAgent,
+  roots: AgentRoots,
   snapshot: unknown,
   previousManaged?: unknown,
   keepAppMetadata = false,
   released?: BuddySnapshot,
 ): Promise<void> {
-  if (agent === 'claude') return writeClaude(snapshot as ClaudeSnapshot);
-  if (agent === 'codex') return writeCodex(snapshot as CodexSnapshot);
+  if (agent === 'claude') return writeClaude(snapshot as ClaudeSnapshot, roots);
+  if (agent === 'codex') return writeCodex(snapshot as CodexSnapshot, roots);
   if (agent === 'opencode') return writeOpenCode(snapshot as OpenCodeSnapshot);
   if (agent === 'muse') return writeMuse(snapshot as MuseSnapshot);
+  if (agent === 'agy') return writeAgy(snapshot);
   if (agent === 'pi' || agent === 'omp') return writePi(agent, snapshot as PiSnapshot, previousManaged);
   return replaceBuddy(agent, previousManaged as BuddySnapshot | undefined, snapshot as BuddySnapshot, keepAppMetadata, released);
 }
@@ -924,6 +1020,14 @@ function desiredSnapshot(agent: ModelAgent, profile: ResolvedModelProfile): unkn
       keyExport: `export META_API_KEY=${envRef ? `"\${${envRef}}"` : shellQuoteValue(profile.api_key_value ?? '')}\n`,
     } satisfies MuseSnapshot;
   }
+  if (agent === 'agy') {
+    const route = profile.routes.gemini;
+    if (!route) throw new Error(`Profile ${profile.ref} serves no Gemini route for agy`);
+    return {
+      modelProvider: 'gemini',
+      keyExport: agyKeyFunction(envRef ? { envRef } : { value: profile.api_key_value ?? '' }, route.base_url),
+    } satisfies AgySnapshot;
+  }
   if (agent === 'opencode') {
     const providers: Record<string, unknown> = Object.fromEntries(OPENCODE_PROVIDER_IDS.map((id) => [id, null]));
     const providerOf = new Map<string, string>();
@@ -945,9 +1049,14 @@ function desiredSnapshot(agent: ModelAgent, profile: ResolvedModelProfile): unkn
         };
       }
     }
-    const catalog = profile.profile.model_groups.flatMap((group) => group.models);
-    const defaultModel = profile.model ?? catalog[0];
-    return { model: `${providerOf.get(defaultModel)}/${defaultModel}`, providers } satisfies OpenCodeSnapshot;
+    // A model the profile serves only over Gemini has no OpenCode provider.
+    const reachable = profile.profile.model_groups.flatMap((group) => group.models).filter((model) => providerOf.has(model));
+    const defaultModel = profile.model ?? reachable[0];
+    const provider = defaultModel === undefined ? undefined : providerOf.get(defaultModel);
+    if (defaultModel === undefined || provider === undefined) {
+      throw new Error(`Profile ${profile.ref} serves ${defaultModel ?? 'no model'} only over Gemini, which OpenCode does not speak. Choose one of: ${reachable.join(', ')}.`);
+    }
+    return { model: `${provider}/${defaultModel}`, providers } satisfies OpenCodeSnapshot;
   }
   if (agent === 'pi' || agent === 'omp') {
     const provider = piProvider(profile)!;
@@ -981,8 +1090,8 @@ function desiredSnapshot(agent: ModelAgent, profile: ResolvedModelProfile): unkn
   } satisfies BuddySnapshot;
 }
 
-async function firstSnapshot(agent: ModelAgent, desired: unknown): Promise<unknown> {
-  if (agent !== 'codebuddy' && agent !== 'workbuddy') return currentSnapshot(agent);
+async function firstSnapshot(agent: ModelAgent, roots: AgentRoots, desired: unknown): Promise<unknown> {
+  if (agent !== 'codebuddy' && agent !== 'workbuddy') return currentSnapshot(agent, roots);
   const { models } = await buddyDoc(agent);
   const ids = Object.keys((desired as BuddySnapshot).entries);
   return { entries: Object.fromEntries(ids.map((id) => [id, buddyEntry(models, id) ?? null])) } satisfies BuddySnapshot;
@@ -991,31 +1100,31 @@ async function firstSnapshot(agent: ModelAgent, desired: unknown): Promise<unkno
 // A write-ahead entry makes either side of an interrupted file replacement
 // recognizable on the next command. An unrelated model edit matches neither
 // side and is never overwritten automatically.
-async function recoverPending(manifest: ModelSwitchManifest, agent: ModelAgent): Promise<boolean> {
+async function recoverPending(manifest: ModelSwitchManifest, agent: ModelAgent, roots: AgentRoots): Promise<boolean> {
   const state = manifest.agents[agent];
   const pending = state?.pending;
   if (!state || !pending) return true;
-  if (!sameAgentSettingsPath(agent, state)) return false;
-  const after = await currentSnapshot(agent, state.lastWritten);
+  if (!sameAgentSettingsPath(agent, state, roots)) return false;
+  const after = await currentSnapshot(agent, roots, state.lastWritten);
   if (pending.kind === 'switch') {
     if (sameManaged(agent, after, state.lastWritten)) {
       delete state.pending;
-    } else if (sameManaged(agent, await currentSnapshot(agent, pending.before), pending.before)) {
+    } else if (sameManaged(agent, await currentSnapshot(agent, roots, pending.before), pending.before)) {
       if (pending.prior) manifest.agents[agent] = pending.prior;
       else delete manifest.agents[agent];
     } else return false;
   } else if (sameManaged(agent, after, state.lastWritten)) {
     delete state.pending;
-  } else if (sameManaged(agent, await currentSnapshot(agent, state.previous), state.previous)) {
+  } else if (sameManaged(agent, await currentSnapshot(agent, roots, state.previous), state.previous)) {
     delete manifest.agents[agent];
   } else return false;
   await saveManifest(manifest);
   return true;
 }
 
-async function firstSwitchCollision(agent: ModelAgent, profile: ResolvedModelProfile): Promise<string | undefined> {
+async function firstSwitchCollision(agent: ModelAgent, roots: AgentRoots, profile: ResolvedModelProfile): Promise<string | undefined> {
   if (agent === 'codex') {
-    const source = (await readOptionalFile(codexSettingsPath())) ?? '';
+    const source = (await readOptionalFile(codexSettingsPath(roots))) ?? '';
     const providers = parseCodex(source).model_providers;
     const taken = providers !== undefined && (!isRecord(providers)
       || Object.prototype.hasOwnProperty.call(providers, 'teamai')
@@ -1081,6 +1190,7 @@ async function switchModelProfileUnlocked(
   agents: ModelAgent[],
   options: SwitchOptions,
 ): Promise<ModelSwitchResult[]> {
+  const roots = await agentRootsOf(options.localConfig, options.dryRun);
   const manifest = (await loadManifest()) ?? { version: 1, agents: {} };
   const results: ModelSwitchResult[] = [];
   const metadata: Pick<AgentState, 'profile' | 'team' | 'model'> = {
@@ -1095,7 +1205,7 @@ async function switchModelProfileUnlocked(
         results.push({ agent, status: 'skipped', message: `${agent} has an interrupted model update; run without --dry-run to recover it` });
         continue;
       }
-      if (!options.dryRun && !await recoverPending(manifest, agent)) {
+      if (!options.dryRun && !await recoverPending(manifest, agent, roots)) {
         results.push({ agent, status: 'skipped', message: `${agent} model settings changed during an interrupted TeamAI update; leaving them untouched` });
         continue;
       }
@@ -1111,12 +1221,12 @@ async function switchModelProfileUnlocked(
         results.push({ agent, status: 'unsupported', message: `Profile ${profile.ref} has no protocol ${agent} can use` });
         continue;
       }
-      if (!await installed(agent)) {
+      if (!await installed(agent, roots)) {
         results.push({ agent, status: 'not-installed', message: `${agent} is not installed` });
         continue;
       }
       if (agent === 'claude') {
-        const settingsEnv = claudeEnv(await jsonObject(claudeSettingsPath()));
+        const settingsEnv = claudeEnv(await jsonObject(claudeSettingsPath(roots)));
         const providerFlags = CLAUDE_PROVIDER_KEYS.filter((key) => claudeProviderFlagEnabled(settingsEnv[key]));
         if (providerFlags.length > 0) {
           results.push({ agent, status: 'skipped', message: `claude settings.json enables ${providerFlags.join(', ')}; disable it before switching` });
@@ -1124,8 +1234,8 @@ async function switchModelProfileUnlocked(
         }
       }
       const state = manifest.agents[agent];
-      if (state && !sameAgentSettingsPath(agent, state)) {
-        results.push({ agent, status: 'skipped', message: `${agent} configuration path changed since TeamAI switched it; leaving it untouched` });
+      if (state && !sameAgentSettingsPath(agent, state, roots)) {
+        results.push({ agent, status: 'skipped', message: movedSettingsMessage(agent, state, roots) });
         continue;
       }
       const desired = desiredSnapshot(agent, profile);
@@ -1140,12 +1250,15 @@ async function switchModelProfileUnlocked(
         const { base_url: baseUrl } = (desired as MuseSnapshot).endpoint_transport as { base_url: string };
         warning = `Shells started before this switch lack the profile's META_API_KEY: open a new shell before running muse, or Muse Code sends your saved Meta credential to ${baseUrl}`;
       }
-      const current = await currentSnapshot(agent, state ? state.lastWritten : desired);
+      if (agent === 'agy') {
+        warning = "Shells started before this switch lack teamai's agy function, which hands agy the profile's key and endpoint: open a new shell before running agy, or agy refuses to start with modelProvider set";
+      }
+      const current = await currentSnapshot(agent, roots, state ? state.lastWritten : desired);
       if (state && !sameManaged(agent, current, state.lastWritten)) {
         results.push({ agent, status: 'skipped', message: `${agent} model settings changed outside TeamAI; leaving them untouched` });
         continue;
       }
-      const previous = state ? structuredClone(state.previous) : await firstSnapshot(agent, desired);
+      const previous = state ? structuredClone(state.previous) : await firstSnapshot(agent, roots, desired);
       let released: BuddySnapshot | undefined;
       if (agent === 'codebuddy' || agent === 'workbuddy') {
         const desiredBuddy = desired as BuddySnapshot;
@@ -1186,7 +1299,7 @@ async function switchModelProfileUnlocked(
 
       const collision = agent === 'codebuddy' || agent === 'workbuddy'
         ? await buddyCollision(agent, desired as BuddySnapshot, state)
-        : state ? undefined : await firstSwitchCollision(agent, profile);
+        : state ? undefined : await firstSwitchCollision(agent, roots, profile);
       if (collision) {
         results.push({ agent, status: 'skipped', message: collision });
         continue;
@@ -1197,12 +1310,12 @@ async function switchModelProfileUnlocked(
           ...metadata,
           previous,
           lastWritten: desired,
-          filePath: path.resolve(agentSettingsPath(agent)),
-          pending: { kind: 'switch', before: state ? current : await firstSnapshot(agent, desired), prior: state ?? null },
+          filePath: path.resolve(agentSettingsPath(agent, roots)),
+          pending: { kind: 'switch', before: state ? current : await firstSnapshot(agent, roots, desired), prior: state ?? null },
         };
         await saveManifest(manifest);
         try {
-          await writeSnapshot(agent, desired, state?.lastWritten, true, released);
+          await writeSnapshot(agent, roots, desired, state?.lastWritten, true, released);
         } catch (error) {
           // Agent files are replaced atomically, so a failed write left the
           // file as it was. Drop the ownership record written for it.
@@ -1240,6 +1353,7 @@ async function restoreModelProfilesUnlocked(
   agents: ModelAgent[],
   options: { dryRun?: boolean },
 ): Promise<ModelSwitchResult[]> {
+  const roots = await agentRootsOf(undefined, options.dryRun);
   const manifest = (await loadManifest()) ?? { version: 1 as const, agents: {} };
   const results: ModelSwitchResult[] = [];
   for (const agent of agents) {
@@ -1248,7 +1362,7 @@ async function restoreModelProfilesUnlocked(
         results.push({ agent, status: 'skipped', message: `${agent} has an interrupted model update; run without --dry-run to recover it` });
         continue;
       }
-      if (!options.dryRun && !await recoverPending(manifest, agent)) {
+      if (!options.dryRun && !await recoverPending(manifest, agent, roots)) {
         results.push({ agent, status: 'skipped', message: `${agent} model settings changed during an interrupted TeamAI update; leaving them untouched` });
         continue;
       }
@@ -1257,11 +1371,11 @@ async function restoreModelProfilesUnlocked(
         results.push({ agent, status: 'unchanged', message: `${agent} has no TeamAI-managed model settings` });
         continue;
       }
-      if (!sameAgentSettingsPath(agent, state)) {
-        results.push({ agent, status: 'skipped', message: `${agent} configuration path changed since TeamAI switched it; leaving it untouched` });
+      if (!sameAgentSettingsPath(agent, state, roots)) {
+        results.push({ agent, status: 'skipped', message: movedSettingsMessage(agent, state, roots) });
         continue;
       }
-      const current = await currentSnapshot(agent, state.lastWritten);
+      const current = await currentSnapshot(agent, roots, state.lastWritten);
       if (!sameManaged(agent, current, state.lastWritten)) {
         results.push({ agent, status: 'skipped', message: `${agent} model settings changed outside TeamAI; leaving them untouched` });
         continue;
@@ -1279,7 +1393,7 @@ async function restoreModelProfilesUnlocked(
         state.pending = { kind: 'restore', before: current };
         await saveManifest(manifest);
         try {
-          await writeSnapshot(agent, restored, state.lastWritten);
+          await writeSnapshot(agent, roots, restored, state.lastWritten);
         } catch (error) {
           delete state.pending;
           await saveManifest(manifest);
@@ -1294,6 +1408,9 @@ async function restoreModelProfilesUnlocked(
         message: options.dryRun ? `${agent} model settings would be restored` : `${agent} model settings restored`,
         ...(agent === 'muse'
           ? { warning: "Shells started before this restore still export the profile's META_API_KEY: open a new shell before running muse" }
+          : {}),
+        ...(agent === 'agy'
+          ? { warning: "Shells started before this restore still define teamai's agy function, which sends agy to the profile's gateway: open a new shell before running agy" }
           : {}),
       });
     } catch (error) {
@@ -1317,13 +1434,13 @@ export type LiveModelSwitch = { readonly ok: true; readonly switched: boolean } 
 
 /**
  * Which agents a TeamAI switch still controls: the switch was recorded for
- * the agent's live settings path (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, ...) and
+ * the agent's live settings path (`agentRootsOf` for Claude and Codex, ...) and
  * those settings still hold what TeamAI wrote, the checks `restore` makes
  * before it touches them. A record for another path, or settings the user
  * took over, does not count. Reads without the lock and never writes, so an
  * interrupted switch counts only once its write landed.
  */
-export async function liveModelSwitches(): Promise<Record<ModelAgent, LiveModelSwitch>> {
+export async function liveModelSwitches(localConfig: Pick<LocalConfig, 'toolRoots'>): Promise<Record<ModelAgent, LiveModelSwitch>> {
   let manifest: ModelSwitchManifest | null;
   try {
     manifest = await loadManifest();
@@ -1331,11 +1448,12 @@ export async function liveModelSwitches(): Promise<Record<ModelAgent, LiveModelS
     const unreadable: LiveModelSwitch = { ok: false, reason: (error as Error).message };
     return Object.fromEntries(ALL_MODEL_AGENTS.map((agent) => [agent, unreadable])) as Record<ModelAgent, LiveModelSwitch>;
   }
+  const roots = await agentRootsOf(localConfig, true);
   const entries = await Promise.all(ALL_MODEL_AGENTS.map(async (agent): Promise<[ModelAgent, LiveModelSwitch]> => {
     const state = manifest?.agents[agent];
-    if (!state || !sameAgentSettingsPath(agent, state)) return [agent, { ok: true, switched: false }];
+    if (!state || !sameAgentSettingsPath(agent, state, roots)) return [agent, { ok: true, switched: false }];
     try {
-      return [agent, { ok: true, switched: sameManaged(agent, await currentSnapshot(agent, state.lastWritten), state.lastWritten) }];
+      return [agent, { ok: true, switched: sameManaged(agent, await currentSnapshot(agent, roots, state.lastWritten), state.lastWritten) }];
     } catch (error) {
       return [agent, { ok: false, reason: (error as Error).message }];
     }
@@ -1393,6 +1511,10 @@ function writtenGatewayUrls(agent: ModelAgent, snapshot: unknown): string[] {
   if (agent === 'muse') {
     const transport = snapshot.endpoint_transport;
     return isRecord(transport) && typeof transport.base_url === 'string' ? [transport.base_url] : [];
+  }
+  if (agent === 'agy') {
+    const url = typeof snapshot.keyExport === 'string' ? agyGatewayOf(snapshot.keyExport, {})?.GOOGLE_GEMINI_BASE_URL : undefined;
+    return url ? [url] : [];
   }
   const entries = isRecord(snapshot.entries) ? Object.values(snapshot.entries) : [];
   return entries.flatMap((entry) => (isRecord(entry) && typeof entry.url === 'string' ? [entry.url] : []));

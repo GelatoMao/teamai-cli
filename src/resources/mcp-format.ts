@@ -7,6 +7,7 @@ import { sameEnvName } from './env-key.js';
 //  One McpServerDef renders into three different on-disk shapes:
 //
 //    claude family   { "type": "http", "url", "headers" }
+//    agy             { "url", "headers" }                     (no type at all)
 //    cursor          { "url", "headers" }                     (type omitted)
 //    copilot         { "type": "local"|"http", ..., "tools": ["*"] }
 //    buddy family    { "transportType": "streamable-http", … } (+ timeout)
@@ -15,27 +16,9 @@ import { sameEnvName } from './env-key.js';
 //  Keeping the differences here — rather than in the reconcile engine — is the
 //  same split agents uses between agent-format.ts and its handler.
 
-export type McpFormat = 'claude' | 'cursor' | 'buddy' | 'codex' | 'opencode' | 'copilot' | 'pi' | 'muse';
+export type McpFormat = 'claude' | 'cursor' | 'buddy' | 'codex' | 'opencode' | 'copilot' | 'pi' | 'muse' | 'agy';
 
-const CLAUDE_TOOLS = new Set(['claude', 'claude-internal', 'tclaude', 'qoder', 'qoder-cn', 'kiro', 'zcode', 'omp', 'trae', 'trae-cn']);
-const CURSOR_TOOLS = new Set(['cursor']);
-const CODEX_TOOLS = new Set(['codex', 'codex-internal', 'tcodex']);
-const BUDDY_TOOLS = new Set(['codebuddy', 'workbuddy']);
-const OPENCODE_TOOLS = new Set(['opencode']);
-const COPILOT_TOOLS = new Set(['copilot']);
 const COPILOT_ALL_TOOLS = '*';
-
-export function detectMcpFormat(tool: string): McpFormat | null {
-  if (tool === 'pi') return 'pi';
-  if (tool === 'muse') return 'muse';
-  if (CLAUDE_TOOLS.has(tool)) return 'claude';
-  if (CURSOR_TOOLS.has(tool)) return 'cursor';
-  if (CODEX_TOOLS.has(tool)) return 'codex';
-  if (BUDDY_TOOLS.has(tool)) return 'buddy';
-  if (OPENCODE_TOOLS.has(tool)) return 'opencode';
-  if (COPILOT_TOOLS.has(tool)) return 'copilot';
-  return null;
-}
 
 /**
  * Top-level JSON key each format stores its server map under. Claude/cursor/buddy
@@ -45,6 +28,7 @@ export function detectMcpFormat(tool: string): McpFormat | null {
 export const MCP_SERVER_KEY: Record<Exclude<McpFormat, 'codex'>, string> = {
   pi: 'mcpServers',
   muse: 'mcpServers',
+  agy: 'mcpServers',
   claude: 'mcpServers',
   cursor: 'mcpServers',
   buddy: 'mcpServers',
@@ -64,6 +48,8 @@ const SUPPORTED_TRANSPORTS: Record<McpFormat, Set<McpTransport>> = {
   // Muse Code fails startup validation on a single `type: sse` server and then
   // loads no MCP server at all.
   muse: new Set<McpTransport>(['stdio', 'http']),
+  // Antigravity CLI speaks stdio and streamable HTTP; it has no legacy SSE transport.
+  agy: new Set<McpTransport>(['stdio', 'http']),
   claude: new Set<McpTransport>(['stdio', 'http', 'sse']),
   cursor: new Set<McpTransport>(['stdio', 'http', 'sse']),
   buddy: new Set<McpTransport>(['stdio', 'http', 'sse']),
@@ -238,6 +224,12 @@ function renderCursor(def: McpServerDef): McpJsonEntry {
   return e;
 }
 
+/** Antigravity CLI takes the transport from `command` or `url`, and warns on a `type` key. */
+function renderAgy(def: McpServerDef): McpJsonEntry {
+  const { type: _transport, ...entry } = renderClaude(def);
+  return entry;
+}
+
 function renderBuddy(def: McpServerDef): McpJsonEntry {
   const e: McpJsonEntry = {};
   if (def.transport === 'stdio') {
@@ -308,6 +300,7 @@ export function renderJsonEntry(format: Exclude<McpFormat, 'codex'>, def: McpSer
     return entry;
   }
   if (format === 'claude' || format === 'muse') return renderClaude(def);
+  if (format === 'agy') return renderAgy(def);
   if (format === 'cursor') return renderCursor(def);
   if (format === 'opencode') return renderOpencode(def);
   if (format === 'copilot') return renderCopilot(def);
@@ -360,4 +353,21 @@ export function renderCodexBlock(def: McpServerDef): string {
 /** Stable content hash of a rendered entry; drives idempotent rewrites. */
 export function entryHash(rendered: unknown): string {
   return crypto.createHash('sha1').update(JSON.stringify(rendered)).digest('hex').slice(0, 16);
+}
+
+/** Muse saves inferred stdio types and object keys differently; array order remains meaningful. */
+export function museEntryHash(rendered: unknown): string {
+  let value = rendered;
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const entry = value as Record<string, unknown>;
+    if (entry.type === undefined && typeof entry.command === 'string' && entry.url === undefined) {
+      value = { type: 'stdio', ...entry };
+    }
+  }
+  const canonical = JSON.stringify(value, (_key, item: unknown) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return item;
+    const object = item as Record<string, unknown>;
+    return Object.fromEntries(Object.keys(object).sort().map(key => [key, object[key]]));
+  });
+  return crypto.createHash('sha1').update(canonical).digest('hex').slice(0, 16);
 }

@@ -7,6 +7,7 @@ import matter from 'gray-matter';
 import { autoDetectInit } from './config.js';
 import { publishTeamwikiViaMR, refreshTeamwikiIndexes } from './import-codebase.js';
 import { importFromRepo } from './import-repo.js';
+import { DetachedTeamRepoError } from './utils/git.js';
 import { log } from './utils/logger.js';
 import { pathExists } from './utils/fs.js';
 
@@ -76,11 +77,13 @@ export async function upgradeCodebaseWiki(opts: UpgradeCodebaseWikiOptions): Pro
       await importFromRepo({ url: String(source), incremental: true, skipAutoPush: true });
       result.migrated.push(slug);
     } catch (err) {
+      DetachedTeamRepoError.rethrow(err);
       result.errors.push(`${slug}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
   if (!opts.dryRun && result.migrated.length > 0) {
+    // oxlint-disable-next-line teamai/config-load-options -- this publishing branch runs only when opts.dryRun is false
     const team = await autoDetectInit();
     await refreshTeamwikiIndexes(path.join(team.localConfig.repo.localPath, 'teamwiki'));
     await publishTeamwikiViaMR(team, '[teamai] Migrate docs/team-codebase to teamwiki');

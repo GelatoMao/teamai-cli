@@ -4,10 +4,11 @@ import fse from 'fs-extra';
 import { gitTracks, gitUntracked } from '../git-exclude.js';
 import type { DeliveryRecorder } from '../git-exclude-delivered.js';
 import type { AgentModelRecords, CopyOrigin, DeliveryTarget, ResourceItem } from '../types.js';
-import { fileHash, listFilesRecursive } from '../utils/fs.js';
+import { fileHash, listFilesRecursive, remove } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 import { resolveReal } from '../utils/path-safety.js';
-import { historicalVersions, matchesHistory, readBlob } from '../utils/team-history.js';
+import { historicalVersions, matchesHistory, readBlob, readRenderedBlob } from '../utils/team-history.js';
+import { isUneditedGeneratedSkill } from '../workflow/discovery/generated-marker.js';
 import { warnOnce } from '../utils/warn-once.js';
 
 /**
@@ -87,6 +88,12 @@ export interface DeliveryLedger {
   readonly held: { name: string; reason: string; tools?: string[]; everyTool: boolean }[];
   /** Copies that failed with an error, already reported: the pull is not synced, and the next one is full. */
   readonly failed: { name: string; tool: string }[];
+  /** Tools that did not receive every skill this pull delivers: a copy there was kept, skipped or failed. */
+  readonly toolsMissingSkills: Set<string>;
+  /** Tools that did not receive every rule this pull delivers: a copy there was kept, skipped or failed. */
+  readonly toolsMissingRules: Set<string>;
+  /** Tools that did not receive every agent this pull delivers: a copy there was kept, held or failed. */
+  readonly toolsMissingAgents: Set<string>;
   /**
    * Where a writer reports the paths it delivered into the project checkout
    * and whether it delivered all it meant to (#915). Only pull's project
@@ -106,6 +113,9 @@ export function openLedger(
     otherRecords,
     held: [],
     failed: [],
+    toolsMissingSkills: new Set(),
+    toolsMissingRules: new Set(),
+    toolsMissingAgents: new Set(),
     agentModels: Object.fromEntries(Object.entries(agentModels ?? {}).map(([stem, byTool]) => [stem, { ...byTool }])),
   };
 }
@@ -113,6 +123,15 @@ export function openLedger(
 /** sha256 of `content`, as `fileHash` and the record spell it. */
 export function contentHash(content: string | Buffer): string {
   return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+/** Hashes of the LF and CRLF forms of a text file, for Git/worktree comparisons. */
+function textContentHashes(content: string | Buffer): Set<string> {
+  const normalized = content.toString('utf8').replace(/\r\n/g, '\n');
+  return new Set([
+    contentHash(normalized),
+    contentHash(normalized.replace(/\n/g, '\r\n')),
+  ]);
 }
 
 /** The recorded paths of the copy at `dest`: the file, or every file under the skill directory. */
@@ -188,23 +207,31 @@ export async function isTeamSkillAsDelivered(previous: DeliveredHashes, dest: st
 /**
  * Whether the SKILL.md recorded in the skill directory `dest` is what pull
  * writes from a version of `<teamDir>/SKILL.md` (repo-relative) in the
- * history of `repoPath`: the team skill the copy was delivered from, even
- * after the team changed it. Tells which of several same-named team skills a
- * copy came from. False with no record, or when git cannot read the history.
- * Read-only; reads the history.
+ * history of `repoPath` up to `rev` (HEAD by default): the team skill the
+ * copy was delivered from, even after the team changed it. Tells which of
+ * several same-named team skills a copy came from. False with no record, or
+ * when git cannot read the history. Read-only; reads the history.
  */
 export async function isRecordedFromTeamSkill(
-  previous: DeliveredHashes, dest: string, repoPath: string, teamDir: string,
+  previous: DeliveredHashes,
+  dest: string,
+  repoPath: string,
+  teamDir: string,
+  options: { normalizeLineEndings?: boolean; rev?: string } = {},
 ): Promise<boolean> {
   const recorded = previous[path.join(dest, SKILL_MD)];
   if (recorded === undefined) return false;
   const { withSkillFrontmatter } = await import('./skills.js');
-  for (const version of await historicalVersions(repoPath, `${teamDir}/${SKILL_MD}`, { currentLifetime: true }) ?? []) {
-    const bytes = await readBlob(repoPath, version.blob);
+  for (const version of await historicalVersions(repoPath, `${teamDir}/${SKILL_MD}`, { currentLifetime: true, rev: options.rev }) ?? []) {
+    const source = await readBlob(repoPath, version.blob);
+    const bytes = source === null ? null : await readRenderedBlob(repoPath, version.blob, version.path) ?? source;
     if (bytes === null) continue;
     const text = bytes.toString('utf-8');
     const written = withSkillFrontmatter(text, path.posix.basename(teamDir));
-    if (contentHash(written === text ? bytes : written) === recorded) return true;
+    const hashes = options.normalizeLineEndings === false
+      ? new Set([contentHash(written === text ? bytes : written)])
+      : textContentHashes(written === text ? bytes : written);
+    if (hashes.has(recorded)) return true;
   }
   return false;
 }
@@ -299,6 +326,8 @@ export async function isTeamaiSkillCopy(
 ): Promise<boolean> {
   // A link in place of the directory, or any non-regular entry inside it, is the member's.
   if (await isLink(dir) || !await isDirectory(dir) || await holdsNonRegular(dir) || await holdsGitDir(dir)) return false;
+  // A skill pull generated from a workflow, untouched since: teamai's by its own marker, not by the team history.
+  if (await isUneditedGeneratedSkill(dir)) return true;
   // A CONTRIBUTORS file too: teamai's only on the same proof, never by its name.
   for (const rel of await listFilesRecursive(dir)) {
     const file = path.join(dir, rel);
@@ -671,6 +700,16 @@ export function adoptRecord(ledger: DeliveryLedger, file: string, hash: string):
 
 export function forgetDelivered(hashes: DeliveredHashes, dest: string): void {
   for (const file of recordedUnder(hashes, dest)) delete hashes[file];
+}
+
+/**
+ * Delete teamai's copy at `dest` and take it off the record this pull writes,
+ * so the record never names a file that is gone (#1577). Without a ledger
+ * there is no record to update.
+ */
+export async function removeDelivered(ledger: DeliveryLedger | undefined, dest: string): Promise<void> {
+  await remove(dest);
+  if (ledger) forgetDelivered(ledger.hashes, dest);
 }
 
 /**

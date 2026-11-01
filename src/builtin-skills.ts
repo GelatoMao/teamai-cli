@@ -6,18 +6,18 @@ import { pathExists, remove } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import { warnOnce } from './utils/warn-once.js';
 import type { TeamaiConfig, LocalConfig } from './types.js';
-import { getCopilotHome, resolveBaseDir, isAgentExcluded, scopedToolPaths } from './types.js';
-import { getHermesHome } from './hermes-home.js';
-import { resolveOpenclawWorkspaceDir } from './openclaw-hooks.js';
-import { ResourceHandler } from './resources/base.js';
+import { COPILOT_TOOL_ID, resolveBaseDir, isAgentExcluded, scopedToolPaths } from './types.js';
+import { installOf, locate, openclawWorkspaceDir, SHARED_AGENT_SKILLS_PATH, writable } from './locate.js';
+import { toolHome } from './tool-home.js';
 import {
-  CODEX_TOOL, allowsSkillDirectory, describeSkippedSkillDirectory, findSkillDirectoryBlock, resolveSkillDestination,
-  SHARED_AGENT_SKILLS_PATH, skillsDirForTool, skillTargetsFor,
+  CODEX_TOOL, allowsSkillDirectory, describeSkippedSkillDirectory, findSkillDirectoryBlock,
+  skillTargetsFor,
 } from './resources/skills.js';
 import { getUserHome } from './utils/home.js';
 import { packagedSkillRoots } from './skill-content.js';
 import { PACKAGED_SKILL_DIGESTS } from './packaged-skill-digests.js';
 import { keepsTrackedCopy } from './resources/delivered-copies.js';
+import { generatedSkillAt } from './workflow/discovery/generated-marker.js';
 import type { DeliveryRecorder } from './git-exclude-delivered.js';
 
 // ─── Built-in skills deployment ──────────────────────────
@@ -38,7 +38,7 @@ import type { DeliveryRecorder } from './git-exclude-delivered.js';
 //    ~/.cursor/skills/teamai/SKILL.md
 //    ...
 //
-//    skill-data/{core,setup,wiki,share}/   never copied
+//    skill-data/{core,setup,wiki,share,workflow,workflow-local}/   never copied
 //
 
 /**
@@ -360,7 +360,7 @@ export interface BuiltinSkillsTarget {
 /**
  * The base the link guard walks down from: the scope root — home, or the
  * project root — when `skillsDir` sits under it, since a link at or above that
- * is ordinary. Not the tool's base directory: for Copilot that is
+ * is ordinary. Not the tool's home: for Copilot that is
  * `COPILOT_HOME`, and starting there would never check whether `COPILOT_HOME`
  * itself is a link. A root outside the scope root has the walk start at the
  * parent of the tool home holding it (`COPILOT_HOME`, `HERMES_HOME`, the
@@ -373,28 +373,24 @@ export async function skillsGuardBase(scopeRoot: string, skillsDir: string): Pro
     return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
   };
   if (under(scopeRoot)) return scopeRoot;
-  const homes = [getCopilotHome(), getHermesHome(), await resolveOpenclawWorkspaceDir()];
+  const homes = [toolHome(COPILOT_TOOL_ID), toolHome('hermes'), await openclawWorkspaceDir()];
   const home = homes.filter((dir): dir is string => dir !== null && under(dir)).sort((a, b) => a.length - b.length)[0];
   return home ? path.dirname(home) : path.dirname(path.dirname(skillsDir));
 }
 
 /**
  * The skills directory `tool` receives built-ins into, or null when it cannot
- * receive them. The same resolver team-skill sync uses (`skillsDirForTool`),
- * so the stub lands where every other skill does — OpenClaw's workspace,
- * `HERMES_HOME` — and the prune looks where earlier releases wrote.
+ * receive them. The same resolver team-skill sync uses (`locate`), so the stub
+ * lands where every other skill does — OpenClaw's workspace, `HERMES_HOME`, a
+ * home `XDG_CONFIG_HOME` moves — and the prune looks where earlier releases
+ * wrote.
  */
 export async function builtinSkillsTarget(
   tool: string,
-  configuredSkillsPath: string,
-  localConfig?: LocalConfig,
+  teamConfig: Pick<TeamaiConfig, 'toolPaths'>,
+  localConfig: LocalConfig,
 ): Promise<BuiltinSkillsTarget | null> {
-  if (!localConfig) {
-    const baseDir = getUserHome();
-    if (!await ResourceHandler.isToolInstalled(configuredSkillsPath, baseDir)) return null;
-    return { skillsDir: path.join(baseDir, configuredSkillsPath), guardBase: baseDir };
-  }
-  const skillsDir = await skillsDirForTool(tool, configuredSkillsPath, localConfig);
+  const skillsDir = writable(await locate(tool, 'skills', installOf(teamConfig, localConfig)))?.path ?? null;
   if (skillsDir === null) return null;
   return { skillsDir, guardBase: await skillsGuardBase(resolveBaseDir(localConfig), skillsDir) };
 }
@@ -420,7 +416,8 @@ export async function pruneLegacyBuiltinSkills(
   for (const legacyName of names) {
     for (const root of skillRoots) {
       const dir = path.join(root, legacyName);
-      if (!await pathExists(dir)) continue;
+      // teamai-share-learnings is now also the skill pull generates for that default workflow.
+      if (!await pathExists(dir) || (await generatedSkillAt(dir)).kind === 'ours') continue;
       try {
         const backupDir = skillBackupDir(guardBase, tool, path.relative(guardBase, root), legacyName);
         const result = await removeOwnedFiles(dir, await ownedSkillFiles(legacyName), guardBase, backupDir);
@@ -482,6 +479,38 @@ async function retireOtherCodexCopy(
   }
 }
 
+/** The built-in skills in `builtinDir` that have a SKILL.md, or none when it cannot be listed. */
+async function packagedBuiltinSkillNames(builtinDir: string): Promise<string[]> {
+  if (!await pathExists(builtinDir)) {
+    log.debug('No built-in skills directory found, skipping deployment');
+    return [];
+  }
+
+  let entries: string[];
+  try {
+    entries = await fs.promises.readdir(builtinDir);
+  } catch (e) {
+    log.debug(`Could not list the built-in skills in ${builtinDir}, skipping deployment: ${e instanceof Error ? e.message : String(e)}`);
+    return [];
+  }
+
+  const skillNames: string[] = [];
+  for (const entry of entries) {
+    if (await pathExists(path.join(builtinDir, entry, 'SKILL.md'))) skillNames.push(entry);
+  }
+  if (skillNames.length === 0) log.debug(`No built-in skill in ${builtinDir} has a SKILL.md, skipping deployment`);
+  return skillNames;
+}
+
+/** Pull's line for the `SKILL.md` in `destDir` it keeps in place of the built-in skill, or null when there is none to keep. */
+export async function keptStubLine(destDir: string, skillName: string): Promise<string | null> {
+  const stub = path.join(destDir, 'SKILL.md');
+  if (!await pathExists(stub)) return null;
+  if ((await fs.promises.lstat(stub)).isFile() && !await keepsTrackedCopy(stub)
+    && await isOwnedFile(stub, 'SKILL.md', await ownedSkillFiles(skillName))) return null;
+  return `Kept ${stub}: it is tracked or contains member instructions. Remove it to receive the built-in skill.`;
+}
+
 /**
  * Deploy CLI built-in skills to all configured AI tool skill directories.
  *
@@ -500,51 +529,32 @@ async function retireOtherCodexCopy(
  * while still pruning the legacy trees would leave those members with no
  * discoverable entry point at all.
  *
- * Silently skips if:
- * - Built-in skills directory doesn't exist (dev environment without build)
- * - A tool's skills directory is not configured
+ * Deploys nothing when the package lists no built-in skill: no directory (a
+ * dev environment without a build), an unreadable one, or none with a
+ * SKILL.md. Each tool that would get them is then added to
+ * `toolsMissingSkills`. Skips a tool whose skills directory is not configured.
  */
 export async function deployBuiltinSkills(
-  teamConfig: TeamaiConfig, localConfig?: LocalConfig, options?: { recorder?: DeliveryRecorder; dryRun?: boolean },
+  teamConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  options?: {
+    recorder?: DeliveryRecorder;
+    dryRun?: boolean;
+    /** Gets each tool that did not take every built-in skill (`DeliveryLedger.toolsMissingSkills`). */
+    toolsMissingSkills?: Set<string>;
+  },
 ): Promise<number> {
   const builtinDir = packagedSkillRoots().deployRoot;
-
-  if (!await pathExists(builtinDir)) {
-    log.debug('No built-in skills directory found, skipping deployment');
-    return 0;
-  }
-
-  let entries: string[];
-  try {
-    entries = await fs.promises.readdir(builtinDir);
-  } catch (e) {
-    log.debug(`Could not list the built-in skills in ${builtinDir}, skipping deployment: ${e instanceof Error ? e.message : String(e)}`);
-    return 0;
-  }
-
-  // Filter to directories that contain SKILL.md
-  const skillNames: string[] = [];
-  for (const entry of entries) {
-    const skillMd = path.join(builtinDir, entry, 'SKILL.md');
-    if (await pathExists(skillMd)) {
-      skillNames.push(entry);
-    }
-  }
-
-  if (skillNames.length === 0) {
-    log.debug(`No built-in skill in ${builtinDir} has a SKILL.md, skipping deployment`);
-    return 0;
-  }
-
+  const skillNames = await packagedBuiltinSkillNames(builtinDir);
   let deployed = 0;
 
-  const toolPaths = scopedToolPaths(teamConfig, localConfig ?? {});
-  const skillTarget = localConfig && skillTargetsFor(toolPaths, localConfig);
+  const toolPaths = scopedToolPaths(teamConfig, localConfig);
+  const skillTarget = skillTargetsFor(teamConfig, localConfig);
   for (const [tool, toolPath] of Object.entries(toolPaths)) {
     if (!toolPath.skills) continue;
 
     // Skip tools that cannot receive skills: not installed, no workspace.
-    const target = await builtinSkillsTarget(tool, toolPath.skills, localConfig);
+    const target = await builtinSkillsTarget(tool, teamConfig, localConfig);
     if (!target) {
       log.debug(`Skipping built-in skill deployment for ${tool}: tool not installed`);
       continue;
@@ -553,7 +563,11 @@ export async function deployBuiltinSkills(
     // An excluded agent is neither written to nor deleted from (usage-guide:
     // "the enabledAgents whitelist also gates CLI built-in skills"), so its
     // legacy directories are left alone too.
-    if (localConfig && isAgentExcluded(localConfig, tool)) continue;
+    if (isAgentExcluded(localConfig, tool)) continue;
+    if (skillNames.length === 0) {
+      options?.toolsMissingSkills?.add(tool);
+      continue;
+    }
 
     let deployedHere = 0;
     for (const skillName of skillNames) {
@@ -565,9 +579,7 @@ export async function deployBuiltinSkills(
       // name is the CLI's (`isCliOwnedSkillName`), so an existing shared copy
       // takes the stub; its files are judged by what a release shipped.
       const ownsShared = async (dir: string): Promise<boolean> => allowsSkillDirectory(baseDir, dir);
-      const destDir = skillTarget
-        ? await skillTarget({ tool, skillName, ownsShared }) ?? path.join(target.skillsDir, skillName)
-        : await resolveSkillDestination(tool, toolPath.skills, baseDir, skillName, ownsShared);
+      const destDir = await skillTarget({ tool, skillName, ownsShared }) ?? path.join(target.skillsDir, skillName);
 
       try {
         // Deployment and pruning follow the same repository boundary.
@@ -576,14 +588,10 @@ export async function deployBuiltinSkills(
           warnOnce(describeSkippedSkillDirectory(skillName, tool, block));
           continue;
         }
-        const stub = path.join(destDir, 'SKILL.md');
-        if (await pathExists(stub)) {
-          const entry = await fs.promises.lstat(stub);
-          if (!entry.isFile() || await keepsTrackedCopy(stub)
-            || !await isOwnedFile(stub, 'SKILL.md', await ownedSkillFiles(skillName))) {
-            log.warn(`Kept ${stub}: it is tracked or contains member instructions. Remove it to receive the built-in skill.`);
-            continue;
-          }
+        const kept = await keptStubLine(destDir, skillName);
+        if (kept !== null) {
+          log.warn(kept);
+          continue;
         }
         // A dry run writes and prunes nothing: it reports where the skill would land (#915).
         if (options?.dryRun) {
@@ -631,6 +639,7 @@ export async function deployBuiltinSkills(
     if (deployedHere === skillNames.length) {
       await pruneLegacyBuiltinSkills(tool, target);
     } else {
+      options?.toolsMissingSkills?.add(tool);
       log.warn(`Kept the pre-stub skills for ${tool}: the new stub was not deployed there, so removing them would leave nothing to discover.`);
     }
   }

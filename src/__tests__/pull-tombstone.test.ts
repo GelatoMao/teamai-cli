@@ -20,8 +20,9 @@ vi.mock('../config.js', async (importOriginal) => ({
 const { HEAD_REV } = vi.hoisted(() => ({ HEAD_REV: 'rev-unchanged' }));
 
 vi.mock('../utils/git.js', async (importOriginal) => ({
-  // The history proof of an unrecorded copy reads the team repo (#993).
-  createGit: (await importOriginal<typeof import('../utils/git.js')>()).createGit,
+  // Real git: an unrecorded copy is proved from the team repo's history (#993),
+  // and a project pull asks whether its directory is a repository.
+  ...(await importOriginal<typeof import('../utils/git.js')>()),
   pullRepo: vi.fn().mockResolvedValue('Already up to date.'),
   // Needed by the unchanged-rev fast path: without a rev, pull always does a
   // full sync and that branch is unreachable.
@@ -198,6 +199,35 @@ describe('pull role-aware sync and cleanup', () => {
 
     expect(await fse.pathExists(path.join(homeDir, '.claude/rules', 'old-rule.md'))).toBe(false);
     expect(await fse.pathExists(path.join(homeDir, '.codex/rules', 'old-rule.md'))).toBe(false);
+  });
+
+  it('removes a verbatim tombstoned rule from a project directory a none-channel tool no longer writes, and keeps a member edit of another there (#993)', async () => {
+    const projectRoot = path.join(tmpDir, 'proj');
+    const user = await loadLocalConfigForScope('user');
+    const teamConfig = await loadTeamConfig(repoPath);
+    if (user === null || teamConfig === null) throw new Error('fixture config is missing');
+    vi.mocked(detectProjectConfig).mockResolvedValue({ ...user, scope: 'project', projectRoot });
+    vi.mocked(loadTeamConfig).mockResolvedValue({
+      ...teamConfig,
+      toolPaths: { ...teamConfig.toolPaths, hermes: { rules: '.hermes/rules' } },
+    });
+    // Blank, so the installed gate is the temporary ~/.hermes below, not a home this shell already set.
+    vi.stubEnv('HERMES_HOME', '');
+    await fse.writeFile(path.join(repoPath, 'rules', 'old-rule.md'), '# Old');
+    await fse.writeFile(path.join(repoPath, 'rules', 'kept-rule.md'), '# Kept');
+    commitTeamRepo(repoPath, 'rules');
+    await fse.remove(path.join(repoPath, 'rules', 'old-rule.md'));
+    await fse.remove(path.join(repoPath, 'rules', 'kept-rule.md'));
+    await fse.writeFile(path.join(repoPath, 'rules', '.removed'), 'old-rule\nkept-rule\n');
+    await fse.ensureDir(path.join(homeDir, '.hermes'));
+    const rulesDir = path.join(projectRoot, '.hermes', 'rules');
+    await fse.outputFile(path.join(rulesDir, 'old-rule.md'), '# Old');
+    await fse.outputFile(path.join(rulesDir, 'kept-rule.md'), 'Edited by the member.\n');
+
+    await pull({});
+
+    expect(await fse.pathExists(path.join(rulesDir, 'old-rule.md'))).toBe(false);
+    expect(await fse.readFile(path.join(rulesDir, 'kept-rule.md'), 'utf8')).toBe('Edited by the member.\n');
   });
 
   it("cleans up a tombstoned rule's flat OMP copy on record, not a member's file of that name or a live root rule (#946)", async () => {
@@ -514,7 +544,7 @@ describe('pull role-aware sync and cleanup', () => {
     await fse.writeFile(path.join(homeDir, '.claude/skills', 'pm-skill', 'SKILL.md'), '# PM');
     await fse.ensureDir(path.join(repoPath, 'skills', 'pm', 'pm-skill'));
     await fse.writeFile(path.join(repoPath, 'skills', 'pm', 'pm-skill', 'SKILL.md'), '# PM');
-    const teamConfig = vi.mocked(loadTeamConfig).mock.results.at(-1)?.value;
+    const teamConfig = (await loadTeamConfig(repoPath))!;
     const localConfig = {
       repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
       username: 'testuser',
@@ -543,7 +573,7 @@ describe('pull role-aware sync and cleanup', () => {
     await fse.writeFile(path.join(homeDir, '.claude/skills', 'pm-skill', 'unpublished.py'), 'print("wip")');
     await fse.ensureDir(path.join(repoPath, 'skills', 'pm', 'pm-skill'));
     await fse.writeFile(path.join(repoPath, 'skills', 'pm', 'pm-skill', 'SKILL.md'), '# PM');
-    const teamConfig = vi.mocked(loadTeamConfig).mock.results.at(-1)?.value;
+    const teamConfig = (await loadTeamConfig(repoPath))!;
     const localConfig = {
       repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
       username: 'testuser', updatePolicy: 'auto' as const,
@@ -565,7 +595,7 @@ describe('pull role-aware sync and cleanup', () => {
   it('KEEPS a stale skill when its team-repo source is gone (cannot verify → no delete)', async () => {
     await fse.ensureDir(path.join(homeDir, '.claude/skills', 'orphan-skill'));
     await fse.writeFile(path.join(homeDir, '.claude/skills', 'orphan-skill', 'SKILL.md'), '# orphan');
-    const teamConfig = vi.mocked(loadTeamConfig).mock.results.at(-1)?.value;
+    const teamConfig = (await loadTeamConfig(repoPath))!;
     const localConfig = {
       repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
       username: 'testuser', updatePolicy: 'auto' as const,
@@ -592,7 +622,7 @@ describe('pull role-aware sync and cleanup', () => {
     await fse.writeFile(path.join(homeDir, '.claude/skills', 'vcs-skill', '.git', 'HEAD'), 'ref: refs/heads/main\n');
     await fse.ensureDir(path.join(repoPath, 'skills', 'pm', 'vcs-skill'));
     await fse.writeFile(path.join(repoPath, 'skills', 'pm', 'vcs-skill', 'SKILL.md'), '# VCS');
-    const teamConfig = vi.mocked(loadTeamConfig).mock.results.at(-1)?.value;
+    const teamConfig = (await loadTeamConfig(repoPath))!;
     const localConfig = {
       repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
       username: 'testuser', updatePolicy: 'auto' as const,
@@ -624,7 +654,7 @@ describe('pull role-aware sync and cleanup', () => {
     await fse.ensureDir(path.join(src, 'scripts'));
     await fse.writeFile(path.join(src, 'SKILL.md'), '# Nested');
     await fse.writeFile(path.join(src, 'scripts', 'runner.py'), 'print("run")');
-    const teamConfig = vi.mocked(loadTeamConfig).mock.results.at(-1)?.value;
+    const teamConfig = (await loadTeamConfig(repoPath))!;
     const localConfig = {
       repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
       username: 'testuser', updatePolicy: 'auto' as const,

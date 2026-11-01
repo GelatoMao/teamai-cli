@@ -41,6 +41,10 @@ vi.mock('../utils/learnings-publish.js', () => ({
   publishQueuedLearnings: vi.fn().mockResolvedValue({ published: [], remaining: 0 }),
 }));
 
+vi.mock('../scorers/label-store.js', () => ({
+  LabelStore: { publish: vi.fn().mockRejectedValue('reports branch unreachable') },
+}));
+
 vi.mock('../source.js', () => ({ pullSources: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('../hooks.js', () => ({
   injectHooksToAllTools: vi.fn().mockResolvedValue(undefined),
@@ -51,7 +55,7 @@ vi.mock('../hooks.js', () => ({
 vi.mock('../mcp-reconcile.js', () => ({
   reconcileMcpForConfig: vi.fn().mockResolvedValue({ changes: [], wrote: false }),
 }));
-vi.mock('../team-push.js', () => ({ reportUsageToTeam: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('../team-push.js', () => ({ reportUsage: vi.fn().mockResolvedValue('unreported') }));
 vi.mock('../usage-tracker.js', () => ({
   readUsageEvents: vi.fn().mockResolvedValue([]),
   truncateUsageAfterReport: vi.fn().mockResolvedValue(undefined),
@@ -73,6 +77,7 @@ vi.mock('../update.js', () => ({
 const { pull } = await import('../pull.js');
 const { loadLocalConfigForScope, loadTeamConfig } = await import('../config.js');
 const { publishQueuedLearnings } = await import('../utils/learnings-publish.js');
+const { log } = await import('../utils/logger.js');
 import type { LocalConfig, TeamaiConfig } from '../types.js';
 
 const business = path.join(testRoot, 'product');
@@ -145,5 +150,13 @@ describe('teamai pull publishes what contribute could not', () => {
     await pull({ silent: true, force: true });
 
     expect(publishQueuedLearnings).toHaveBeenCalled();
+  });
+
+  it('says why score labels stay pending when their publish throws a non-Error', async () => {
+    vi.mocked(loadLocalConfigForScope).mockResolvedValue(config('git'));
+
+    await pull({ silent: true, force: true });
+
+    expect(log.debug).toHaveBeenCalledWith(expect.stringMatching(/^Score label publish to .+ deferred: reports branch unreachable$/));
   });
 });

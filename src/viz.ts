@@ -118,6 +118,8 @@ interface VizPaths {
   root: string;
   /** Root under which docs/rules/skills live (may differ from the reports root in self mode). */
   knowledgeRoot: string;
+  /** The git checkout of knowledgeRoot whose refs promotion candidates follow; none for an HTTP repo, `--repo` or ~/.teamai. */
+  promotionCheckout?: string;
   votesDir: string;
   learningsDir: string;
   /** Every learnings root to read, highest precedence first. */
@@ -161,11 +163,11 @@ export async function resolveVizRoot(opts: VizOptions): Promise<VizPaths> {
       root,
       knowledgeRoot: root,
       votesDir: path.join(root, 'votes'),
-      // learnings-root ok: an explicit --repo path, with no config to resolve
+      // oxlint-disable-next-line teamai/learnings-root -- an explicit --repo path, with no config to resolve
       learningsDir: path.join(root, 'learnings'),
-      // learnings-root ok: same explicit --repo path
+      // oxlint-disable-next-line teamai/learnings-root -- same explicit --repo path
       learningsDirs: [path.join(root, 'learnings')],
-      // learnings-root ok: same explicit --repo path
+      // oxlint-disable-next-line teamai/learnings-root -- same explicit --repo path
       indexLearningsDirs: [path.join(root, 'learnings')],
       learningsNamespaces: { ok: true, namespaces: [] },
       statsDir: path.join(root, 'stats'),
@@ -229,6 +231,7 @@ export async function resolveVizRoot(opts: VizOptions): Promise<VizPaths> {
     return {
       root: knowledgeRoot,
       knowledgeRoot,
+      promotionCheckout: usesBranchWorktree(config) ? knowledgeRoot : undefined,
       votesDir: path.join(reportsRoot, 'votes'),
       learningsDir,
       learningsDirs,
@@ -341,7 +344,8 @@ async function loadEntries(paths: VizPaths): Promise<SearchIndexEntry[]> {
         rulesDir: path.join(paths.knowledgeRoot, 'rules'),
         skillsDir: path.join(paths.knowledgeRoot, 'skills'),
         ...delivered,
-        votesDir: paths.votesDir,
+        votesDir: paths.scope ? undefined : paths.votesDir,
+        voteScope: paths.scope,
         indexPath: tmpIndexPath,
       });
       index = await loadIndex(tmpIndexPath);
@@ -458,12 +462,13 @@ export async function buildVizData(paths: VizPaths): Promise<VizData> {
   const trend = buildTrend(metrics);
   const authors = buildAuthors(metrics);
 
+  const namespaces = paths.learningsNamespaces.ok ? paths.learningsNamespaces.namespaces : undefined;
   const [promote, prune, stale] = await Promise.all([
-    findPromotionCandidates(paths.learningsDirs, paths.votesDir).catch((err: Error) => {
+    findPromotionCandidates(paths.learningsDirs, paths.votesDir, paths.promotionCheckout, { namespaces }).catch((err: Error) => {
       console.warn(`Warning: could not load promotion candidates: ${err.message}`);
       return [] as PromotionCandidate[];
     }),
-    findPruneCandidates(paths.learningsDirs, paths.votesDir).catch((err: Error) => {
+    findPruneCandidates(paths.learningsDirs, paths.votesDir, { namespaces }).catch((err: Error) => {
       console.warn(`Warning: could not load prune candidates: ${err.message}`);
       return [] as PruneCandidate[];
     }),
@@ -536,9 +541,14 @@ export async function getVizSummary(opts: VizOptions = {}): Promise<VizSummary> 
 
 /** Read-only dashboard payload; report HTML is escaped by the existing renderer. */
 export async function getDashboardContext(opts: VizOptions = {}) {
-  const data = await buildVizData(await resolveVizRoot(opts));
+  const paths = await resolveVizRoot(opts);
+  const data = await buildVizData(paths);
   const { renderDashboardReport } = await import('./viz-render.js');
+  const { buildImprovement } = await import('./dashboard/improvement.js');
+  // A broken stats file must not take the knowledge report down with it; the page falls back to the plain maintenance list.
+  const improvement = await buildImprovement(paths, data.maintenance, data.silent.length).catch(() => null);
   return {
+    improvement,
     generatedAt: data.generatedAt,
     source: data.source,
     totalEntries: data.totalEntries,

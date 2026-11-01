@@ -19,18 +19,31 @@ import { loadTeamConfig } from '../config.js';
 import type { LocalConfig } from '../types.js';
 import { getDataHome, isUsageReportEnabled } from '../types.js';
 import { log } from '../utils/logger.js';
-import { isLocalWorkflowTool } from './local-tool-adapter.js';
+import { redactJson } from '../utils/redact.js';
+import { acquireLock, releaseLock } from '../update.js';
+import { isLaunchTool } from '../tool-launch/tools.js';
+import type { RunMode } from '../launch-context.js';
+import type { RunOrigin } from '../default-workflows.js';
+import { uniqueOutcomes, type WorkOutcome } from '../outcomes.js';
 import { stepDefinitions } from './scope.js';
-import { settled, VISIBLE_OUTCOMES, type StepPass, type StepState, type VisibleOutcome } from './step-state.js';
-import type { DriverIdentity, RunState, RunStatus, TokenUsage, WorkflowFailure } from './types.js';
+import { snapshotPath } from './snapshot.js';
+import { installOwner, runLockPath } from './store.js';
+import { settled, visibleOutcome, type StepPass, type StepState, type VisibleOutcome } from './step-state.js';
+import type { TokenUsage } from '../tool-launch/stdout.js';
+import { LIMIT_FAILURES, type Unenforced } from './requirements.js';
+import type { DriverIdentity, RunState, RunStatus, WorkflowFailure } from './types.js';
 
 /**
  * The failure codes the engine writes, then those the local driver sets. A code a model writes into its result, or
  * another driver reports, can be any text, so a record carries only these.
  */
 const RECORDED_FAILURES = [
+  'cancelled', 'hitl_required',
   'loop_exhausted', 'invalid_output', 'invalid_template', 'invalid_inputs', 'invalid_items', 'item_cycle',
   'tool_failed', 'tool_unavailable', 'agent_unavailable', 'model_unavailable', 'read_only_dirty', 'tool_unconfigured', 'tool_unsupported',
+  'merge_conflict', 'base_config', 'push_failed', 'workspace_base', 'bad_session',
+  ...LIMIT_FAILURES,
+  'delivery_failed', 'protected_path',
 ] as const;
 type RecordedFailure = (typeof RECORDED_FAILURES)[number];
 
@@ -44,8 +57,18 @@ export type WorkflowRunRecord = {
   /** The run's logical key; a retry publishes the same id. */
   run: string;
   workflow: string;
+  /** The alias that started the workflow when the run started: the name people use for it. */
+  alias?: string;
+  /** Exact workflow and prompt bytes that ran. Absent on records published before source provenance. */
+  sourceHash?: string;
+  /** Remote-reachable team commit that stores those bytes, when one commit stores the whole workflow tree. */
+  teamRevision?: string;
   /** Which publication wrote this record; the end phase completes the file. */
   phase: 'start' | 'end';
+  /** The run mode `workflow start` resolved. Absent on runs started before it was recorded. */
+  runMode?: RunMode;
+  /** Whether the run executed the team's workflow or teamai's default, with its version. Absent on runs started before it was recorded. */
+  origin?: RunOrigin;
   /**
    * Driver kind only. The workspace is a local path (banned, #1083) and the
    * hostname is machine-identifying (#1126 review) — neither is published.
@@ -76,6 +99,14 @@ export type WorkflowRunRecord = {
     model?: string;
     outcome?: Exclude<VisibleOutcome, 'skipped'>;
     tokens?: TokenUsage;
+    /** Answer provenance only; free-text notes and answer times stay local. */
+    answer?: Pick<NonNullable<StepPass['answer']>, 'choice' | 'channel' | 'agent'>;
+    /** The best-effort requirements the pass's driver could not enforce. */
+    unenforced?: Unenforced[];
+    /** The run mode of the driver that ran the pass. Absent on passes settled before it was recorded. */
+    runMode?: RunMode;
+    /** What the pass delivered (#1387): the commits on its branch, its pull request, what its own commands reported. */
+    outcomes?: WorkOutcome[];
   }>;
   /**
    * Counts of the step instances the run ended with, by status. A step a loop
@@ -84,18 +115,26 @@ export type WorkflowRunRecord = {
   stepCounts?: { total: number; succeeded: number; failed: number; skipped: number; cancelled: number };
   /** Settled attempts across the run — the cumulative iteration count. */
   iterations?: number;
+  /** The pull requests the run delivered, in the order they first appeared. Public on a public team repo; absent when it delivered none. */
+  prs?: string[];
   username: string;
   publishedAt: string;
 };
 
+/** A record built by this version; readers also accept legacy records without source provenance. */
+export type CurrentWorkflowRunRecord = WorkflowRunRecord & { sourceHash: string };
+
 type StepEntry = NonNullable<WorkflowRunRecord['steps']>[number];
 
 /** What one pass of a step reported. */
-type Reported = Pick<StepPass, 'outcome' | 'tool' | 'model' | 'tokens' | 'agent'>;
+type Reported = Pick<StepPass, 'outcome' | 'tool' | 'model' | 'tokens' | 'agent' | 'answer' | 'unenforced' | 'runMode' | 'changes' | 'outcomes'>;
+
+/** The directory on the reports branch that holds every run record. */
+export const RECORDS_DIR = 'workflows/runs';
 
 /** A record's path on the reports branch, keyed by run id. */
 export function recordPath(runId: string): string {
-  return `workflows/runs/${runId}.json`;
+  return `${RECORDS_DIR}/${runId}.json`;
 }
 
 function iso(date: Date): string {
@@ -112,12 +151,17 @@ export function buildStartRecord(
   driver: DriverIdentity | undefined,
   username: string,
   now: Date = new Date(),
-): WorkflowRunRecord {
+): CurrentWorkflowRunRecord {
   return {
     schemaVersion: 'v1alpha1',
     run: run.id,
     workflow: run.name,
+    ...(run.alias !== undefined ? { alias: run.alias } : {}),
+    sourceHash: run.sourceHash,
+    ...(run.teamRevision ? { teamRevision: run.teamRevision } : {}),
     phase: 'start',
+    ...(run.runMode ? { runMode: run.runMode } : {}),
+    ...(run.origin ? { origin: run.origin } : {}),
     // A start record may have no driver yet (a remote driver leases later);
     // the end record always carries the driver that completed the run.
     // Kind only: the workspace is a banned local path and the hostname is
@@ -138,7 +182,7 @@ function failureOf(run: RunState): RecordedFailure | undefined {
   if (run.status !== 'failed' || run.end !== undefined) return undefined;
   if (isRecordedFailure(run.failure)) return run.failure.code;
   const failed = run.steps
-    .filter((step): step is Extract<StepState, { status: 'failed' }> => step.status === 'failed')
+    .filter((step): step is Extract<StepState, { status: 'failed' | 'cancelled' }> => step.status === 'failed' || step.status === 'cancelled')
     .sort((left, right) => left.settledAt - right.settledAt);
   const top = new Set(run.definition.steps.map((step) => step.id));
   const first = failed.find((step) => top.has(step.id));
@@ -156,7 +200,7 @@ export function buildEndRecord(
   driver: DriverIdentity | undefined,
   username: string,
   now: Date = new Date(),
-): WorkflowRunRecord {
+): CurrentWorkflowRunRecord {
   const started = Date.parse(run.createdAt);
   const ended = Date.parse(run.updatedAt);
   const count = (status: StepState['status']): number => run.steps.filter((step) => step.status === status).length;
@@ -168,14 +212,23 @@ export function buildEndRecord(
     const name = definitionOf(step)?.agent;
     const agent = reported?.agent ?? (name ? { definition: { name } } : undefined);
     const outcome = reported?.outcome === 'skipped' ? undefined : reported?.outcome;
+    const outcomes = uniqueOutcomes([
+      ...(reported?.changes?.commits ?? []).map((sha): WorkOutcome => ({ kind: 'commit', sha })),
+      ...(run.deliveries ?? []).filter((receipt) => receipt.step === step && receipt.pass === (pass ?? 1)).map((receipt): WorkOutcome => ({ kind: 'pr', url: receipt.url })),
+      ...(reported?.outcomes ?? []),
+    ]);
     return {
       step,
+      ...(reported?.answer ? { answer: { choice: reported.answer.choice, channel: reported.answer.channel, agent: reported.answer.agent } } : {}),
       pass: pass ?? 1,
       ...(agent ? { agent } : {}),
-      ...(reported?.tool && isLocalWorkflowTool(reported.tool) ? { tool: reported.tool } : {}),
+      ...(reported?.tool && isLaunchTool(reported.tool) ? { tool: reported.tool } : {}),
       ...(reported?.model && isNameShaped(reported.model) ? { model: reported.model } : {}),
       ...(outcome ? { outcome } : {}),
       ...(reported?.tokens ? { tokens: reported.tokens } : {}),
+      ...(reported?.unenforced ? { unenforced: reported.unenforced } : {}),
+      ...(reported?.runMode ? { runMode: reported.runMode } : {}),
+      ...(outcomes.length > 0 ? { outcomes } : {}),
     };
   };
   // A loop keeps a step's earlier passes in `passes`, and the passes of the
@@ -184,10 +237,12 @@ export function buildEndRecord(
   const steps = [
     ...run.steps.flatMap((step) => [
       ...(step.passes ?? []).map((earlier) => entry(step.id, earlier.pass, earlier)),
-      entry(step.id, step.pass, settled(step) ? { ...step, outcome: VISIBLE_OUTCOMES[step.status] } : undefined),
+      entry(step.id, step.pass, settled(step) ? { ...step, outcome: visibleOutcome(step) } : undefined),
     ]),
     ...(run.archive ?? []).map((archived) => entry(archived.step, archived.pass, archived)),
   ];
+  // Receipts are what delivery recorded, never a step's outputs, and each URL appears once.
+  const prs = (run.deliveries ?? []).map((receipt) => receipt.url);
   return {
     ...buildStartRecord(run, driver, username, now),
     phase: 'end',
@@ -209,6 +264,7 @@ export function buildEndRecord(
     // Cumulative when present; runs from before the counter fall back to the
     // bounded history length (their true count is unknowable now).
     iterations: run.settledCount ?? run.settledAttempts.length,
+    ...(prs.length ? { prs } : {}),
   };
 }
 
@@ -223,11 +279,15 @@ export function buildEndRecord(
 export function mergeRecord(origin: WorkflowRunRecord | null, next: WorkflowRunRecord): WorkflowRunRecord {
   if (!origin) return next;
   if (origin.phase === 'end' && next.phase === 'start') return origin;
-  return { ...origin, ...next, startedAt: origin.startedAt };
+  const merged = { ...origin, ...next, startedAt: origin.startedAt };
+  if (next.end === undefined) delete merged.end;
+  if (next.failure === undefined) delete merged.failure;
+  if (next.prs === undefined) delete merged.prs;
+  return merged;
 }
 
 /** Whether a run record was delivered or still waits in the local queue. */
-type RecordState = 'published' | 'pending';
+export type RecordState = 'published' | 'pending';
 
 /** The opt-out `pull` applies to stat commits covers run records too: the member's `usageReportEnabled`, else teamai.yaml `usageReport`. */
 async function isRecordingEnabled(config: LocalConfig): Promise<boolean> {
@@ -245,6 +305,7 @@ export async function queueRunRecord(
   run: RunState,
   driver: DriverIdentity | undefined,
   phase: 'start' | 'end',
+  secrets: Record<string, string>,
 ): Promise<boolean> {
   try {
     if (!await isRecordingEnabled(config)) return false;
@@ -252,7 +313,7 @@ export async function queueRunRecord(
     const record = phase === 'start'
       ? buildStartRecord(run, driver, username)
       : buildEndRecord(run, driver, username);
-    await enqueueRecord(config, record);
+    await enqueueRecord(config, record, secrets);
     return true;
   } catch (error) {
     log.warn(`[workflows] Could not queue the ${phase} record of run ${run.id}, so the team report will not include it: ${error instanceof Error ? error.message : String(error)}`);
@@ -268,7 +329,7 @@ export async function queueRunRecord(
  */
 export async function publishRunRecords(config: LocalConfig): Promise<RecordState> {
   try {
-    return await publishPendingRecords(config);
+    return (await publishPendingRecords(config)).state;
   } catch {
     return 'pending';
   }
@@ -276,8 +337,15 @@ export async function publishRunRecords(config: LocalConfig): Promise<RecordStat
 
 /** The record state of a run that settled earlier: none when it queued no end record, pending while any of its records waits in the queue. */
 export async function runRecordState(config: LocalConfig, run: RunState): Promise<RecordState | undefined> {
-  if (!run.endRecordQueued || !await isRecordingEnabled(config)) return undefined;
-  return (await pendingRecords(config)).some((record) => record.run === run.id) ? 'pending' : 'published';
+  return (await runRecordStates(config, [run])).get(run.id);
+}
+
+/** `runRecordState` of several runs, reading the team config and the queue once for all of them. */
+export async function runRecordStates(config: LocalConfig, runs: RunState[]): Promise<Map<string, RecordState>> {
+  const queued = runs.filter((run) => run.endRecordQueued);
+  if (queued.length === 0 || !await isRecordingEnabled(config)) return new Map();
+  const pending = new Set((await pendingRecords(config)).map((record) => record.run));
+  return new Map(queued.map((run): [string, RecordState] => [run.id, pending.has(run.id) ? 'pending' : 'published']));
 }
 
 // ─── Local pending queue ────────────────────────────────
@@ -295,13 +363,18 @@ function pendingPath(config: LocalConfig, record: WorkflowRunRecord): string {
 }
 
 /** Queue a record for (re)publication; the write is atomic per file. */
-export async function enqueueRecord(config: LocalConfig, record: WorkflowRunRecord): Promise<void> {
+export async function enqueueRecord(config: LocalConfig, record: CurrentWorkflowRunRecord, secrets: Record<string, string>): Promise<void> {
   const dir = pendingDir(config);
   await fs.mkdir(dir, { recursive: true });
   const target = pendingPath(config, record);
   const tmp = `${target}.tmp`;
-  await fs.writeFile(tmp, `${JSON.stringify(record, null, 2)}\n`, 'utf-8');
+  await fs.writeFile(tmp, `${JSON.stringify(redactJson(record, secrets), null, 2)}\n`, 'utf-8');
   await fs.rename(tmp, target);
+}
+
+/** Removes the provisional end of a reopened run so a later drain cannot publish it. */
+export async function removeQueuedEndRecord(config: LocalConfig, runId: string): Promise<void> {
+  await fs.rm(path.join(pendingDir(config), `${runId}.end.json`), { force: true });
 }
 
 /** All queued records, oldest file first for stable drain order. */
@@ -327,25 +400,44 @@ export async function pendingRecords(config: LocalConfig): Promise<WorkflowRunRe
 }
 
 async function dequeue(config: LocalConfig, record: WorkflowRunRecord): Promise<void> {
-  await fs.rm(pendingPath(config, record), { force: true });
+  const lock = runLockPath(config, record.run);
+  if (!await acquireLock(lock)) return;
+  try {
+    const target = pendingPath(config, record);
+    let current: WorkflowRunRecord;
+    try {
+      current = JSON.parse(await fs.readFile(target, 'utf-8')) as WorkflowRunRecord;
+    } catch {
+      return;
+    }
+    if (current.phase === record.phase && current.endedAt === record.endedAt) await fs.rm(target, { force: true });
+  } finally {
+    await releaseLock(lock);
+  }
 }
 
+/** Whether a drain delivered the records it took, and when it did not, why they are still queued. */
+export type RecordDelivery = { state: 'published' } | { state: 'pending'; reason: string };
+
 /**
- * Publish every queued record through the reports branch, then fold their
- * totals into each record's own member stats file in the same update.
+ * Publish every queued record, or only run `options.run`'s, through the reports branch, then fold their
+ * totals into each record's own member stats file in the same update. The records of a run that origin shows
+ * another install owns are dropped instead: they describe this machine's copy, which that install's records replace.
  *
- * Returns `'published'` when the queue drained (or was empty) and `'pending'`
- * when anything remains queued — the value the engine surfaces as
- * `record: pending` (#1083).
+ * Pending when the update did not land, or when a delivered run+phase path was queued again meanwhile;
+ * the engine surfaces that as `record: pending` (#1083). Records queued at other paths during delivery
+ * do not affect it.
  */
-export async function publishPendingRecords(config: LocalConfig): Promise<RecordState> {
-  const queued = await pendingRecords(config);
-  if (queued.length === 0) return 'published';
+export async function publishPendingRecords(config: LocalConfig, options: { run?: string } = {}): Promise<RecordDelivery> {
+  const queued = (await pendingRecords(config)).filter((record) => options.run === undefined || record.run === options.run);
+  if (queued.length === 0) return { state: 'published' };
   const { updateReports, readReportsOriginFile } = await import('../utils/reports-branch.js');
+  const install = (await installOwner(config)).id;
   const outcome = await updateReports(config, async (worktree) => {
     const files: string[] = [];
     const byRun = new Map<string, WorkflowRunRecord[]>();
     for (const record of queued) {
+      if (ownedElsewhere(await readReportsOriginFile(worktree, snapshotPath(record.run)), install)) continue;
       const list = byRun.get(record.run) ?? [];
       list.push(record);
       byRun.set(record.run, list);
@@ -379,14 +471,15 @@ export async function publishPendingRecords(config: LocalConfig): Promise<Record
     // Workflow totals ride the same update: one lock, one push, and the stats
     // merge counts only what this update delivered. Each total lands in the
     // stats file of the member who ran it, not of whoever drains the queue.
+    // An end that replaces another member's end also moves that run out of
+    // the other member's totals.
     const { default: YAML } = await import('yaml');
-    const deltaByUser = new Map<string, WorkflowRunRecord[]>();
-    for (const record of statsDeltaRecords(originByRun, delivered)) {
-      const list = deltaByUser.get(record.username) ?? [];
-      list.push(record);
-      deltaByUser.set(record.username, list);
-    }
-    for (const [username, delta] of deltaByUser) {
+    const delta = statsDeltaRecords(originByRun, delivered);
+    const usernames = new Set(delta.flatMap((record) => {
+      const origin = originByRun.get(record.run);
+      return origin?.phase === 'end' ? [record.username, origin.username] : [record.username];
+    }));
+    for (const username of usernames) {
       const statsRel = `stats/${username}.yaml`;
       const existingStatsRaw = await readReportsOriginFile(worktree, statsRel);
       let existingStats: Record<string, unknown> = {};
@@ -397,7 +490,7 @@ export async function publishPendingRecords(config: LocalConfig): Promise<Record
           existingStats = {};
         }
       }
-      const mergedStats = mergeWorkflowStats(ensureStatsShape(existingStats, username), delta);
+      const mergedStats = mergeWorkflowStats(ensureStatsShape(existingStats, username), username, delta, originByRun);
       await fs.mkdir(path.join(worktree, 'stats'), { recursive: true });
       await fs.writeFile(path.join(worktree, statsRel), YAML.stringify(mergedStats), 'utf-8');
       files.push(statsRel);
@@ -407,12 +500,37 @@ export async function publishPendingRecords(config: LocalConfig): Promise<Record
       message: `[teamai] Publish ${byRun.size} workflow run record${byRun.size === 1 ? '' : 's'}`,
     };
   });
-  const { isDelivered } = await import('../utils/branch-worktree.js');
-  if (isDelivered(outcome)) {
-    for (const record of queued) await dequeue(config, record);
-    return 'published';
+  switch (outcome.status) {
+    case 'published':
+    case 'already-present': {
+      for (const record of queued) await dequeue(config, record);
+      const remaining = new Set(await fs.readdir(pendingDir(config)).catch(() => []));
+      return queued.some((record) => remaining.has(path.basename(pendingPath(config, record))))
+        ? { state: 'pending', reason: 'a record of the same run was still queued after they were delivered' }
+        : { state: 'published' };
+    }
+    case 'busy':
+      return { state: 'pending', reason: 'another teamai process is writing teamai-reports' };
+    case 'failed':
+      return { state: 'pending', reason: outcome.reason };
+    default: {
+      const unhandled: never = outcome;
+      return unhandled;
+    }
   }
-  return 'pending';
+}
+
+/** Whether `snapshot`, a run's published state as origin holds it, names an install other than `install` as its owner. */
+function ownedElsewhere(snapshot: string | null, install: string): boolean {
+  if (snapshot === null) return false;
+  try {
+    const value: unknown = JSON.parse(snapshot);
+    if (typeof value !== 'object' || value === null || !('owner' in value)) return false;
+    const { owner } = value;
+    return typeof owner === 'object' && owner !== null && 'id' in owner && typeof owner.id === 'string' && owner.id !== install;
+  } catch {
+    return false;
+  }
 }
 
 // ─── Stats totals ───────────────────────────────────────
@@ -444,16 +562,22 @@ export interface WorkflowStats {
 }
 
 /**
- * Fold end-phase records into the user's workflow totals, additively,
- * preserving every unrelated stats field (the #1056 preservation discipline).
+ * Fold `username`'s end-phase records into that member's workflow totals,
+ * additively, preserving every unrelated stats field (the #1056 preservation
+ * discipline). Records of other members are skipped.
  *
  * Idempotent against a queue replay: an end record whose run total already
- * appears is not counted twice — the delivery-merge guarantees one record file
- * per run, and the stats side derives from the same per-run collapse.
+ * appears is not counted twice. An end that replaces a different end on origin
+ * (a retried run that ended again) withdraws that end's run, outcome and
+ * duration from the totals of the member who published it, so a run counts
+ * once, for the member whose end origin holds. A cancelled run counts toward
+ * runs and duration only.
  */
 export function mergeWorkflowStats(
   existing: Record<string, unknown>,
+  username: string,
   records: WorkflowRunRecord[],
+  originByRun: ReadonlyMap<string, WorkflowRunRecord | null> = new Map(),
 ): Record<string, unknown> {
   const current = (existing.workflows ?? {}) as Partial<WorkflowStats>;
   const byRun = new Map<string, WorkflowRunRecord>();
@@ -464,21 +588,31 @@ export function mergeWorkflowStats(
     if (!prior || (prior.phase === 'start' && record.phase === 'end')) byRun.set(record.run, record);
   }
   let { runs = 0, succeeded = 0, failed = 0, totalDurationMs = 0 } = current;
+  const fold = (record: WorkflowRunRecord, sign: 1 | -1): void => {
+    if (record.username !== username) return;
+    runs += sign;
+    if (record.status === 'succeeded') succeeded += sign;
+    if (record.status === 'failed') failed += sign;
+    totalDurationMs += sign * (record.durationMs ?? 0);
+  };
   for (const record of byRun.values()) {
     if (record.phase !== 'end') continue;
-    runs += 1;
-    if (record.status === 'succeeded') succeeded += 1;
-    if (record.status === 'failed') failed += 1;
-    totalDurationMs += record.durationMs ?? 0;
+    const origin = originByRun.get(record.run);
+    if (origin?.phase === 'end') {
+      if (origin.endedAt === record.endedAt) continue;
+      fold(origin, -1);
+    }
+    fold(record, 1);
   }
   return { ...existing, workflows: { runs, succeeded, failed, totalDurationMs } };
 }
 
 /**
  * The records whose totals still need folding into stats: an end-phase record
- * whose run already shows an end phase on origin was counted by the delivery
- * that first published it, so a queue replay must not count it again. Pure
- * function of the merge base, so the idempotency is testable without git.
+ * whose run already shows the same end on origin was counted by the delivery
+ * that first published it, so a queue replay must not count it again. An end
+ * with a different `endedAt` replaces the one on origin. Pure function of the
+ * merge base, so the idempotency is testable without git.
  */
 export function statsDeltaRecords(
   originByRun: Map<string, WorkflowRunRecord | null>,
@@ -487,6 +621,6 @@ export function statsDeltaRecords(
   return records.filter((record) => {
     if (record.phase !== 'end') return false;
     const origin = originByRun.get(record.run);
-    return !(origin && origin.phase === 'end');
+    return origin?.phase !== 'end' || origin.endedAt !== record.endedAt;
   });
 }

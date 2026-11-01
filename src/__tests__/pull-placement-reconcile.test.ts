@@ -16,6 +16,9 @@ vi.mock('../config.js', () => ({
   detectProjectConfig: vi.fn().mockResolvedValue(null),
   loadStateForScope: vi.fn().mockResolvedValue({ lastPull: null, lastPullRev: null }),
   saveStateForScope: vi.fn(),
+  // Pull re-resolves the role assignment once the team repo has moved (#1186);
+  // this suite's configs carry none, so it hands the config straight back.
+  refreshRoleAssignment: vi.fn(async () => {}),
 }));
 
 vi.mock('../utils/git.js', () => ({
@@ -54,7 +57,7 @@ vi.mock('../hooks.js', () => ({
 vi.mock('../mcp-reconcile.js', () => ({
   reconcileMcpForConfig: vi.fn().mockResolvedValue({ changes: [], wrote: false }),
 }));
-vi.mock('../team-push.js', () => ({ reportUsageToTeam: vi.fn().mockResolvedValue(undefined) }));
+vi.mock('../team-push.js', () => ({ reportUsage: vi.fn().mockResolvedValue('unreported') }));
 vi.mock('../usage-tracker.js', () => ({
   readUsageEvents: vi.fn().mockResolvedValue([]),
   truncateUsageAfterReport: vi.fn().mockResolvedValue(undefined),

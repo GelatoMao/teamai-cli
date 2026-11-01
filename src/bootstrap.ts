@@ -18,6 +18,7 @@ import path from 'node:path';
 import YAML from 'yaml';
 import {
   BOOTSTRAP_LOCK_FILENAME,
+  SELF_BRANCH_HOME_DIRNAME,
   getConfigPath,
   type LocalConfig,
   type TeamaiConfig,
@@ -35,7 +36,7 @@ export type BootstrapResult = 'bootstrapped' | 'already' | 'skip';
  * Returns null otherwise (not a single-repo project). Purely a marker read — no
  * schema validation beyond the mode field so a partial/older file still triggers.
  */
-async function readSelfModeMarker(dir: string): Promise<{ repo?: string; provider?: string } | null> {
+export async function readSelfModeMarker(dir: string): Promise<{ repo?: string; provider?: string } | null> {
   const yamlPath = path.join(dir, '.teamai', 'teamai.yaml');
   const content = await readFileSafe(yamlPath);
   if (!content) return null;
@@ -163,6 +164,8 @@ async function planSelfBootstrap(
     // stays <repo>/.teamai (the class-B knowledge anchor); dataHome routes the
     // class-A1 writes (config/state) out of the workspace.
     dataHome: partitionHome,
+    // Both scopes of a self-mode repo share one side-branch checkout (#1443).
+    branchHome: path.join(partitionHome, SELF_BRANCH_HOME_DIRNAME),
     additionalRoles: [],
     ...(enabledAgents.length > 0 ? { enabledAgents } : {}),
   };
@@ -299,7 +302,9 @@ export async function bootstrapSelfRepo(
         const memberDir = path.join(wt, 'members');
         await ensureDir(memberDir);
         const memberPath = path.join(memberDir, `${username}.yaml`);
-        if (await pathExists(memberPath)) return null;
+        if (await pathExists(memberPath)) {
+          return { files: [], message: `[teamai] Register member: ${username}` };
+        }
         // Absorb the member's pre-switch file from the clone (inherited root):
         // its displayName/registeredAt/projects survive the re-registration.
         const inherited = await getMemberConfig(localConfig.repo.localPath, username);

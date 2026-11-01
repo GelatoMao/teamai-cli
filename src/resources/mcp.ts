@@ -4,6 +4,7 @@ import { ResourceHandler } from './base.js';
 import type { ResourceItem, TeamaiConfig, LocalConfig, McpServerDef } from '../types.js';
 import { readFileSafe, writeFile } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
+import { pushRepoResourceItem, scanRepoResourceForPush } from './repo-resource.js';
 import {
   entryFileAbsolutePath, entryFilePath, listEntryFiles, missingTopLevelKeyReason, readEntryFileText, unknownEntryKeys,
   type EntryReader,
@@ -120,12 +121,8 @@ export function teamMcpToDef(s: TeamMcpServer): McpServerDef {
 export class McpHandler extends ResourceHandler {
   readonly type = 'mcp' as const;
 
-  /**
-   * MCP servers are contributed by editing mcp/mcp.yaml directly (same as hooks),
-   * so there is nothing to discover on the local side for push.
-   */
-  async scanLocalForPush(): Promise<ResourceItem[]> {
-    return [];
+  async scanLocalForPush(teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<ResourceItem[]> {
+    return scanRepoResourceForPush('mcp', 'mcp', teamConfig, localConfig);
   }
 
   /**
@@ -156,8 +153,8 @@ export class McpHandler extends ResourceHandler {
     return items;
   }
 
-  async pushItem(): Promise<void> {
-    // Servers live in a single mcp.yaml committed directly; nothing per-item to copy.
+  async pushItem(item: ResourceItem, _teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<void> {
+    await pushRepoResourceItem(item, localConfig);
   }
 
   async pullItem(): Promise<void> {
@@ -190,7 +187,7 @@ export class McpHandler extends ResourceHandler {
     // drops a key it does not know, and dropping a misspelled `roles:` would
     // install that server for every member (#822).
     const doc = YAML.parseDocument(content);
-    for (const index of removed.reverse()) doc.deleteIn(['servers', index]);
+    for (const index of removed.toReversed()) doc.deleteIn(['servers', index]);
     await writeFile(yamlPath, doc.toString());
     await this.addTombstone(serverName, localConfig);
     return [yamlPath];

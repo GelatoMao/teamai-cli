@@ -1,8 +1,14 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
+import { loadLocalConfigForScope } from '../config.js';
+import { syncScorerDefinitions, type SyncScorerOptions, type SyncScorerResult } from '../scorers/cache.js';
 import { log } from '../utils/logger.js';
-import { readFileSafe, remove, writeJsonAtomic } from '../utils/fs.js';
+import { pathExists, readFileSafe, remove, writeJsonAtomic } from '../utils/fs.js';
+import { isSafeNamespaceSegment } from '../manifest-schema.js';
+import { resolveResourceNamespaces } from '../resource-namespaces.js';
+import { resolveNamespacedItems, type NamespaceCandidate } from '../namespace-resolver.js';
 import {
   getBusinessRoot,
   getDataHome,
@@ -11,21 +17,49 @@ import {
   managedMcpWorkspaceId,
   type LocalConfig,
 } from '../types.js';
+import { LineCounter, parseDocument } from 'yaml';
 import { formatDiagnostic, parseWorkflow, promptFileDiagnostics, stepField } from './parse.js';
-import type { WorkflowFiles } from './parse-context.js';
-import type { CachedWorkflow, WorkflowDefinition, WorkflowDiagnostic, WorkflowStep } from './types.js';
+import { locate, valueNode, type WorkflowFiles } from './parse-context.js';
+import type { CachedWorkflow, OutputSchema, ResolvedWorkflow, WorkflowDefinition, WorkflowDiagnostic, WorkflowStep } from './types.js';
+import { DefaultWorkflows } from '../default-workflows.js';
 import { assertSafePath, assertWithinRoot } from '../utils/path-safety.js';
+import { createGit } from '../utils/git.js';
+import {
+  remotelyReachableRevision, revisionHoldsSources, withoutStaleTeamRevision, type ReachableRevision,
+} from '../utils/team-revision.js';
 
-export interface SyncWorkflowOptions {
-  dryRun?: boolean;
-  scopeLabel?: string;
-}
+export type SyncWorkflowOptions = SyncScorerOptions;
 
 export interface SyncWorkflowResult {
   cached: string[];
   kept: string[];
   invalid: WorkflowDiagnostic[];
   unrunnable: string[];
+  /** The scorers of the same tree, synced first. */
+  scorers: SyncScorerResult;
+  /** Scorers a step lists that `scorers` has no valid version of. The workflow still runs; the step runs without them. */
+  unknownScorers: UnknownScorer[];
+  /** `alias_conflict` on each cached workflow whose alias another one has as alias or name. Each still starts by name. */
+  aliasConflicts: WorkflowDiagnostic[];
+}
+
+export interface UnknownScorer {
+  file: string;
+  /** The step's path, such as `check.review`. */
+  step: string;
+  scorer: string;
+}
+
+export function formatUnknownScorer({ file, step, scorer }: UnknownScorer): string {
+  return `${file}: step "${step}" lists scorer "${scorer}", which has no valid scorers/${scorer}.md; the step runs without it`;
+}
+
+/** The scorers a definition's steps list, including inside its inline workflows, with each step's path. */
+function scorersListedBy(definition: { steps: WorkflowStep[] }, prefix = ''): Array<{ step: string; scorer: string }> {
+  return definition.steps.flatMap((step) => [
+    ...(step.scorers?.names ?? []).map((scorer) => ({ step: `${prefix}${step.id}`, scorer })),
+    ...(typeof step.workflow === 'object' ? scorersListedBy(step.workflow, `${prefix}${step.id}.`) : []),
+  ]);
 }
 
 /** One version of a file, as its reference checks read it: this revision, or the copy the cache keeps. */
@@ -40,6 +74,7 @@ interface Version {
 interface Candidate extends Version {
   stem: string;
   sourceHash: string;
+  teamRevision?: string;
 }
 
 /** What a file runs after this sync, and why the versions it did not pick cannot run. */
@@ -81,10 +116,58 @@ async function readCache(config: LocalConfig, name: string): Promise<CachedWorkf
   }
 }
 
-/** The last validated definition for `name`, or null when this file has never been valid. */
-export async function loadCachedWorkflow(config: LocalConfig, name: string): Promise<CachedWorkflow | null> {
+/**
+ * The last validated team definition for `name`, by name then by alias, else teamai's default of that name; null when
+ * neither runs.
+ */
+export async function loadCachedWorkflow(config: LocalConfig, name: string): Promise<ResolvedWorkflow | null> {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) return null;
-  return readCache(config, name);
+  const direct = await readCache(config, name);
+  if (direct) return { ...direct, source: 'team' };
+  const team = await listTeamWorkflows(config);
+  const aliases = team.filter((entry) => entry.definition.alias === name);
+  if (aliases.length === 1) return { ...aliases[0], source: 'team' };
+  const shipped = DefaultWorkflows.named(name);
+  return shipped && aliases.length === 0 ? { ...shipped, source: 'default' } : null;
+}
+
+/** `definition`'s alias when a start by that alias runs it, else undefined: another workflow has the alias as its name or alias. */
+export async function startingAlias(config: LocalConfig, { name, alias }: { name: string; alias?: string }): Promise<string | undefined> {
+  return alias !== undefined && (await loadCachedWorkflow(config, alias))?.definition.name === name ? alias : undefined;
+}
+
+/**
+ * Where a start of workflow `name` from `config`'s directory runs, and what it runs: a team version in `config`'s scope,
+ * else, from a project, one in the user scope, whose generated skills show in every directory, else teamai's default in
+ * `config`'s scope. `workflow` is null when none of them runs.
+ */
+export async function resolveStart(config: LocalConfig, name: string): Promise<{ config: LocalConfig; workflow: ResolvedWorkflow | null }> {
+  const here = await loadCachedWorkflow(config, name);
+  if (here?.source === 'team' || config.scope !== 'project') return { config, workflow: here };
+  const user = await loadLocalConfigForScope('user', undefined, { dryRun: true });
+  const there = user ? await loadCachedWorkflow(user, name) : null;
+  return user && there?.source === 'team' ? { config: user, workflow: there } : { config, workflow: here };
+}
+
+/**
+ * Every runnable workflow in stable name order, without resolving aliases recursively: the cached team files, and each
+ * default no team file or alias takes the name of.
+ */
+export async function listCachedWorkflows(config: LocalConfig): Promise<ResolvedWorkflow[]> {
+  const team = await listTeamWorkflows(config);
+  const taken = new Set(team.flatMap(({ definition }) => [definition.name, ...(definition.alias ? [definition.alias] : [])]));
+  return [
+    ...team.map((entry) => ({ ...entry, source: 'team' as const })),
+    ...DefaultWorkflows.all().filter(({ definition }) => !taken.has(definition.name)).map((entry) => ({ ...entry, source: 'default' as const })),
+  ].sort((left, right) => (left.definition.name < right.definition.name ? -1 : 1));
+}
+
+/** The cached team files in name order. */
+async function listTeamWorkflows(config: LocalConfig): Promise<CachedWorkflow[]> {
+  let files: string[];
+  try { files = await fs.readdir(cacheDir(config)); } catch { return []; }
+  const entries = await Promise.all(files.filter((file) => file.endsWith('.json')).sort().map((file) => readCache(config, file.slice(0, -5))));
+  return entries.filter((entry): entry is CachedWorkflow => entry !== null);
 }
 
 /** Removes every cached workflow this sync did not settle to a version, missing files included. */
@@ -114,7 +197,7 @@ async function workflowFileNames(dir: string): Promise<string[]> {
 }
 
 /**
- * Validate each `workflows/*.yaml` on its own and cache only files that pass.
+ * Validate `scorers/` first, then each `workflows/*.yaml` on its own, and cache only files that pass.
  * An invalid file keeps its last cached definition; a file that was never valid
  * stays unrunnable. The cache then holds only what this sync settled, so start
  * finds no version that was not checked against the others. Nothing here fails the caller.
@@ -123,12 +206,140 @@ export async function syncWorkflowDefinitions(
   config: LocalConfig,
   options: SyncWorkflowOptions = {},
 ): Promise<SyncWorkflowResult> {
-  const result: SyncWorkflowResult = { cached: [], kept: [], invalid: [], unrunnable: [] };
+  const scorers = await syncScorerDefinitions(config, options);
+  const result: SyncWorkflowResult = { cached: [], kept: [], invalid: [], unrunnable: [], scorers, unknownScorers: [], aliasConflicts: [] };
   const dir = path.join(getKnowledgeDir(config), 'workflows');
+  const knowledgeRoot = getKnowledgeDir(config);
+  // Asked on the first valid file: a team without workflows starts no git here.
+  let reachable: Promise<ReachableRevision | undefined> | undefined;
   const checked: Checked[] = [];
+  const rawCandidates: Array<{ stem: string; relativePath: string; full: string; namespace: string | null }> = [];
   for (const name of await workflowFileNames(dir)) {
-    const relativePath = `workflows/${name}`;
-    const full = path.join(dir, name);
+    rawCandidates.push({
+      stem: name.replace(/\.yaml$/, ''),
+      relativePath: `workflows/${name}`,
+      full: path.join(dir, name),
+      namespace: null,
+    });
+  }
+
+  try {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink() || entry.name.startsWith('.')) continue;
+      if (!isSafeNamespaceSegment(entry.name)) continue;
+      const ns = entry.name;
+      const nsDir = path.join(dir, ns);
+      for (const name of await workflowFileNames(nsDir)) {
+        rawCandidates.push({
+          stem: name.replace(/\.yaml$/, ''),
+          relativePath: `workflows/${ns}/${name}`,
+          full: path.join(nsDir, name),
+          namespace: ns,
+        });
+      }
+    }
+  } catch {
+    // dir missing or unreadable
+  }
+
+  // Resolve namespaces when namespaced candidates exist on disk — workflows
+  // OR prompts. A root-only tree needs no manifest read, and an unconditional
+  // read here would fire before the push's pull refreshes the clone — the
+  // stale mapping the #649 review forbids. A manifest that cannot be read
+  // resolves to an empty namespace set (conservative), while a manifest-free
+  // team discovers prompt namespaces from disk below.
+  let hasNamespaced = rawCandidates.some((c) => c.namespace !== null);
+  if (!hasNamespaced) {
+    // Prompt namespaces are independent of workflow layout: a root-only
+    // workflows/ tree with prompts/<ns>/ still needs resolution.
+    try {
+      const promptsDir = path.join(knowledgeRoot, 'prompts');
+      for (const entry of await fs.readdir(promptsDir, { withFileTypes: true })) {
+        if (entry.isDirectory() && !entry.isSymbolicLink() && isSafeNamespaceSegment(entry.name)) {
+          hasNamespaced = true;
+          break;
+        }
+      }
+    } catch {
+      // prompts dir missing or unreadable
+    }
+  }
+  let resourceNamespaces: Awaited<ReturnType<typeof resolveResourceNamespaces>> = null;
+  if (hasNamespaced) {
+    try {
+      resourceNamespaces = await resolveResourceNamespaces(config);
+    } catch {
+      // A manifest exists but cannot be read: be conservative. Treating
+      // every on-disk namespace as active (the null fallback) would cache
+      // an inactive namespace's workflow as runnable for this member.
+      // An empty resolution means "no namespace is active".
+      resourceNamespaces = { activeNamespaces: {} } as Awaited<ReturnType<typeof resolveResourceNamespaces>>;
+    }
+  }
+  const activeWorkflows = resourceNamespaces?.activeNamespaces.workflows ?? (resourceNamespaces ? [] : null);
+  const activePrompts = resourceNamespaces?.activeNamespaces.prompts ?? (resourceNamespaces ? [] : null);
+  // Manifest-free: discover prompt namespaces from disk so a namespaced
+  // prompt directory is still found even without a roles/projects manifest.
+  let effectiveActivePrompts: readonly string[] | null = activePrompts;
+  if (effectiveActivePrompts === null) {
+    const discovered = new Set<string>();
+    try {
+      const promptsDir = path.join(knowledgeRoot, 'prompts');
+      for (const entry of await fs.readdir(promptsDir, { withFileTypes: true })) {
+        if (entry.isDirectory() && !entry.isSymbolicLink() && isSafeNamespaceSegment(entry.name)) {
+          discovered.add(entry.name);
+        }
+      }
+    } catch { /* prompts dir missing */ }
+    effectiveActivePrompts = discovered.size > 0 ? [...discovered] : null;
+  }
+  const effectiveActiveWorkflows = activeWorkflows ?? [
+    ...new Set(rawCandidates.flatMap((candidate) => (
+      candidate.namespace === null ? [] : [candidate.namespace]
+    ))),
+  ];
+
+  const byStem = new Map<string, Array<{ stem: string; relativePath: string; full: string; namespace: string | null }>>();
+  for (const cand of rawCandidates) {
+    const group = byStem.get(cand.stem) ?? [];
+    group.push(cand);
+    byStem.set(cand.stem, group);
+  }
+
+  const toCheck: Array<{ stem: string; relativePath: string; full: string }> = [];
+
+  for (const [stem, group] of byStem) {
+    const namespaceCandidatesList: NamespaceCandidate<{ stem: string; relativePath: string; full: string }>[] = group.map((c) => ({
+      name: c.stem,
+      source: c.relativePath,
+      namespace: c.namespace,
+      value: c,
+    }));
+
+    const resolution = resolveNamespacedItems(namespaceCandidatesList, effectiveActiveWorkflows);
+    if (resolution.kind === 'conflict') {
+      checked.push({
+        stem,
+        relativePath: resolution.first.source,
+        diagnostics: [{
+          file: resolution.first.source,
+          line: 1,
+          column: 1,
+          field: '(root)',
+          code: 'workflow_namespace_conflict',
+          message: `Workflow "${stem}" is defined in multiple active namespaces (${resolution.first.source} and ${resolution.second.source}); conflicting workflows have no runnable version`,
+        }],
+      });
+      continue;
+    }
+
+    if (resolution.items.length > 0) {
+      toCheck.push(resolution.items[0].value);
+    }
+  }
+
+  for (const { stem, relativePath, full } of toCheck) {
     let stat: Awaited<ReturnType<typeof fs.lstat>>;
     try {
       stat = await fs.lstat(full);
@@ -137,7 +348,6 @@ export async function syncWorkflowDefinitions(
     }
     // A symlink is not a workflow file, even when the target is a YAML file outside this directory.
     if (stat.isSymbolicLink() || !stat.isFile()) continue;
-    const stem = name.replace(/\.yaml$/, '');
     const content = await readFileSafe(full);
     if (content === null) {
       checked.push({ stem, relativePath, diagnostics: [{ file: relativePath, line: 1, column: 1, field: '(root)', message: 'workflow file could not be read' }] });
@@ -148,7 +358,7 @@ export async function syncWorkflowDefinitions(
       checked.push({ stem, relativePath, diagnostics: parsed.diagnostics });
       continue;
     }
-    const resolved = await resolvePromptFiles(config, parsed.definition, parsed.promptFileLocations, relativePath);
+    const resolved = await resolvePromptFiles(config, parsed.definition, parsed.promptFileLocations, relativePath, effectiveActivePrompts);
     if (!resolved.ok) {
       checked.push({ stem, relativePath, diagnostics: resolved.diagnostics });
       continue;
@@ -157,15 +367,26 @@ export async function syncWorkflowDefinitions(
     for (const source of resolved.sources) {
       hash.update('\0').update(source.path).update('\0').update(source.content);
     }
+    const sources = [{ path: relativePath, content }, ...resolved.sources];
+    const revision = await (reachable ??= remotelyReachableRevision(knowledgeRoot));
+    const teamRevision = await revisionHoldsSources(knowledgeRoot, revision, sources)
+      ? revision?.revision
+      : undefined;
     checked.push({
-      stem, relativePath, content, definition: resolved.definition, sourceHash: hash.digest('hex'), promptFileLocations: parsed.promptFileLocations,
+      stem, relativePath, content, definition: resolved.definition, sourceHash: hash.digest('hex'),
+      ...(teamRevision ? { teamRevision } : {}), promptFileLocations: parsed.promptFileLocations,
     });
   }
 
   const kept = new Map<string, CachedWorkflow | null>();
   for (const file of checked) {
     const dropped = 'diagnostics' in file && dropsKeptVersion(file.diagnostics);
-    kept.set(file.stem, dropped ? null : await readCache(config, file.stem));
+    const cached = dropped ? null : await readCache(config, file.stem);
+    const reachableCache = await withoutStaleTeamRevision(knowledgeRoot, cached);
+    kept.set(file.stem, reachableCache);
+    if (!options.dryRun && cached?.teamRevision && !reachableCache?.teamRevision) {
+      await writeJsonAtomic(cachePath(config, file.stem), reachableCache);
+    }
   }
   const settle = checkReferences(checked, kept);
 
@@ -180,7 +401,9 @@ export async function syncWorkflowDefinitions(
       log.warn(`[workflows] Kept the last valid version of ${stem}; this revision was not cached`);
     } else {
       result.unrunnable.push(relativePath);
-      log.warn(`[workflows] ${relativePath} has no runnable version`);
+      log.warn(DefaultWorkflows.named(stem)
+        ? `[workflows] ${relativePath} has no runnable version, so teamai's default ${stem} stays in effect`
+        : `[workflows] ${relativePath} has no runnable version`);
     }
   };
   let wrote = 0;
@@ -194,12 +417,15 @@ export async function syncWorkflowDefinitions(
       reject(file, problems);
       continue;
     }
-    const previous = await readCache(config, file.definition.name);
+    const previous = kept.get(file.stem);
     result.cached.push(file.definition.name);
-    if (options.dryRun || previous?.sourceHash === file.sourceHash) continue;
+    // Equal bytes are still stored at the earlier entry's revision; the loop that filled `kept` dropped it if origin no longer reaches it.
+    const teamRevision = file.teamRevision ?? (previous?.sourceHash === file.sourceHash ? previous.teamRevision : undefined);
+    if (options.dryRun || (previous?.sourceHash === file.sourceHash && previous.teamRevision === teamRevision)) continue;
     await writeJsonAtomic(cachePath(config, file.definition.name), {
       relativePath: file.relativePath,
       sourceHash: file.sourceHash,
+      ...(teamRevision ? { teamRevision } : {}),
       content: file.content,
       definition: file.definition,
       validatedAt: new Date().toISOString(),
@@ -207,6 +433,47 @@ export async function syncWorkflowDefinitions(
     wrote += 1;
   }
   if (!options.dryRun) await dropUnsettled(config, new Set([...result.cached, ...result.kept]));
+  const valid = new Set(scorers.cached);
+  for (const file of checked) {
+    const definition = settle(file.stem).definition;
+    for (const { step, scorer } of definition ? scorersListedBy(definition) : []) {
+      if (!valid.has(scorer)) result.unknownScorers.push({ file: file.relativePath, step, scorer });
+    }
+  }
+  for (const unknown of result.unknownScorers) log.warn(`[workflows] ${formatUnknownScorer(unknown)}`);
+  const versions = checked.flatMap((file): AliasSource[] => {
+    const { definition, revision } = settle(file.stem);
+    if (!definition) return [];
+    if (!('diagnostics' in file) && revision.length === 0) return [{ relativePath: file.relativePath, content: file.content, definition }];
+    const copy = kept.get(file.stem);
+    return copy ? [{ relativePath: copy.relativePath, content: copy.content, definition }] : [];
+  });
+  result.aliasConflicts = aliasConflicts(versions);
+  for (const conflict of result.aliasConflicts) log.warn(`[workflows] ${formatDiagnostic(conflict)}`);
+  // A default is checked against the team versions this sync settled on, as a team file is, so a team replacement of a
+  // workflow it runs that takes other inputs is reported here, not by a run that fails after its first steps.
+  // Resolved as `loadCachedWorkflow` resolves a start: the team file of that name, else the one team alias, else the default.
+  const settledTeam = (name: string): WorkflowDefinition | null | undefined => {
+    const named = versions.find(({ definition }) => definition.name === name);
+    if (named) return named.definition;
+    const aliased = versions.filter(({ definition }) => definition.alias === name);
+    return aliased.length === 1 ? aliased[0]?.definition : aliased.length > 1 ? null : undefined;
+  };
+  const runnable = (name: string): WorkflowDefinition | null => {
+    const team = settledTeam(name);
+    return team === undefined ? DefaultWorkflows.named(name)?.definition ?? null : team;
+  };
+  for (const shipped of DefaultWorkflows.all()) {
+    if (settledTeam(shipped.definition.name) !== undefined || shipped.content === undefined) continue;
+    const parsed = parseWorkflow(shipped.relativePath, shipped.content, { runnable, cycle: () => undefined });
+    const retypedBy = workflowsRunBy(shipped.definition).flatMap((run) => {
+      const child = runnable(run.workflow);
+      return child ? retypedInputs(shipped.definition, run, child) : [];
+    });
+    for (const reason of [...(parsed.ok ? [] : parsed.diagnostics.map(({ message }) => message)), ...retypedBy]) {
+      log.warn(`[workflows] teamai's default ${shipped.definition.name} cannot start: ${reason}`);
+    }
+  }
 
   const scope = options.scopeLabel ?? config.scope;
   if (options.dryRun && result.cached.length > 0) {
@@ -215,6 +482,24 @@ export async function syncWorkflowDefinitions(
     log.success(`[${scope}] Synced ${wrote} workflow${wrote === 1 ? '' : 's'}`);
   }
   return result;
+}
+
+/** The version of a file a sync settled on, with the YAML that locates its alias. */
+type AliasSource = { relativePath: string; content: string | undefined; definition: WorkflowDefinition };
+
+/** Each workflow whose alias another settled workflow has as alias or name. `loadCachedWorkflow` resolves such an alias to no other workflow. */
+function aliasConflicts(versions: AliasSource[]): WorkflowDiagnostic[] {
+  return versions.flatMap(({ relativePath, content, definition: { name, alias } }) => {
+    if (alias === undefined) return [];
+    const named = versions.find((other) => other.definition.name === alias);
+    const twin = versions.find((other) => other.definition.name !== name && other.definition.alias === alias);
+    const message = named ? `alias "${alias}" is also the name of ${named.relativePath}, so it starts that workflow; start ${name} by name`
+      : twin ? `alias "${alias}" is also the alias of ${twin.relativePath}, so it starts neither; start them by name` : undefined;
+    if (!message) return [];
+    const lineCounter = new LineCounter();
+    const document = parseDocument(content ?? '', { lineCounter });
+    return [{ ...locate(relativePath, lineCounter, valueNode(document.contents, 'alias'), 'alias', message), code: 'alias_conflict' }];
+  });
 }
 
 /**
@@ -230,9 +515,181 @@ function dropsKeptVersion(diagnostics: WorkflowDiagnostic[]): boolean {
  * with the path of the step that runs each one, such as `group.run-b`.
  * Every walk across files, at pull and at start, follows references through here.
  */
-export function workflowsRunBy(definition: { steps: WorkflowStep[] }, prefix = ''): Array<{ step: string; workflow: string }> {
+export function workflowsRunBy(definition: { steps: WorkflowStep[] }, prefix = ''): Array<{ step: string; workflow: string; with?: Record<string, unknown> }> {
   return definition.steps.flatMap((step) => (typeof step.workflow === 'object' ? workflowsRunBy(step.workflow, `${prefix}${step.id}.`)
-    : step.workflow === undefined ? [] : [{ step: `${prefix}${step.id}`, workflow: step.workflow }]));
+    : step.workflow === undefined ? [] : [{ step: `${prefix}${step.id}`, workflow: step.workflow, ...(step.with ? { with: step.with } : {}) }]));
+}
+
+/** The workflows a cached workflow runs, by name, and one hash over its sources and theirs. */
+export interface WorkflowTree {
+  workflows: Record<string, WorkflowDefinition>;
+  sourceHash: string;
+  /** The team commit that stores every one of those sources, when one does. */
+  teamRevision?: string;
+}
+
+type TreeFailure = { code: 'workflow_recursion' | 'workflow_not_found' | 'invalid_inputs'; message: string };
+
+/**
+ * Why step `step` of workflow `parent` cannot start `child` with the inputs its `with` names, or undefined when they
+ * fit. Every declared input is required, so the names alone tell, before any value renders: a run that would fail
+ * there, after the steps before it already ran, never starts.
+ */
+function withMismatch(parent: string, { step, with: passed }: { step: string; with?: Record<string, unknown> }, child: WorkflowDefinition): TreeFailure | undefined {
+  const names = Object.keys(passed ?? {});
+  const declared = Object.keys(child.inputs ?? {});
+  const extra = names.filter((name) => !declared.includes(name));
+  const missing = declared.filter((name) => !names.includes(name));
+  const message = extra.length > 0
+    ? `Workflow "${parent}" step "${step}" passes ${extra.join(', ')} to workflow "${child.name}", which does not declare them. Make the two agree, then pull again.`
+    : missing.length > 0
+      ? `Workflow "${parent}" step "${step}" does not pass ${missing.join(', ')}, which workflow "${child.name}" declares. Make the two agree, then pull again.`
+      : undefined;
+  return message === undefined ? undefined : { code: 'invalid_inputs', message };
+}
+
+/** Whether `left` and `right` accept the same values: an enum's values in any order, an object's fields in any order. */
+function sameType(left: OutputSchema, right: OutputSchema): boolean {
+  switch (left.type) {
+    case 'string':
+    case 'number':
+    case 'boolean':
+      return right.type === left.type;
+    case 'enum':
+      return right.type === 'enum' && left.values.every((value) => right.values.includes(value)) && right.values.every((value) => left.values.includes(value));
+    case 'array':
+      return right.type === 'array' && sameType(left.items, right.items);
+    case 'object': {
+      if (right.type !== 'object') return false;
+      const names = Object.keys(left.fields);
+      return names.length === Object.keys(right.fields).length
+        && names.every((name) => { const other = right.fields[name]; const own = left.fields[name]; return own !== undefined && other !== undefined && sameType(own, other); });
+    }
+    default: {
+      const unhandled: never = left;
+      return unhandled;
+    }
+  }
+}
+
+/**
+ * Why step `step` of teamai's default `parent` cannot pass `child` what it passes, one reason per input, when `child`
+ * replaces the default the step runs and declares one of those inputs as another type. `parent` renders its `with`
+ * for teamai's own definition of that workflow, so a value of the default's type would fail `child` at the step,
+ * after the steps before it ran. Team workflows are matched by input name only.
+ */
+function retypedInputs(parent: WorkflowDefinition, { step, workflow, with: passed }: { step: string; workflow: string; with?: Record<string, unknown> }, child: WorkflowDefinition): string[] {
+  const shipped = DefaultWorkflows.named(workflow)?.definition;
+  if (DefaultWorkflows.named(parent.name)?.definition !== parent || !shipped || shipped === child) return [];
+  return Object.keys(passed ?? {})
+    .filter((input) => {
+      const declared = child.inputs?.[input];
+      const expected = shipped.inputs?.[input];
+      return declared !== undefined && expected !== undefined && !sameType(declared, expected);
+    })
+    .map((input) => `step "${step}" passes ${input}, which workflow "${child.name}" declares as another type than teamai's default ${workflow}`);
+}
+
+/** Every workflow `cached` runs through its steps, directly or not, from the cache, and one hash over all of their sources. */
+export async function loadWorkflowTree(
+  config: LocalConfig,
+  cached: CachedWorkflow,
+): Promise<WorkflowTree | { failed: TreeFailure }> {
+  const workflows: Record<string, WorkflowDefinition> = {};
+  const hashes: Array<[string, string]> = [];
+  const revisions: Array<string | undefined> = [cached.teamRevision];
+  const retyped = (parent: WorkflowDefinition, run: { step: string; workflow: string; with?: Record<string, unknown> }, child: WorkflowDefinition): TreeFailure | undefined => {
+    const [reason] = retypedInputs(parent, run, child);
+    return reason === undefined ? undefined : { code: 'invalid_inputs', message: `Workflow "${parent.name}" ${reason}. Make the two agree, then pull again.` };
+  };
+  const visit = async (definition: WorkflowDefinition, through: string[]): Promise<TreeFailure | undefined> => {
+    for (const run of workflowsRunBy(definition)) {
+      const { step, workflow } = run;
+      if (through.includes(workflow)) {
+        const cycle = [...through.slice(through.indexOf(workflow)), workflow].join(' -> ');
+        return { code: 'workflow_recursion', message: `Workflow "${cached.definition.name}" cannot start: its sub-workflows run in a cycle: ${cycle}` };
+      }
+      const loaded = Object.hasOwn(workflows, workflow) ? workflows[workflow] : undefined;
+      if (loaded) {
+        const unfit = withMismatch(definition.name, run, loaded) ?? retyped(definition, run, loaded);
+        if (unfit) return unfit;
+        continue;
+      }
+      const child = await loadCachedWorkflow(config, workflow);
+      if (!child) {
+        return { code: 'workflow_not_found', message: `Workflow "${definition.name}" step "${step}" runs workflow "${workflow}", which has no runnable version. Check workflows/${workflow}.yaml and pull again.` };
+      }
+      const unfit = withMismatch(definition.name, run, child.definition) ?? retyped(definition, run, child.definition);
+      if (unfit) return unfit;
+      workflows[workflow] = child.definition;
+      hashes.push([workflow, child.sourceHash]);
+      revisions.push(child.teamRevision);
+      const failed = await visit(child.definition, [...through, workflow]);
+      if (failed) return failed;
+    }
+    return undefined;
+  };
+  const failed = await visit(cached.definition, [cached.definition.name]);
+  if (failed) return { failed };
+  const teamRevision = cached.teamRevision !== undefined && revisions.every((revision) => revision === cached.teamRevision)
+    ? cached.teamRevision
+    : undefined;
+  if (hashes.length === 0) return { workflows, sourceHash: cached.sourceHash, ...(teamRevision ? { teamRevision } : {}) };
+  const hash = createHash('sha256').update(cached.sourceHash);
+  for (const [name, sourceHash] of hashes.sort(([left], [right]) => left.localeCompare(right))) {
+    hash.update('\0').update(name).update('\0').update(sourceHash);
+  }
+  return { workflows, sourceHash: hash.digest('hex'), ...(teamRevision ? { teamRevision } : {}) };
+}
+
+/** A workflow, every workflow it runs, and one hash over all of their sources. */
+export interface WorkflowBundle {
+  definition: WorkflowDefinition;
+  workflows: Record<string, WorkflowDefinition>;
+  sourceHash: string;
+}
+
+export async function loadWorkflowBundle(config: LocalConfig, name: string): Promise<WorkflowBundle | { failed: string }> {
+  const cached = await loadCachedWorkflow(config, name);
+  if (!cached) return { failed: `workflow "${name}" has no runnable version` };
+  const tree = await loadWorkflowTree(config, cached);
+  if ('failed' in tree) return { failed: tree.failed.message };
+  return { definition: cached.definition, workflows: tree.workflows, sourceHash: tree.sourceHash };
+}
+
+/**
+ * Workflow `name` and the workflows it runs as team commit `revision` stores them, synced from a `--shared` clone at that
+ * commit into a cache of its own, so this member's checkout and cache stay as they are. Only a fetch of origin, when the
+ * team repo lacks the commit, touches the member's repository.
+ */
+export async function loadWorkflowBundleAt(config: LocalConfig, name: string, revision: string): Promise<WorkflowBundle | { failed: string }> {
+  const repoRoot = isSelfMode(config) ? getBusinessRoot(config) : config.repo.localPath;
+  const git = createGit(repoRoot);
+  const present = (): Promise<boolean> => git.raw(['cat-file', '-e', `${revision}^{commit}`]).then(() => true, () => false);
+  if (!await present()) {
+    const fetched = await git.fetch(['origin']).then(() => '', (error: unknown) => (error instanceof Error ? error.message.trim() : String(error)));
+    if (!await present()) {
+      return { failed: `the team repo at ${repoRoot} does not have it, even after fetching origin${fetched ? ` (${fetched})` : ''}` };
+    }
+  }
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'teamai-revision-'));
+  try {
+    const clone = path.join(dir, 'team');
+    await git.raw(['clone', '--quiet', '--shared', '--no-checkout', repoRoot, clone]);
+    await createGit(clone).raw(['checkout', '--quiet', '--detach', revision]);
+    const knowledge = path.join(clone, path.relative(repoRoot, config.repo.localPath));
+    const at: LocalConfig = {
+      ...config,
+      repo: isSelfMode(config) ? { ...config.repo, localPath: knowledge, businessRepoRoot: clone } : { ...config.repo, localPath: knowledge },
+      dataHome: path.join(dir, 'data'),
+    };
+    await syncWorkflowDefinitions(at, { scopeLabel: `team commit ${revision.slice(0, 7)}` });
+    return await loadWorkflowBundle(at, name);
+  } catch (error) {
+    return { failed: error instanceof Error ? error.message.trim() : String(error) };
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -250,11 +707,13 @@ function checkReferences(checked: Checked[], kept: Map<string, CachedWorkflow | 
     candidates.has(stem) ? [[stem, 'revision']] : kept.get(stem) ? [[stem, 'kept']] : [])));
   const revisionProblems = new Map<string, WorkflowDiagnostic[]>();
   const keptProblems = new Map<string, WorkflowDiagnostic[]>();
-  const runs = (workflow: string): WorkflowDefinition | null => {
+  const own = (workflow: string): WorkflowDefinition | null => {
     const version = chosen.get(workflow);
     if (version === 'revision') return candidates.get(workflow)?.definition ?? null;
     return version === 'kept' ? kept.get(workflow)?.definition ?? null : null;
   };
+  // A name no team version is chosen for runs teamai's default of that name, as `loadCachedWorkflow` resolves it.
+  const runs = (workflow: string): WorkflowDefinition | null => own(workflow) ?? DefaultWorkflows.named(workflow)?.definition ?? null;
   // Every workflow a file runs at its version, directly or not; the file itself when it runs in a cycle.
   const reach = (stem: string): Set<string> => {
     const found = new Set<string>();
@@ -335,7 +794,7 @@ function checkReferences(checked: Checked[], kept: Map<string, CachedWorkflow | 
       }
     }
   }
-  return (stem) => ({ definition: runs(stem), revision: revisionProblems.get(stem) ?? [], kept: keptProblems.get(stem) ?? [] });
+  return (stem) => ({ definition: own(stem), revision: revisionProblems.get(stem) ?? [], kept: keptProblems.get(stem) ?? [] });
 }
 
 /** Resolves every `prompt_file`, including those inside inline workflows. */
@@ -344,6 +803,7 @@ async function resolvePromptFiles(
   definition: WorkflowDefinition,
   locations: Record<string, { line: number; column: number }>,
   workflowFile: string,
+  activePromptsNamespaces: readonly string[] | null = null,
 ): Promise<
   | { ok: true; definition: WorkflowDefinition; sources: Array<{ path: string; content: string }> }
   | { ok: false; diagnostics: WorkflowDiagnostic[] }
@@ -360,8 +820,45 @@ async function resolvePromptFiles(
         continue;
       }
       if (!step.promptFile) continue;
-      const target = path.resolve(root, step.promptFile);
+
+      let promptPath = step.promptFile;
       const location = locations[field] ?? { line: 1, column: 1 };
+
+      const promptRelative = promptPath.replace(/^[\\/]/, '');
+      if (promptRelative.startsWith('prompts/') && activePromptsNamespaces && activePromptsNamespaces.length > 0) {
+        const leaf = promptRelative.slice('prompts/'.length);
+        // Namespace lookup works for any leaf depth — a nested path like
+        // prompts/topic/note.md resolves to prompts/<ns>/topic/note.md
+        // just as a flat prompts/note.md resolves to prompts/<ns>/note.md.
+        //
+        // A leaf whose first segment is already an active namespace is explicit
+        // and resolved as written: prepending another namespace would look up
+        // prompts/<other>/ops/note.md and load that file instead.
+        const lead = leaf.split('/')[0];
+        const alreadyNamespaced = lead !== undefined && activePromptsNamespaces.includes(lead);
+        const found = alreadyNamespaced ? [] : (await Promise.all(
+          activePromptsNamespaces.map(async (ns) => {
+            const candidate = path.join(root, 'prompts', ns, ...leaf.split('/'));
+            return (await pathExists(candidate)) ? `prompts/${ns}/${leaf}` : null;
+          }),
+        )).filter((p): p is string => p !== null);
+
+        if (found.length === 1) {
+          promptPath = found[0];
+        } else if (found.length > 1) {
+          diagnostics.push({
+            file: workflowFile,
+            line: location.line,
+            column: location.column,
+            field: `${field}.prompt_file`,
+            code: 'prompt_namespace_conflict',
+            message: `prompt_file "${step.promptFile}" is ambiguous between active namespaces (${found.join(', ')}); fix the conflict or specify the prompt path explicitly`,
+          });
+          continue;
+        }
+      }
+
+      const target = path.resolve(root, promptPath);
       let prompt: string | null = null;
       try {
         assertWithinRoot(path.join(root, 'prompts'), target);
@@ -381,7 +878,7 @@ async function resolvePromptFiles(
         continue;
       }
       diagnostics.push(...promptFileDiagnostics(workflowFile, definition, [...trail, index], prompt, location));
-      sources.push({ path: step.promptFile, content: prompt });
+      sources.push({ path: promptPath, content: prompt });
       steps[index] = { ...step, prompt };
     }
     return steps;

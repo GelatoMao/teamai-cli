@@ -1,21 +1,25 @@
 // -*- coding: utf-8 -*-
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'fs-extra';
 
 // Mock external dependencies
-vi.mock('../codebase-extract.js', () => ({
+vi.mock('../codebase-extract.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../codebase-extract.js')>()),
   extractCodebase: vi.fn(),
   // The fixtures are outside git, where the slug is the directory's name.
-  defaultProjectSlug: async (dir: string) => path.basename(dir),
+  defaultProjectSlug: vi.fn(async (dir: string) => path.basename(dir)),
+  checkoutName: async (dir: string) => path.basename(dir),
 }));
 
 vi.mock('../graph-aggregate.js', () => ({
   aggregateGlobalGraph: vi.fn(),
 }));
 
-vi.mock('../utils/git.js', () => ({
+vi.mock('../utils/git.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../utils/git.js')>()),
   autoPushTeamRepo: vi.fn(),
 }));
 
@@ -24,10 +28,15 @@ vi.mock('../config.js', async (importOriginal) => ({
   autoDetectInit: vi.fn(),
 }));
 
-import { extractCodebase } from '../codebase-extract.js';
+vi.mock('../deep-enrich.js', () => ({
+  deepEnrich: vi.fn(),
+}));
+
+import { defaultProjectSlug, extractCodebase, sourceRepositoryMetadata } from '../codebase-extract.js';
 import { aggregateGlobalGraph } from '../graph-aggregate.js';
 import { autoPushTeamRepo } from '../utils/git.js';
 import { autoDetectInit } from '../config.js';
+import { deepEnrich } from '../deep-enrich.js';
 
 describe('import --dir', () => {
   let tmpDir: string;
@@ -57,12 +66,16 @@ describe('import --dir', () => {
     });
 
     // extractCodebase mock: simulate writing teamwiki output to outputRoot
-    (extractCodebase as ReturnType<typeof vi.fn>).mockImplementation(async (opts: { outputRoot?: string; project?: string }) => {
+    (extractCodebase as ReturnType<typeof vi.fn>).mockImplementation(async (opts: { path: string; outputRoot?: string; project?: string }) => {
       const outputBase = opts.outputRoot ?? projectDir;
       const wikiRoot = path.join(outputBase, 'teamwiki');
       const evidenceDir = path.join(wikiRoot, 'evidence', 'code', opts.project ?? 'my-project');
       await fs.ensureDir(evidenceDir);
       await fs.writeFile(path.join(evidenceDir, 'index.md'), '# test\n');
+      // Deep enrich runs on an extraction that wrote a manifest.
+      await fs.writeJson(path.join(evidenceDir, '_manifest.json'), { components: [{ slug: 'src' }] });
+      // The source the real extraction records, by which the next import recognises it.
+      await fs.writeJson(path.join(evidenceDir, 'source-manifest.json'), await sourceRepositoryMetadata(opts.path));
       await fs.ensureDir(path.join(wikiRoot, '.indices'));
       await fs.writeFile(path.join(wikiRoot, '.indices', 'graph-index.json'), JSON.stringify({ nodes: [{ slug: 'a' }], edges: [] }));
       return true;
@@ -70,15 +83,19 @@ describe('import --dir', () => {
 
     (aggregateGlobalGraph as ReturnType<typeof vi.fn>).mockResolvedValue({ nodes: 1, edges: 0 });
     (autoPushTeamRepo as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    vi.mocked(deepEnrich).mockImplementation(async ({ project }) => (
+      { project, complete: true, missingComponents: [], missingArchitecture: false }
+    ));
   });
 
   afterEach(async () => {
+    process.exitCode = undefined;
     await fs.remove(tmpDir);
   });
 
-  async function runImportDir(opts: { dir: string; dryRun?: boolean; output?: string; skipEnrich?: boolean; incremental?: boolean }) {
+  async function runImportDir(opts: { dir: string; dryRun?: boolean; output?: string; skipEnrich?: boolean; incremental?: boolean; maxFiles?: string }) {
     const { importCmd } = await import('../import.js');
-    await importCmd({ dir: opts.dir, dryRun: opts.dryRun, output: opts.output, skipEnrich: opts.skipEnrich, incremental: opts.incremental });
+    await importCmd({ dir: opts.dir, dryRun: opts.dryRun, output: opts.output, skipEnrich: opts.skipEnrich, incremental: opts.incremental, maxFiles: opts.maxFiles });
   }
 
   it('calls extractCodebase with outputRoot (not source dir) and skipEnrich', { timeout: 60_000 }, async () => {
@@ -102,6 +119,152 @@ describe('import --dir', () => {
     expect(autoPushTeamRepo).toHaveBeenCalled();
   });
 
+  it('names the roles and projects whose resources.wiki still lists the directory-named slug', async () => {
+    vi.mocked(defaultProjectSlug).mockResolvedValueOnce('github__acme__my-project');
+    await fs.outputFile(path.join(teamRepoDir, 'manifest', 'roles.yaml'),
+      'version: 1\nroles:\n  - id: backend\n    resources: { knowledge: [], skills: [], wiki: [my-project] }\n');
+    await fs.outputFile(path.join(teamRepoDir, 'manifest', 'projects.yaml'),
+      'version: 1\nprojects:\n  - id: shop\n    name: Shop\n    resources: { wiki: [my-project, payments] }\n');
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    try {
+      await runImportDir({ dir: projectDir });
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(lines.join('\n')).toContain('role backend and project shop list "my-project" under resources.wiki, '
+      + 'and this codebase is now teamwiki/evidence/code/github__acme__my-project/. '
+      + 'Change those entries to "github__acme__my-project" so it stays scoped to them.');
+  });
+
+  it('leaves a resources.wiki entry alone while the directory-named slug still holds another repo\'s evidence', async () => {
+    vi.mocked(defaultProjectSlug).mockResolvedValueOnce('github__other__my-project');
+    await fs.outputJson(path.join(teamRepoDir, 'teamwiki', 'evidence', 'code', 'my-project', 'source-manifest.json'),
+      { repoUrl: 'https://github.com/acme/my-project' });
+    await fs.outputFile(path.join(teamRepoDir, 'manifest', 'roles.yaml'),
+      'version: 1\nroles:\n  - id: backend\n    resources: { knowledge: [], skills: [], wiki: [my-project] }\n');
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    try {
+      await runImportDir({ dir: projectDir });
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(await fs.pathExists(path.join(teamRepoDir, 'teamwiki', 'evidence', 'code', 'my-project', 'source-manifest.json'))).toBe(true);
+    expect(lines.join('\n')).not.toContain('under resources.wiki');
+  });
+
+  it('tells a suffixed checkout without an origin to repoint resources.wiki only while the directory-named copy may be its own', async () => {
+    // Evidence a release that recorded no source published for this checkout, scoped to a role.
+    const legacy = path.join(teamRepoDir, 'teamwiki', 'evidence', 'code', 'my-project');
+    await fs.outputJson(path.join(legacy, 'source-manifest.json'), { project: 'my-project', files: [] });
+    await fs.outputFile(path.join(teamRepoDir, 'manifest', 'roles.yaml'),
+      'version: 1\nroles:\n  - id: backend\n    resources: { knowledge: [], skills: [], wiki: [my-project] }\n');
+    const other = path.join(tmpDir, 'other', 'my-project');
+    await fs.outputFile(path.join(other, 'main.py'), '# other\n');
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    try {
+      await runImportDir({ dir: projectDir });
+      const own = `my-project-${createHash('sha256').update(await fs.realpath(projectDir)).digest('hex').slice(0, 8)}`;
+      expect(lines.join('\n')).toContain('teamwiki/evidence/code/my-project/ holds evidence that names another source, or no source, ');
+      expect(lines.join('\n')).toContain(`change any resources.wiki entry that means this checkout from "my-project" to "${own}".`);
+      await runImportDir({ dir: other });
+      // The older copy was moved over by hand and removed.
+      await fs.remove(legacy);
+      lines.length = 0;
+      await runImportDir({ dir: projectDir });
+      await runImportDir({ dir: other });
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(lines.join('\n')).not.toContain('under resources.wiki');
+  });
+
+  it('moves a suffixed checkout\'s own evidence to the remote slug once it gains an origin, and names the stale resources.wiki entry', async () => {
+    // Another checkout's evidence, which recorded no source, holds the directory name.
+    const evidenceRoot = path.join(teamRepoDir, 'teamwiki', 'evidence', 'code');
+    await fs.outputJson(path.join(evidenceRoot, 'my-project', 'source-manifest.json'), { project: 'my-project', files: [] });
+    await runImportDir({ dir: projectDir });
+    const own = `my-project-${createHash('sha256').update(await fs.realpath(projectDir)).digest('hex').slice(0, 8)}`;
+    await fs.outputFile(path.join(evidenceRoot, own, 'docs', 'curated.md'), '# curated\n');
+    await fs.outputFile(path.join(teamRepoDir, 'manifest', 'roles.yaml'),
+      `version: 1\nroles:\n  - id: backend\n    resources: { knowledge: [], skills: [], wiki: [${own}] }\n`);
+    // The checkout gained an origin.
+    vi.mocked(defaultProjectSlug).mockResolvedValueOnce('github__acme__my-project');
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    try {
+      await runImportDir({ dir: projectDir });
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect((await fs.readdir(evidenceRoot)).sort()).toEqual(['github__acme__my-project', 'my-project']);
+    expect(await fs.readFile(path.join(evidenceRoot, 'github__acme__my-project', 'docs', 'curated.md'), 'utf8')).toBe('# curated\n');
+    expect(lines.join('\n')).toContain(`Moved teamwiki/evidence/code/${own}/ to teamwiki/evidence/code/github__acme__my-project/`);
+    expect(lines.join('\n')).not.toContain('teamwiki/evidence/code/my-project/ names no repository');
+    expect(lines.join('\n')).toContain(`role backend lists "${own}" under resources.wiki, `
+      + 'and this codebase is now teamwiki/evidence/code/github__acme__my-project/. '
+      + 'Change that entry to "github__acme__my-project" so it stays scoped to it.');
+  });
+
+  it('dryRun without a team repo or --output previews the directory slug', async () => {
+    vi.mocked(autoDetectInit).mockRejectedValueOnce(new Error('teamai is not initialized. Run `teamai init` first.'));
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    try {
+      await runImportDir({ dir: projectDir, dryRun: true });
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(lines.join('\n')).toContain('(project: my-project)');
+    expect(extractCodebase).not.toHaveBeenCalled();
+  });
+
+  it('dryRun prints the slug the import would publish under, and writes nothing', async () => {
+    await runImportDir({ dir: projectDir });
+    const other = path.join(tmpDir, 'other', 'my-project');
+    await fs.outputFile(path.join(other, 'main.py'), '# other\n');
+    vi.clearAllMocks();
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    try {
+      await runImportDir({ dir: other, dryRun: true });
+    } finally {
+      spy.mockRestore();
+    }
+
+    const suffixed = `my-project-${createHash('sha256').update(await fs.realpath(other)).digest('hex').slice(0, 8)}`;
+    expect(lines.join('\n')).toContain(`(project: ${suffixed})`);
+    expect(await fs.readdir(path.join(teamRepoDir, 'teamwiki', 'evidence', 'code'))).toEqual(['my-project']);
+    expect(extractCodebase).not.toHaveBeenCalled();
+  });
+
+  it('prints the slug a same-named directory without an origin is published under', async () => {
+    await runImportDir({ dir: projectDir });
+    const other = path.join(tmpDir, 'other', 'my-project');
+    await fs.outputFile(path.join(other, 'main.py'), '# other\n');
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    try {
+      await runImportDir({ dir: other });
+    } finally {
+      spy.mockRestore();
+    }
+
+    const slugs = (await fs.readdir(path.join(teamRepoDir, 'teamwiki', 'evidence', 'code'))).sort();
+    expect(slugs).toHaveLength(2);
+    const suffixed = slugs.find((slug) => slug !== 'my-project');
+    expect(suffixed).toMatch(/^my-project-[0-9a-f]{8}$/);
+    expect(lines.join('\n')).toContain(`(project: ${suffixed})`);
+    expect(lines.join('\n')).toContain(`Local directory ${suffixed} import complete`);
+  });
+
   it('--output writes to specified dir without touching team-repo', async () => {
     const outputDir = path.join(tmpDir, 'output');
     await fs.ensureDir(outputDir);
@@ -115,6 +278,79 @@ describe('import --dir', () => {
     expect(await fs.pathExists(path.join(teamRepoDir, 'teamwiki', 'evidence', 'code', 'my-project'))).toBe(false);
     expect(autoDetectInit).not.toHaveBeenCalled();
     expect(autoPushTeamRepo).not.toHaveBeenCalled();
+  });
+
+  it('exits 1 and names the retry command when deep enrich leaves AI docs missing, still publishing the evidence', async () => {
+    const outputDir = path.join(tmpDir, 'output');
+    vi.mocked(deepEnrich).mockImplementation(async ({ project }) => (
+      { project, complete: false, missingComponents: ['src'], missingArchitecture: true }
+    ));
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    try {
+      await runImportDir({ dir: projectDir, output: outputDir });
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(process.exitCode).toBe(1);
+    const output = lines.join('\n');
+    expect(output).toContain(
+      `Deep enrich incomplete: my-project. Run \`teamai codebase --deep-enrich --project my-project --output ${outputDir}\` to retry.`,
+    );
+    expect(output).not.toContain('Deep enrich complete');
+    expect(await fs.pathExists(path.join(outputDir, 'teamwiki', 'evidence', 'code', 'my-project', 'index.md'))).toBe(true);
+  });
+
+  it('quotes an --output path with a space in the retry command', async () => {
+    const outputDir = path.join(tmpDir, 'my wiki');
+    vi.mocked(deepEnrich).mockImplementation(async ({ project }) => (
+      { project, complete: false, missingComponents: ['src'], missingArchitecture: false }
+    ));
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    try {
+      await runImportDir({ dir: projectDir, output: outputDir });
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(lines.join('\n')).toContain(`--project my-project --output '${outputDir}'\` to retry.`);
+  });
+
+  it('exits 1 and prints the error when deep enrich throws', async () => {
+    vi.mocked(deepEnrich).mockRejectedValue(new Error('Cannot deep-enrich through a symbolic link: docs/README.md'));
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    try {
+      await runImportDir({ dir: projectDir });
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(process.exitCode).toBe(1);
+    const output = lines.join('\n');
+    expect(output).toContain('Deep enrich failed for my-project: Cannot deep-enrich through a symbolic link: docs/README.md');
+    expect(output).toContain('Deep enrich incomplete: my-project. Run `teamai codebase --deep-enrich --project my-project` to retry.');
+    expect(await fs.pathExists(path.join(teamRepoDir, 'teamwiki', 'evidence', 'code', 'my-project', 'index.md'))).toBe(true);
+  });
+
+  it('names the same deep-enrich project slug as the retry in a team repo, quoting a path with a space', async () => {
+    const spacedDir = path.join(tmpDir, 'my project');
+    await fs.copy(projectDir, spacedDir);
+    vi.mocked(deepEnrich).mockImplementation(async ({ project }) => (
+      { project, complete: false, missingComponents: ['src'], missingArchitecture: false }
+    ));
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    try {
+      await runImportDir({ dir: spacedDir, incremental: true, maxFiles: '500' });
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(process.exitCode).toBe(1);
+    expect(lines.join('\n')).toContain("Run `teamai codebase --deep-enrich --project 'my project'` to retry.");
   });
 
   it('--incremental keeps the published evidence and pushes nothing when the source is unchanged', async () => {
@@ -146,6 +382,29 @@ describe('import --dir', () => {
 
     expect(staging).toContain(path.join(os.tmpdir(), 'teamai-extract-'));
     expect(await fs.pathExists(staging!)).toBe(false);
+  });
+
+  it('does not report a publish when the push to the team repo fails', async () => {
+    (autoPushTeamRepo as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error('Push to the team repo failed: rejected. Run `teamai pull`, then rerun this command.'),
+    );
+    const lines: string[] = [];
+    const logSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+    let exitCode: unknown;
+    try {
+      await runImportDir({ dir: projectDir });
+      exitCode = exitSpy.mock.calls[0]?.[0];
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+      exitSpy.mockRestore();
+    }
+
+    expect(exitCode).toBe(1);
+    expect(lines.join('\n')).not.toContain('Pushed to team knowledge repo');
+    expect(lines.join('\n')).not.toContain('import complete');
   });
 
   it('source directory is not polluted with teamwiki/', async () => {

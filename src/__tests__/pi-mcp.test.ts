@@ -2,9 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fse from 'fs-extra';
 import os from 'node:os';
 import path from 'node:path';
-import { reconcileMcpForConfig, resolveMcpTargets } from '../mcp-reconcile.js';
+import { reconcileMcpForConfig } from '../mcp-reconcile.js';
 import { buildMcpDeliveryChecks, mcpTransportNotes } from '../doctor-delivery.js';
-import { detectMcpFormat, renderJsonEntry, supportsTransport } from '../resources/mcp-format.js';
+import { renderJsonEntry, supportsTransport } from '../resources/mcp-format.js';
+import { mcpFormatOf } from '../tools.js';
 import { TeamaiConfigSchema, type LocalConfig, type TeamaiConfig } from '../types.js';
 
 const yaml = `servers:
@@ -54,7 +55,7 @@ describe('Pi MCP', () => {
   });
 
   it('supports only native transports and converts timeout without rounding', () => {
-    expect(detectMcpFormat('pi')).toBe('pi');
+    expect(mcpFormatOf('pi')).toBe('pi');
     expect(supportsTransport('pi', 'sse')).toBe(false);
     expect(supportsTransport('pi', 'http')).toBe(true);
     expect(supportsTransport('pi', 'stdio')).toBe(true);
@@ -71,9 +72,6 @@ describe('Pi MCP', () => {
       : path.join(projectRoot, '.pi/mcp.json');
     const personal = { command: 'personal-server', exposure: 'direct' };
     await fse.outputJson(file, { autoEnableCodemode: false, mcpServers: { personal } });
-    expect(await resolveMcpTargets(team, local)).toContainEqual(expect.objectContaining({
-      tool: 'pi', file, projectScope: scope === 'project',
-    }));
     const dry = await reconcileMcpForConfig(team, local, { dryRun: true });
     expect(dry.wrote).toBe(false);
     expect((await fse.readJson(file)).mcpServers).toEqual({ personal });

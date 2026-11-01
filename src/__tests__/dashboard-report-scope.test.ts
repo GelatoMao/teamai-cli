@@ -33,7 +33,7 @@ vi.mock('node:child_process', async (importOriginal) => ({
     return child;
   }),
 }));
-vi.mock('../pull.js', () => ({ pull: vi.fn(async () => undefined) }));
+vi.mock('../pull.js', () => ({ pull: vi.fn(async () => undefined), settleLateUsageReport: vi.fn(async () => undefined) }));
 vi.mock('../update.js', () => ({
   doUpdate: vi.fn(async () => undefined),
   // appendEvent and compactEvents take the events file's lock (#804); the
@@ -61,10 +61,11 @@ vi.mock('../utils/reports-branch.js', () => ({
 
 const { hookDispatchCli } = await import('../hook-dispatch-cli.js');
 const { resolveProjectDataHome, saveLocalConfigForScope, resolveConfigForDir, loadLocalConfig } = await import('../config.js');
-const { reportUsageToTeam } = await import('../team-push.js');
+const { reportUsage } = await import('../team-push.js');
 const { reconcileHooks } = await import('../hooks.js');
 const { getDataHome } = await import('../types.js');
 const { dataHomeKey } = await import('../dashboard-collector.js');
+const { SESSION_RUN_PAYLOAD_KEY, sessionRun } = await import('../launch-context.js');
 const dataHomeKeyOf = (config: LocalConfig) => dataHomeKey(getDataHome(config));
 
 let tmp: string;
@@ -143,7 +144,7 @@ async function setup(): Promise<{ root: string; user: LocalConfig; project: Loca
 
 /** Report the way pull does, and return the stats that scope has pushed so far. */
 async function report(config: LocalConfig): Promise<unknown> {
-  await reportUsageToTeam(config.repo.localPath, config.username, { skipTruncate: true, selfConfig: config });
+  await reportUsage(config.repo.localPath, config.username, { skipTruncate: true, selfConfig: config });
   const statsPath = path.join(path.dirname(config.repo.localPath), 'reports-wt', 'stats', `${config.username}.yaml`);
   return fs.existsSync(statsPath) ? YAML.parse(fs.readFileSync(statsPath, 'utf-8')) : null;
 }
@@ -276,9 +277,9 @@ describe('each scope keeps its own reported snapshot (#786)', () => {
   const SNAPSHOTS = ['interventions', 'prompt-tokens', 'daily-sessions'];
 
   /** The shared snapshots as a release before #786 left them, with `prompts` reported per session. */
-  function writeSharedSnapshots(prompts: Record<string, number>, date: string, config?: LocalConfig): void {
+  function writeSharedSnapshots(promptCounts: Record<string, number>, date: string, config?: LocalConfig): void {
     const entries = (value: (n: number) => unknown) =>
-      Object.fromEntries(Object.entries(prompts).map(([sid, n]) => [sid, value(n)]));
+      Object.fromEntries(Object.entries(promptCounts).map(([sid, n]) => [sid, value(n)]));
     const values: Record<string, unknown> = {
       interventions: entries(() => ({ interrupt: 0, toolReject: 0, correction: 0 })),
       'prompt-tokens': entries((n) => ({ prompts: n, tokens: { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 } })),
@@ -563,12 +564,12 @@ describe('each scope keeps its own reported snapshot (#786)', () => {
   });
 
   /** `claude --resume` of `sessionId` in `cwd`, whose Stop carries the transcript's `prompts`. */
-  async function resume(sessionId: string, cwd: string, prompts: number): Promise<void> {
+  async function resume(sessionId: string, cwd: string, promptCount: number): Promise<void> {
     await session('claude', { session_id: sessionId, cwd });
     const log = path.join(teamaiHome(), 'dashboard', 'events.jsonl');
     fs.writeFileSync(log, fs.readFileSync(log, 'utf-8').split('\n').filter(Boolean).map((line) => {
       const event = JSON.parse(line);
-      return JSON.stringify(event.sessionId === sessionId && event.type === 'stop' ? { ...event, prompts } : event);
+      return JSON.stringify(event.sessionId === sessionId && event.type === 'stop' ? { ...event, prompts: promptCount } : event);
     }).join('\n') + '\n');
   }
 
@@ -688,8 +689,8 @@ describe('each scope keeps its own reported snapshot (#786)', () => {
       const day = reported && typeof reported === 'object' && 'daily' in reported && reported.daily && typeof reported.daily === 'object'
         ? Object.values(reported.daily)[0] : undefined;
       const interventions = reported && typeof reported === 'object' && 'interventions' in reported ? reported.interventions : undefined;
-      const prompts = reported && typeof reported === 'object' && 'prompts' in reported ? reported.prompts : undefined;
-      return { day, interventions, prompts };
+      const promptsValue = reported && typeof reported === 'object' && 'prompts' in reported ? reported.prompts : undefined;
+      return { day, interventions, prompts: promptsValue };
     };
     return { event, write, stats };
   }
@@ -793,8 +794,8 @@ describe('each scope keeps its own reported snapshot (#786)', () => {
     const { event, write, stats } = await codexLog(project);
     const day = new Date().toISOString().slice(0, 10);
     // The thread-level token counter spans rollouts; prompts and costs restart with each.
-    const stop = (rollout: string, minute: number, prompts: number, costMicros: number, input: number) => event(rollout, 'stop', minute, {
-      prompts, tokenScope: 'session', tokens: { input, output: 0, cacheRead: 0, cacheCreation: 0 },
+    const stop = (rollout: string, minute: number, promptCount: number, costMicros: number, input: number) => event(rollout, 'stop', minute, {
+      prompts: promptCount, tokenScope: 'session', tokens: { input, output: 0, cacheRead: 0, cacheCreation: 0 },
       requestDaily: { [day]: { pricedRequests: 1, costMicros, cacheReadTokens: 0, cacheEligibleInputTokens: 0, priceVersion: 'v1' } },
     });
     write([stop('rollout-a.jsonl', 0, 5, 100, 500)]);
@@ -947,9 +948,9 @@ describe('each scope keeps its own reported snapshot (#786)', () => {
     const key = await dataHomeKeyOf(project);
     const log = path.join(teamaiHome(), 'dashboard', 'events.jsonl');
     fs.mkdirSync(path.dirname(log), { recursive: true });
-    const stop = (rollout: string, prompts: number, toolReject: number) => JSON.stringify({
+    const stop = (rollout: string, promptCount: number, toolReject: number) => JSON.stringify({
       type: 'stop', timestamp: new Date().toISOString(), sessionId: 'codex-s', tool: 'codex', dataHomeKey: key,
-      transcriptPath: path.join(tmp, rollout), tokenScope: 'transcript', prompts,
+      transcriptPath: path.join(tmp, rollout), tokenScope: 'transcript', prompts: promptCount,
       tokens: { input: 10, output: 1, cacheRead: 0, cacheCreation: 0 }, interventions: { interrupt: 0, toolReject },
     });
     fs.writeFileSync(log, stop('rollout-a.jsonl', 5, 1) + '\n');
@@ -1369,5 +1370,106 @@ describe('each scope keeps its own reported snapshot (#786)', () => {
     writeSharedSnapshots({ 'rollback-p': 1 }, new Date().toISOString().slice(0, 10));
 
     expect(await report(project)).toBeNull();
+  });
+});
+
+describe('the usage report counts the member\'s own sessions, split by run mode (#1384)', () => {
+  /**
+   * One session run with `env` in its host's environment. The background passes run with none of it: they read the
+   * mode and the launcher from the payload, as the foreground dispatcher forwards them.
+   */
+  async function sessionIn(env: Record<string, string>, base: Record<string, unknown>): Promise<void> {
+    for (const [event, name] of [['session-start', 'SessionStart'], ['prompt-submit', 'UserPromptSubmit'], ['stop', 'Stop']] as const) {
+      const payload = { ...base, hook_event_name: name, ...(event === 'prompt-submit' ? { prompt: 'hello' } : {}) };
+      const stdinFile = path.join(tmp, `stdin-${Date.now()}-${Math.random()}.json`);
+      for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+      let forwarded: ReturnType<typeof sessionRun>;
+      try {
+        fs.writeFileSync(stdinFile, JSON.stringify(payload));
+        await hookDispatchCli(event, 'claude', '*', { stdinFile });
+        forwarded = sessionRun(process.env);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+      fs.writeFileSync(stdinFile, JSON.stringify({ ...payload, [SESSION_RUN_PAYLOAD_KEY]: forwarded }));
+      await hookDispatchCli(event, 'claude', '*', { bgOnly: true, stdinFile });
+    }
+  }
+
+  const events = () => fs.readFileSync(path.join(teamaiHome(), 'dashboard', 'events.jsonl'), 'utf-8')
+    .split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+
+  it('a background pass records the mode and launcher its payload carries, with neither in its environment', async () => {
+    const { root } = await setup();
+    const stdinFile = path.join(tmp, 'stop.json');
+    fs.writeFileSync(stdinFile, JSON.stringify({
+      session_id: 'sid-step', cwd: root, hook_event_name: 'Stop', [SESSION_RUN_PAYLOAD_KEY]: { runMode: 'unattended', launchedBy: 'workflow' },
+    }));
+
+    await hookDispatchCli('stop', 'claude', '*', { bgOnly: true, stdinFile });
+
+    expect(events().find((event) => event.type === 'stop')).toMatchObject({ sessionId: 'sid-step', runMode: 'unattended', launchedBy: 'workflow' });
+  });
+
+  it('a session a workflow step launched adds nothing to the member\'s totals', async () => {
+    const { root, project } = await setup();
+    await sessionIn({ TEAMAI_LAUNCHED_BY: 'workflow' }, { session_id: 'sid-step', cwd: root });
+
+    expect(events().map((event) => [event.type, event.runMode, event.launchedBy])).toEqual([
+      ['session_start', 'attended', 'workflow'], ['prompt_submit', 'attended', 'workflow'], ['stop', 'attended', 'workflow'],
+    ]);
+    expect(await report(project)).toBeNull();
+  });
+
+  it('keeps the top-level counters, adds each mode\'s, and leaves what was recorded without a mode in neither', async () => {
+    const { root, project } = await setup();
+    const statsPath = path.join(path.dirname(project.repo.localPath), 'reports-wt', 'stats', 'tester.yaml');
+    fs.mkdirSync(path.dirname(statsPath), { recursive: true });
+    // Written before modes were recorded.
+    fs.writeFileSync(statsPath, YAML.stringify({
+      username: 'tester', updatedAt: '2026-01-01T00:00:00.000Z', skills: {},
+      interventions: { sessions: 5, interrupt: 1, toolReject: 0, correction: 0 }, prompts: 30,
+    }));
+    await sessionIn({}, { session_id: 'sid-attended', cwd: root });
+    await sessionIn({ CI: 'true' }, { session_id: 'sid-unattended', cwd: root });
+    await sessionIn({ TEAMAI_LAUNCHED_BY: 'workflow' }, { session_id: 'sid-step', cwd: root });
+
+    const stats = await report(project);
+
+    expect(stats).toMatchObject({
+      interventions: { sessions: 7, interrupt: 1 },
+      prompts: 32,
+      attended: { interventions: { sessions: 1, interrupt: 0 }, prompts: 1 },
+      unattended: { interventions: { sessions: 1, interrupt: 0 }, prompts: 1 },
+    });
+    // A second report adds nothing: each mode compares against the same baselines.
+    expect(await report(project)).toEqual(stats);
+  });
+
+  it('counts a session a workflow step continued only up to the step, so none of the step\'s turns reach the member', async () => {
+    const { root, project } = await setup();
+    const transcript = path.join(tmp, 'continued.jsonl');
+    let turns = 0;
+    const turn = (inputTokens: number): void => {
+      turns += 1;
+      fs.appendFileSync(transcript, [
+        { type: 'user', message: { content: [{ type: 'text', text: 'please continue' }] } },
+        { type: 'assistant', message: { id: `msg-${turns}`, content: [{ type: 'text', text: 'done' }], usage: { input_tokens: inputTokens, output_tokens: 5 } } },
+      ].map((line) => JSON.stringify(line)).join('\n') + '\n');
+    };
+    const continued = { session_id: 'sid-continued', cwd: root, transcript_path: transcript };
+
+    turn(10);
+    await sessionIn({}, continued);
+    turn(20);
+    await sessionIn({ TEAMAI_LAUNCHED_BY: 'workflow' }, continued);
+    // The member resumes the session: its transcript now holds the step's turn too.
+    turn(10);
+    await sessionIn({}, continued);
+
+    expect(await report(project)).toMatchObject({
+      prompts: 1, tokens: { input: 10, output: 5 },
+      attended: { prompts: 1, tokens: { input: 10, output: 5 } },
+    });
   });
 });

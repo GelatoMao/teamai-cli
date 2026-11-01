@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -10,9 +10,24 @@ import {
   encodeRepoIdentity,
   decodeRepoIdentity,
   canonicalizeRemote,
+  archivedCwd,
+  type ArchiveWriteResult,
   withSessionIndexLock,
+  withSessionPublicationLock,
 } from '../session-flow/sync.js';
 import type { Session } from '../session-flow/ir.js';
+
+function written<T>(result: ArchiveWriteResult<T>): T {
+  expect(result.status).toBe('written');
+  if (result.status === 'busy') throw new Error(`unexpected busy archive: ${result.lockPath}`);
+  return result.value;
+}
+
+// Keep the named filesystem boundary live so fault injection reaches sync.ts.
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, renameSync: (...args: Parameters<typeof actual.renameSync>) => fs.renameSync(...args) };
+});
 
 /**
  * SyncManager 跨 repo 能力测试（M2）。
@@ -20,7 +35,6 @@ import type { Session } from '../session-flow/ir.js';
  * 覆盖点：
  * - listAllRepoIdentities：canonical 反查（目录名编码有损，只能从 _index.json 读回）、
  *   损坏/无索引目录跳过、_unattributed 的纳入条件
- * - listSessionsAcrossRepos：跨 repo 合并、author 过滤、旧索引条目的 repoIdentity 回填
  * - saveSession 去重（P8）：sessionId+author 命中 → 原地更新，无 `_1` 副本；
  *   旧索引无 sessionId → 退化为名冲突路径
  * - rebuildIndex：幂等重建且保留 origin.sessionId
@@ -68,7 +82,7 @@ function mkMeta(o: { sessionId?: string; author?: string; repoIdentity?: string 
   );
 }
 
-/** 与 SyncManager.repoDir 相同的编码规则（非白名单字符 → %XX）。 */
+/** 与 SyncManager.repoDir 相同的编码规则（非白名单字符 → ~XX）。 */
 function repoDirOf(identity: string): string {
   return path.join(repoRoot, 'sessions', 'repos', encodeRepoIdentity(identity));
 }
@@ -83,6 +97,124 @@ function readRepoIndex(identity: string): { sessions: Array<Record<string, unkno
 }
 
 const unattrDir = () => path.join(repoRoot, 'sessions', '_unattributed');
+
+describe('archivedCwd', () => {
+  it('stores a git workspace root as dot and keeps its monorepo subdirectory', async () => {
+    const workspace = path.join(repoRoot, 'workspace');
+    const nested = path.join(workspace, 'packages', 'api');
+    fs.mkdirSync(nested, { recursive: true });
+    execFileSync('git', ['init', '-q', workspace]);
+    execFileSync('git', ['-C', workspace, 'config', 'user.email', 'test@example.com']);
+    execFileSync('git', ['-C', workspace, 'config', 'user.name', 'Test']);
+    execFileSync('git', ['-C', workspace, 'commit', '--allow-empty', '-qm', 'init']);
+
+    await expect(archivedCwd(workspace)).resolves.toBe('.');
+    await expect(archivedCwd(nested)).resolves.toBe('packages/api');
+  });
+
+  it('uses the configured non-git project root and omits paths with no known boundary', async () => {
+    const project = path.join(repoRoot, 'plain-project');
+    const nested = path.join(project, 'backend');
+    fs.mkdirSync(nested, { recursive: true });
+
+    await expect(archivedCwd(nested, project)).resolves.toBe('backend');
+    await expect(archivedCwd(path.join(repoRoot, 'scratch'))).resolves.toBe('');
+    await expect(archivedCwd('md5:3f2a')).resolves.toBe('');
+  });
+
+  it('keeps a valid child whose name starts with two dots', async () => {
+    const project = path.join(repoRoot, 'plain-project');
+    const nested = path.join(project, '..cache');
+    fs.mkdirSync(nested, { recursive: true });
+
+    await expect(archivedCwd(nested, project)).resolves.toBe('..cache');
+    await expect(archivedCwd(path.join(project, '..', 'outside'), project)).resolves.toBe('');
+  });
+
+  it('resolves a symlinked cwd against the real workspace root', async () => {
+    const project = path.join(repoRoot, 'plain-project');
+    const nested = path.join(project, 'packages', 'api');
+    const link = path.join(repoRoot, 'workspace-link');
+    fs.mkdirSync(nested, { recursive: true });
+    try {
+      fs.symlinkSync(project, link, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch (error) {
+      if (process.platform === 'win32' && (error as NodeJS.ErrnoException).code === 'EPERM') return;
+      throw error;
+    }
+
+    await expect(archivedCwd(path.join(link, 'packages', 'api'), project)).resolves.toBe('packages/api');
+  });
+
+  it('stores the normalized cwd in both saved metadata and a rebuilt index', async () => {
+    const workspace = path.join(repoRoot, 'workspace');
+    const nested = path.join(workspace, 'packages', 'api');
+    fs.mkdirSync(nested, { recursive: true });
+    execFileSync('git', ['init', '-q', workspace]);
+    execFileSync('git', ['-C', workspace, 'config', 'user.email', 'test@example.com']);
+    execFileSync('git', ['-C', workspace, 'config', 'user.name', 'Test']);
+    execFileSync('git', ['-C', workspace, 'commit', '--allow-empty', '-qm', 'init']);
+
+    const identity = 'github.com/org/alpha';
+    const mgr = new SyncManager(repoRoot);
+    const saved = written(await mgr.saveSession(
+      mkSession({ cwd: nested }),
+      defaultSyncMeta({
+        platform: 'claude-code', author: 'alice', cwd: nested, sessionId: 'relative-cwd', repoIdentity: identity,
+      }, '2026-01-02T03:04:05.000Z'),
+    ));
+    const entry = mgr.listSessions(identity)[0];
+    expect(entry.cwd).toBe('packages/api');
+    expect(mgr.loadSession(identity, path.basename(saved, '.jsonl'), 'alice').meta.origin.cwd).toBe('packages/api');
+
+    await mgr.rebuildIndex(identity);
+    expect(mgr.listSessions(identity)[0].cwd).toBe('packages/api');
+  });
+});
+
+describe('archive save rollback', () => {
+  it.each([false, true].flatMap((existing) => ['index', 'metadata'].map((failure) => ({ existing, failure }))))('restores the previous pair after a $failure rename fails (existing: $existing)', async ({ existing, failure }) => {
+    const mgr = new SyncManager(repoRoot);
+    if (existing) await mgr.saveSession(mkSession(), mkMeta());
+    const before = fs.readdirSync(repoRoot, { recursive: true }).map(String).filter((p) => fs.statSync(path.join(repoRoot, p)).isFile());
+    const bytes = new Map(before.map((p) => [p, fs.readFileSync(path.join(repoRoot, p))]));
+    const rename = fs.renameSync;
+    const fail = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (failure === 'index' ? String(to).endsWith('_index.json') : String(to).endsWith('.meta.json') && String(from).endsWith('.tmp')) {
+        throw new Error('injected archive rename failure');
+      }
+      return rename(from, to);
+    });
+    try {
+      await expect(mgr.saveSession(mkSession({ messages: [{ role: 'user', content: [{ type: 'text', text: 'new transcript' }] }] }), mkMeta()))
+        .rejects.toThrow('injected archive rename failure');
+    } finally { fail.mockRestore(); }
+    const after = fs.readdirSync(repoRoot, { recursive: true }).map(String).filter((p) => fs.statSync(path.join(repoRoot, p)).isFile());
+    expect(after.sort()).toEqual(before.sort());
+    for (const [p, content] of bytes) expect(fs.readFileSync(path.join(repoRoot, p))).toEqual(content);
+    const saved = written(await mgr.saveSession(mkSession(), mkMeta()));
+    expect(saved).not.toMatch(/_1\.jsonl$/);
+    expect(readRepoIndex('github.com/org/alpha').sessions).toHaveLength(1);
+  });
+});
+
+it('holds publication ownership through Git work and releases it after failure', async () => {
+  let release!: () => void;
+  let entered!: () => void;
+  const enteredFirst = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const first = withSessionPublicationLock(repoRoot, async () => { entered(); await gate; return 'published'; });
+  await enteredFirst;
+  let ranSecond = false;
+  const second = withSessionPublicationLock(repoRoot, async () => { ranSecond = true; return 'second'; });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  expect(ranSecond).toBe(false);
+  release();
+  expect(await first).toEqual({ status: 'done', value: 'published' });
+  expect(await second).toEqual({ status: 'done', value: 'second' });
+  await expect(withSessionPublicationLock(repoRoot, async () => { throw new Error('push failed'); })).rejects.toThrow('push failed');
+  expect(await withSessionPublicationLock(repoRoot, async () => 'retry')).toEqual({ status: 'done', value: 'retry' });
+});
 
 describe('listAllRepoIdentities', () => {
   it('reverse-maps canonical identities from each repo _index.json', () => {
@@ -146,60 +278,10 @@ describe('listAllRepoIdentities', () => {
   });
 });
 
-describe('listSessionsAcrossRepos', () => {
-  it('merges sessions from every repo and _unattributed', () => {
-    const mgr = new SyncManager(repoRoot);
-    mgr.saveSession(mkSession({ sessionId: 'a-1', title: 'alpha task' }), mkMeta({ sessionId: 'a-1', repoIdentity: 'github.com/org/alpha' }));
-    mgr.saveSession(mkSession({ sessionId: 'b-1', title: 'beta task' }), mkMeta({ sessionId: 'b-1', author: 'bob', repoIdentity: 'gitlab.company.com/g/beta' }));
-    mgr.saveSession(mkSession({ sessionId: 'c-1', title: 'plain task' }), mkMeta({ sessionId: 'c-1', author: 'carol', repoIdentity: null }));
-
-    const all = mgr.listSessionsAcrossRepos();
-    expect(all.map((s) => s.sessionId).sort()).toEqual(['a-1', 'b-1', 'c-1']);
-    // 每个条目都带 repoIdentity，标识来源 repo（null → _unattributed）
-    expect(all.find((s) => s.sessionId === 'a-1')?.repoIdentity).toBe('github.com/org/alpha');
-    expect(all.find((s) => s.sessionId === 'b-1')?.repoIdentity).toBe('gitlab.company.com/g/beta');
-    expect(all.find((s) => s.sessionId === 'c-1')?.repoIdentity).toBeNull();
-  });
-
-  it('filters by author across repos', () => {
-    const mgr = new SyncManager(repoRoot);
-    mgr.saveSession(mkSession({ sessionId: 'a-1', title: 'alpha alice' }), mkMeta({ sessionId: 'a-1', author: 'alice', repoIdentity: 'github.com/org/alpha' }));
-    mgr.saveSession(mkSession({ sessionId: 'b-1', title: 'beta bob' }), mkMeta({ sessionId: 'b-1', author: 'bob', repoIdentity: 'gitlab.company.com/g/beta' }));
-    mgr.saveSession(mkSession({ sessionId: 'c-1', title: 'plain alice' }), mkMeta({ sessionId: 'c-1', author: 'alice', repoIdentity: null }));
-
-    const byAlice = mgr.listSessionsAcrossRepos('alice');
-    expect(byAlice.map((s) => s.sessionId).sort()).toEqual(['a-1', 'c-1']);
-  });
-
-  it('backfills repoIdentity for legacy index entries that lack it', () => {
-    // 旧格式索引条目没有 repoIdentity 字段 → 用所在 repo 的 identity 回填，
-    // 展示层（list --all 的 SOURCE 列）依赖它
-    writeRepoIndex('github.com/org/alpha', {
-      version: 1,
-      repoIdentity: 'github.com/org/alpha',
-      updatedAt: '2026-01-01T00:00:00.000Z',
-      sessions: [
-        { sessionName: 'old_x', author: 'alice', platform: 'claude-code', title: 'x', cwd: '/p', messageCount: 1, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', status: 'active' },
-      ],
-    });
-    fs.mkdirSync(unattrDir(), { recursive: true });
-    fs.writeFileSync(
-      path.join(unattrDir(), '_index.json'),
-      JSON.stringify({ version: 1, repoIdentity: null, updatedAt: '2026-01-01T00:00:00.000Z', sessions: [
-        { sessionName: 'old_y', author: 'bob', platform: 'codex', title: 'y', cwd: '/q', messageCount: 1, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', status: 'active' },
-      ] }),
-    );
-
-    const all = new SyncManager(repoRoot).listSessionsAcrossRepos();
-    expect(all.find((s) => s.sessionName === 'old_x')?.repoIdentity).toBe('github.com/org/alpha');
-    expect(all.find((s) => s.sessionName === 'old_y')?.repoIdentity).toBeNull();
-  });
-});
-
 describe('saveSession dedup (origin sessionId + author)', () => {
-  it('updates the existing entry in place instead of creating a _1 duplicate', () => {
+  it('updates the existing entry in place instead of creating a _1 duplicate', async () => {
     const mgr = new SyncManager(repoRoot);
-    mgr.saveSession(mkSession({ title: 'fix payment', messages: mkSession().messages }), mkMeta());
+    await mgr.saveSession(mkSession({ title: 'fix payment', messages: mkSession().messages }), mkMeta());
 
     // 同一 sessionId + author 再推（内容有更新）→ 复用原 sessionName 覆盖写
     const second = mkSession({
@@ -210,7 +292,7 @@ describe('saveSession dedup (origin sessionId + author)', () => {
         { role: 'user', content: [{ type: 'text', text: 'continue' }] },
       ],
     });
-    mgr.saveSession(second, mkMeta());
+    await mgr.saveSession(second, mkMeta());
 
     const authorDir = path.join(repoDirOf('github.com/org/alpha'), 'alice');
     const jsonls = fs.readdirSync(authorDir).filter((f) => f.endsWith('.jsonl'));
@@ -225,10 +307,35 @@ describe('saveSession dedup (origin sessionId + author)', () => {
     });
   });
 
-  it('treats the same sessionId under a different author as a separate session', () => {
+  it('renames a re-pushed session whose old name spelled a local path, and leaves no old copy', async () => {
     const mgr = new SyncManager(repoRoot);
-    mgr.saveSession(mkSession({ sessionId: 'shared-1', title: 'shared' }), mkMeta({ sessionId: 'shared-1', author: 'alice' }));
-    mgr.saveSession(mkSession({ sessionId: 'shared-1', title: 'shared' }), mkMeta({ sessionId: 'shared-1', author: 'bob' }));
+    const leaked = `fix ${path.join(os.homedir(), 'app/src/retry.ts')}`;
+    const before = written(await mgr.saveSession(mkSession({ title: leaked }), mkMeta({ title: leaked })));
+
+    const after = written(await mgr.saveSession(mkSession({ title: 'fix ~/app/src/retry.ts' }), mkMeta({ title: 'fix ~/app/src/retry.ts' }), { pathsRewritten: true }));
+
+    expect(path.basename(after)).toBe('claude-code_fix-app-src-retry-ts_20260102.jsonl');
+    expect(fs.existsSync(path.join(repoRoot, before))).toBe(false);
+    expect(fs.existsSync(path.join(repoRoot, before.replace(/\.jsonl$/, '.meta.json')))).toBe(false);
+    expect(mgr.listSessions('github.com/org/alpha').map((entry) => entry.sessionName)).toEqual([path.basename(after, '.jsonl')]);
+    await mgr.rebuildIndex('github.com/org/alpha');
+    expect(mgr.listSessions('github.com/org/alpha').map((entry) => entry.sessionName)).toEqual([path.basename(after, '.jsonl')]);
+  });
+
+  it('keeps the name of a session re-pushed without rewriting its paths, even when its title moved off a path', async () => {
+    const mgr = new SyncManager(repoRoot);
+    const leaked = `fix ${path.join(os.homedir(), 'app/src/retry.ts')}`;
+    const before = written(await mgr.saveSession(mkSession({ title: leaked }), mkMeta({ title: leaked })));
+
+    const after = written(await mgr.saveSession(mkSession({ title: 'fix retries' }), mkMeta({ title: 'fix retries' })));
+
+    expect(after).toBe(before);
+  });
+
+  it('treats the same sessionId under a different author as a separate session', async () => {
+    const mgr = new SyncManager(repoRoot);
+    await mgr.saveSession(mkSession({ sessionId: 'shared-1', title: 'shared' }), mkMeta({ sessionId: 'shared-1', author: 'alice' }));
+    await mgr.saveSession(mkSession({ sessionId: 'shared-1', title: 'shared' }), mkMeta({ sessionId: 'shared-1', author: 'bob' }));
 
     const repoDir = repoDirOf('github.com/org/alpha');
     expect(fs.existsSync(path.join(repoDir, 'alice', 'claude-code_shared_20260102.jsonl'))).toBe(true);
@@ -241,7 +348,7 @@ describe('saveSession dedup (origin sessionId + author)', () => {
     expect(idx.sessions.map((s) => s.author).sort()).toEqual(['alice', 'bob']);
   });
 
-  it('falls back to name-conflict suffixes when the legacy index has no sessionId', () => {
+  it('falls back to name-conflict suffixes when the legacy index has no sessionId', async () => {
     // 旧索引条目没有 sessionId → 按 sessionId 查重查不到 → 走旧的
     // resolveNameConflict 路径，生成 _1 副本（兼容旧行为）
     const base = generateSessionName('claude-code', 'fix payment', '2026-01-02T03:04:05.000Z');
@@ -258,19 +365,19 @@ describe('saveSession dedup (origin sessionId + author)', () => {
     });
 
     const mgr = new SyncManager(repoRoot);
-    mgr.saveSession(mkSession({ sessionId: 'new-1' }), mkMeta({ sessionId: 'new-1' }));
+    await mgr.saveSession(mkSession({ sessionId: 'new-1' }), mkMeta({ sessionId: 'new-1' }));
 
     expect(fs.existsSync(path.join(authorDir, `${base}_1.jsonl`))).toBe(true);
     expect(readRepoIndex('github.com/org/alpha').sessions).toHaveLength(2);
   });
 
-  it('rebuilds a missing index before dedup so a re-push keeps the other sessions', () => {
+  it('rebuilds a missing index before dedup so a re-push keeps the other sessions', async () => {
     const mgr = new SyncManager(repoRoot);
-    mgr.saveSession(mkSession({ sessionId: 's-1', title: 'fix payment' }), mkMeta({ sessionId: 's-1' }));
-    mgr.saveSession(mkSession({ sessionId: 's-2', title: 'other task' }), mkMeta({ sessionId: 's-2' }));
+    await mgr.saveSession(mkSession({ sessionId: 's-1', title: 'fix payment' }), mkMeta({ sessionId: 's-1' }));
+    await mgr.saveSession(mkSession({ sessionId: 's-2', title: 'other task' }), mkMeta({ sessionId: 's-2' }));
     fs.unlinkSync(path.join(repoDirOf('github.com/org/alpha'), '_index.json'));
 
-    mgr.saveSession(mkSession({ sessionId: 's-1', title: 'fix payment v2' }), mkMeta({ sessionId: 's-1' }));
+    await mgr.saveSession(mkSession({ sessionId: 's-1', title: 'fix payment v2' }), mkMeta({ sessionId: 's-1' }));
 
     const authorDir = path.join(repoDirOf('github.com/org/alpha'), 'alice');
     const jsonls = fs.readdirSync(authorDir).filter((f) => f.endsWith('.jsonl'));
@@ -298,33 +405,33 @@ describe('withSessionIndexLock', () => {
     fs.rmSync(home, { recursive: true, force: true });
   });
 
-  it('lands both of two concurrent saves of different sessions with the same title and day', async () => {
-    let releaseFirst!: () => void;
-    const firstHolds = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
-    let firstHasLock!: () => void;
-    const firstLocked = new Promise<void>((resolve) => {
-      firstHasLock = resolve;
-    });
-    const first = withSessionIndexLock(repoRoot, async () => {
-      firstHasLock();
-      await firstHolds;
-      return new SyncManager(repoRoot).saveSession(mkSession({ sessionId: 's-a' }), mkMeta({ sessionId: 's-a' }));
-    });
-    await firstLocked;
-    const second = withSessionIndexLock(repoRoot, async () =>
-      new SyncManager(repoRoot).saveSession(mkSession({ sessionId: 's-b' }), mkMeta({ sessionId: 's-b' })),
-    );
+  it('the public archive save waits for the index lock without a caller wrapper', async () => {
+    let release!: () => void;
+    let ready!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { ready = resolve; });
+    const held = withSessionIndexLock(repoRoot, async () => { ready(); await gate; });
+    await started;
+    const saving = new SyncManager(repoRoot).saveSession(mkSession(), mkMeta());
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(fs.existsSync(path.join(repoRoot, 'sessions'))).toBe(false);
+    } finally { release(); }
+    await held;
+    await saving;
+    expect(readRepoIndex('github.com/org/alpha').sessions).toHaveLength(1);
+  });
 
-    // The second save waits for the first instead of picking the same free name.
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    expect(fs.existsSync(path.join(repoRoot, 'sessions'))).toBe(false);
-    releaseFirst();
-
-    const [a, b] = await Promise.all([first, second]);
-    expect(a).toEqual({ status: 'done', value: expect.stringMatching(/claude-code_fix-payment_20260102\.jsonl$/) });
-    expect(b).toEqual({ status: 'done', value: expect.stringMatching(/claude-code_fix-payment_20260102_1\.jsonl$/) });
+  it('lands both of two concurrent public saves with the same title and day', async () => {
+    const mgr = new SyncManager(repoRoot);
+    const [a, b] = await Promise.all([
+      mgr.saveSession(mkSession({ sessionId: 's-a' }), mkMeta({ sessionId: 's-a' })),
+      mgr.saveSession(mkSession({ sessionId: 's-b' }), mkMeta({ sessionId: 's-b' })),
+    ]);
+    expect([a, b].map((result) => written(result)).sort()).toEqual([
+      expect.stringMatching(/claude-code_fix-payment_20260102\.jsonl$/),
+      expect.stringMatching(/claude-code_fix-payment_20260102_1\.jsonl$/),
+    ]);
     const sessions = readRepoIndex('github.com/org/alpha').sessions;
     expect(sessions.map((s) => s.sessionId).sort()).toEqual(['s-a', 's-b']);
   });
@@ -343,81 +450,81 @@ describe('withSessionIndexLock', () => {
 });
 
 describe('rebuildIndex', () => {
-  it('preserves origin sessionId in rebuilt entries', () => {
+  it('preserves origin sessionId in rebuilt entries', async () => {
     const mgr = new SyncManager(repoRoot);
-    mgr.saveSession(mkSession(), mkMeta());
+    await mgr.saveSession(mkSession(), mkMeta());
 
     // 索引损坏后重建
     fs.writeFileSync(path.join(repoDirOf('github.com/org/alpha'), '_index.json'), '{ corrupted');
 
-    const count = mgr.rebuildIndex('github.com/org/alpha');
+    const count = written(await mgr.rebuildIndex('github.com/org/alpha'));
     expect(count).toBe(1);
 
     const idx = readRepoIndex('github.com/org/alpha');
     expect(idx.sessions[0]).toMatchObject({ sessionName: 'claude-code_fix-payment_20260102', sessionId: 's-1' });
   });
 
-  it('keeps an author directory whose name starts with an underscore', () => {
+  it('keeps an author directory whose name starts with an underscore', async () => {
     const mgr = new SyncManager(repoRoot);
-    mgr.saveSession(mkSession(), mkMeta({ author: '_alice' }));
+    await mgr.saveSession(mkSession(), mkMeta({ author: '_alice' }));
     fs.unlinkSync(path.join(repoDirOf('github.com/org/alpha'), '_index.json'));
 
-    expect(mgr.rebuildIndex('github.com/org/alpha')).toBe(1);
+    expect(written(await mgr.rebuildIndex('github.com/org/alpha'))).toBe(1);
     expect(readRepoIndex('github.com/org/alpha').sessions[0]).toMatchObject({ author: '_alice', sessionId: 's-1' });
   });
 
-  it('is idempotent across repeated rebuilds', () => {
+  it('is idempotent across repeated rebuilds', async () => {
     const mgr = new SyncManager(repoRoot);
-    mgr.saveSession(mkSession(), mkMeta());
+    await mgr.saveSession(mkSession(), mkMeta());
 
-    expect(mgr.rebuildIndex('github.com/org/alpha')).toBe(1);
-    expect(mgr.rebuildIndex('github.com/org/alpha')).toBe(1);
+    expect(written(await mgr.rebuildIndex('github.com/org/alpha'))).toBe(1);
+    expect(written(await mgr.rebuildIndex('github.com/org/alpha'))).toBe(1);
     expect(readRepoIndex('github.com/org/alpha').sessions).toHaveLength(1);
   });
 
-  it('keeps the original title and author instead of the sanitized directory name', () => {
+  it('keeps the original title and author instead of the sanitized directory name', async () => {
     // The author directory is sanitized (`alice:ci` → `alice_ci`) and the file
     // name is a truncated slug; rebuilding from those destroyed both fields.
     const mgr = new SyncManager(repoRoot);
-    mgr.saveSession(
+    await mgr.saveSession(
       mkSession({ title: 'Fix Payment Retry Logic' }),
       mkMeta({ author: 'alice:ci', repoIdentity: 'github.com/org/alpha', title: 'Fix Payment Retry Logic' }),
     );
 
     fs.writeFileSync(path.join(repoDirOf('github.com/org/alpha'), '_index.json'), '{ corrupted');
-    mgr.rebuildIndex('github.com/org/alpha');
+    await mgr.rebuildIndex('github.com/org/alpha');
 
     const entry = readRepoIndex('github.com/org/alpha').sessions[0];
     expect(entry.author).toBe('alice:ci');
     expect(entry.title).toBe('Fix Payment Retry Logic');
   });
 
-  it('rebuilds repos whose index is missing entirely (pull --all repair path)', () => {
+  it('rebuilds repos whose index is missing entirely (pull --all repair path)', async () => {
     const mgr = new SyncManager(repoRoot);
-    mgr.saveSession(mkSession(), mkMeta());
+    await mgr.saveSession(mkSession(), mkMeta());
 
     // 删掉索引后，listAllRepoIdentities 反查不到 → 只有按目录重建才能修回来
     fs.unlinkSync(path.join(repoDirOf('github.com/org/alpha'), '_index.json'));
     expect(new SyncManager(repoRoot).listAllRepoIdentities()).toEqual([]);
 
-    const { repos, sessions } = new SyncManager(repoRoot).rebuildAllIndexes();
+    const { repos, sessions } = written(await new SyncManager(repoRoot).rebuildAllIndexes());
     expect(repos).toBe(1);
     expect(sessions).toBe(1);
     expect(new SyncManager(repoRoot).listAllRepoIdentities()).toEqual(['github.com/org/alpha']);
   });
 
-  it('repairs a corrupted index instead of overwriting it with the new entry', () => {
+  it('repairs a corrupted index instead of overwriting it with the new entry', async () => {
     // A corrupted index used to be read as empty, so the next upsert wrote a
     // one-entry index and every other session of that repo vanished from
     // `list` -- while their files were still on disk.
     const mgr = new SyncManager(repoRoot);
-    mgr.saveSession(
+    await mgr.saveSession(
       mkSession({ sessionId: 'first', title: 'first session' }),
       mkMeta({ sessionId: 'first' }),
     );
     fs.writeFileSync(path.join(repoDirOf('github.com/org/alpha'), '_index.json'), '{ broken');
 
-    mgr.saveSession(
+    await mgr.saveSession(
       mkSession({ sessionId: 'second', title: 'second session' }),
       mkMeta({ sessionId: 'second' }),
     );
@@ -426,9 +533,9 @@ describe('rebuildIndex', () => {
     expect(idx.sessions.map((s) => s.sessionId).sort()).toEqual(['first', 'second']);
   });
 
-  it('makes a legacy _-folded repository directory readable again', () => {
+  it('makes a legacy _-folded repository directory readable again', async () => {
     const mgr = new SyncManager(repoRoot);
-    mgr.saveSession(mkSession(), mkMeta());
+    await mgr.saveSession(mkSession(), mkMeta());
 
     // Simulate a directory written by the old '_'-folding encoder.
     const reposDir = path.join(repoRoot, 'sessions', 'repos');
@@ -438,7 +545,7 @@ describe('rebuildIndex', () => {
     );
     fs.unlinkSync(path.join(reposDir, 'github.com_org_alpha', '_index.json'));
 
-    const { repos, sessions } = new SyncManager(repoRoot).rebuildAllIndexes();
+    const { repos, sessions } = written(await new SyncManager(repoRoot).rebuildAllIndexes());
     expect(repos).toBe(1);
     expect(sessions).toBe(1);
 
@@ -464,39 +571,418 @@ describe('session pull (gitPull + rebuildIndex) on a team checkout', () => {
     git(dir, 'config', 'user.email', `${name}@example.com`);
   }
 
-  function pushSession(checkout: string, sessionId: string, title: string): void {
+  async function pushSession(checkout: string, sessionId: string, title: string): Promise<void> {
     const mgr = new SyncManager(checkout);
-    mgr.saveSession(mkSession({ sessionId, title }), mkMeta({ sessionId, title }));
+    await mgr.saveSession(mkSession({ sessionId, title }), mkMeta({ sessionId, title }));
     expect(mgr.gitCommit(`push ${title}`).status).toBe('committed');
     mgr.gitPush();
   }
 
-  function pull(checkout: string): void {
+  async function pull(checkout: string): Promise<void> {
     const mgr = new SyncManager(checkout);
     mgr.gitPull();
-    mgr.rebuildIndex(identity);
+    await mgr.rebuildIndex(identity);
   }
 
-  it('leaves the checkout clean when nothing changed, so the next index change merges', () => {
+  it('leaves the checkout clean when nothing changed, so the next index change merges', async () => {
     const remote = path.join(repoRoot, 'team.git');
     git(repoRoot, 'init', '-q', '--bare', '-b', 'main', remote);
     const alice = path.join(repoRoot, 'alice');
     git(repoRoot, 'init', '-q', '-b', 'main', alice);
     initCheckout(alice, 'alice');
     git(alice, 'remote', 'add', 'origin', remote);
-    pushSession(alice, 's-1', 'fix payment');
+    await pushSession(alice, 's-1', 'fix payment');
     const bob = path.join(repoRoot, 'bob');
     git(repoRoot, 'clone', '-q', remote, bob);
     initCheckout(bob, 'bob');
 
-    pull(bob);
-    pull(bob);
+    await pull(bob);
+    await pull(bob);
     expect(git(bob, 'status', '--porcelain')).toBe('');
 
-    pushSession(alice, 's-2', 'add refunds');
-    pull(bob);
+    await pushSession(alice, 's-2', 'add refunds');
+    await pull(bob);
     expect(git(bob, 'status', '--porcelain')).toBe('');
     expect(new SyncManager(bob).listSessions(identity).map((s) => s.sessionId).sort()).toEqual(['s-1', 's-2']);
+  });
+
+  it('moves a %-escaped repository directory to its current name in the next push', async () => {
+    const remote = path.join(repoRoot, 'team.git');
+    git(repoRoot, 'init', '-q', '--bare', '-b', 'main', remote);
+    const alice = path.join(repoRoot, 'alice');
+    git(repoRoot, 'init', '-q', '-b', 'main', alice);
+    initCheckout(alice, 'alice');
+    git(alice, 'remote', 'add', 'origin', remote);
+    await pushSession(alice, 's-1', 'fix payment');
+    // The archive as the previous encoder named it.
+    git(alice, 'mv', `sessions/repos/${encodeRepoIdentity(identity)}`, 'sessions/repos/github.com%2Forg%2Falpha');
+    git(alice, 'commit', '-qm', 'previous layout');
+    git(alice, 'push', '-q', 'origin', 'main');
+    fs.writeFileSync(path.join(alice, 'sessions', 'repos', 'github.com%2Forg%2Falpha', 'notes.txt'), 'local only\n');
+
+    await pushSession(alice, 's-2', 'add refunds');
+
+    const pushed = git(remote, 'ls-tree', '-r', '--name-only', 'main', 'sessions/repos').split('\n');
+    expect(pushed.filter((p) => p.includes('%') || p.endsWith('notes.txt'))).toEqual([]);
+    expect(git(alice, 'status', '--porcelain')).toBe(`?? sessions/repos/${encodeRepoIdentity(identity)}/notes.txt`);
+    expect(new SyncManager(alice).listSessions(identity).map((s) => s.sessionId).sort()).toEqual(['s-1', 's-2']);
+  });
+
+  it('undoes a move whose commit is rejected, and moves the archive on a later push, leaving unrelated files out', async () => {
+    const alice = path.join(repoRoot, 'alice');
+    git(repoRoot, 'init', '-q', '-b', 'main', alice);
+    initCheckout(alice, 'alice');
+    const first = new SyncManager(alice);
+    await first.saveSession(mkSession(), mkMeta());
+    expect(first.gitCommit('push').status).toBe('committed');
+    git(alice, 'mv', `sessions/repos/${encodeRepoIdentity(identity)}`, 'sessions/repos/github.com%2Forg%2Falpha');
+    git(alice, 'commit', '-qm', 'previous layout');
+    fs.writeFileSync(path.join(alice, 'sessions', 'repos', 'github.com%2Forg%2Falpha', 'notes.txt'), 'local only\n');
+    const hook = path.join(alice, '.git', 'hooks', 'pre-commit');
+    fs.writeFileSync(hook, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const before = git(alice, 'rev-parse', 'HEAD');
+
+    const rejected = new SyncManager(alice);
+    await rejected.saveSession(mkSession({ sessionId: 's-2', title: 'add refunds' }), mkMeta({ sessionId: 's-2' }));
+    expect(rejected.gitCommit('push').status).toBe('failed');
+    expect(git(alice, 'rev-parse', 'HEAD')).toBe(before);
+    expect(fs.existsSync(repoDirOf(identity).replace(repoRoot, alice))).toBe(false);
+    fs.rmSync(hook);
+    for (const sessionId of ['s-2', 's-3']) {
+      const mgr = new SyncManager(alice);
+      await mgr.saveSession(mkSession({ sessionId, title: `session ${sessionId}` }), mkMeta({ sessionId }));
+      expect(mgr.gitCommit('push').status).toBe('committed');
+    }
+
+    const committed = git(alice, 'ls-tree', '-r', '--name-only', 'HEAD', 'sessions/repos').split('\n');
+    expect(committed.filter((p) => p.includes('%') || p.endsWith('notes.txt'))).toEqual([]);
+    expect(committed.filter((p) => p.endsWith('.jsonl'))).toHaveLength(3);
+    expect(git(alice, 'status', '--porcelain')).toBe(`?? sessions/repos/${encodeRepoIdentity(identity)}/notes.txt`);
+  });
+
+  it('folds sessions an older CLI pushed under the %-escaped name after the move into the current directory, once each', async () => {
+    const alice = path.join(repoRoot, 'alice');
+    git(repoRoot, 'init', '-q', '-b', 'main', alice);
+    initCheckout(alice, 'alice');
+    const first = new SyncManager(alice);
+    await first.saveSession(mkSession(), mkMeta());
+    expect(first.gitCommit('push').status).toBe('committed');
+    // An older CLI pushes, under the %XX name next to the moved directory: s-1 again after its title changed,
+    // s-3, and s-4, whose title and date give it the file name s-1 has in the current directory.
+    const older = path.join(repoRoot, 'older');
+    const olderMgr = new SyncManager(older);
+    await olderMgr.saveSession(mkSession({ title: 'fix payment retries' }), mkMeta());
+    await olderMgr.saveSession(mkSession({ sessionId: 's-3', title: 'add invoices' }), mkMeta({ sessionId: 's-3' }));
+    await olderMgr.saveSession(mkSession({ sessionId: 's-4' }), mkMeta({ sessionId: 's-4' }));
+    fs.cpSync(
+      path.join(older, 'sessions', 'repos', encodeRepoIdentity(identity)),
+      path.join(alice, 'sessions', 'repos', 'github.com%2Forg%2Falpha'),
+      { recursive: true },
+    );
+    git(alice, 'add', '-A');
+    git(alice, 'commit', '-qm', 'older CLI push');
+
+    const mgr = new SyncManager(alice);
+    await mgr.saveSession(mkSession({ sessionId: 's-2', title: 'add refunds' }), mkMeta({ sessionId: 's-2' }));
+    expect(mgr.gitCommit('push').status).toBe('committed');
+
+    const committed = git(alice, 'ls-tree', '-r', '--name-only', 'HEAD', 'sessions/repos').split('\n');
+    expect(committed.filter((p) => p.includes('%'))).toEqual([]);
+    expect(committed.filter((p) => p.endsWith('.jsonl'))).toHaveLength(4);
+    expect(git(alice, 'status', '--porcelain')).toBe('');
+    expect(new SyncManager(alice).listSessions(identity).map((s) => s.sessionId).sort()).toEqual(['s-1', 's-2', 's-3', 's-4']);
+  });
+
+  it('restores the percent-escaped directory when a rejected fold had only untracked files under the current name', async () => {
+    const alice = path.join(repoRoot, 'alice');
+    git(repoRoot, 'init', '-q', '-b', 'main', alice);
+    initCheckout(alice, 'alice');
+    const first = new SyncManager(alice);
+    await first.saveSession(mkSession(), mkMeta());
+    expect(first.gitCommit('push').status).toBe('committed');
+    git(alice, 'mv', `sessions/repos/${encodeRepoIdentity(identity)}`, 'sessions/repos/github.com%2Forg%2Falpha');
+    git(alice, 'commit', '-qm', 'previous layout');
+    const current = repoDirOf(identity).replace(repoRoot, alice);
+    fs.mkdirSync(current, { recursive: true });
+    fs.writeFileSync(path.join(current, 'notes.txt'), 'local only\n');
+    const session = 'sessions/repos/github.com%2Forg%2Falpha/alice/claude-code_fix-payment_20260102.jsonl';
+    const original = git(alice, 'show', `HEAD:${session}`);
+    fs.writeFileSync(path.join(alice, '.git', 'hooks', 'pre-commit'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+
+    const rejected = new SyncManager(alice);
+    await rejected.saveSession(mkSession({ sessionId: 's-2', title: 'add refunds' }), mkMeta({ sessionId: 's-2' }));
+    expect(rejected.gitCommit('push').status).toBe('failed');
+
+    expect(fs.readFileSync(path.join(alice, session), 'utf-8').trim()).toBe(original);
+  });
+
+  it('keeps a session under the percent-escaped name when the current name holds it only as untracked files', async () => {
+    const alice = path.join(repoRoot, 'alice');
+    git(repoRoot, 'init', '-q', '-b', 'main', alice);
+    initCheckout(alice, 'alice');
+    const first = new SyncManager(alice);
+    await first.saveSession(mkSession({ sessionId: 's-2', title: 'add refunds' }), mkMeta({ sessionId: 's-2' }));
+    expect(first.gitCommit('push').status).toBe('committed');
+    // With no committed index under the current name, its repair reads the local-only copy below as held.
+    git(alice, 'rm', '-q', `sessions/repos/${encodeRepoIdentity(identity)}/_index.json`);
+    git(alice, 'commit', '-qm', 'lose the index');
+    // An older CLI pushed s-1 under the %XX name; a local-only copy of it sits under the current name.
+    const older = path.join(repoRoot, 'older');
+    await new SyncManager(older).saveSession(mkSession(), mkMeta());
+    const olderDir = path.join(older, 'sessions', 'repos', encodeRepoIdentity(identity));
+    fs.cpSync(olderDir, path.join(alice, 'sessions', 'repos', 'github.com%2Forg%2Falpha'), { recursive: true });
+    git(alice, 'add', '-A');
+    git(alice, 'commit', '-qm', 'older CLI push');
+    fs.cpSync(path.join(olderDir, 'alice'), path.join(repoDirOf(identity).replace(repoRoot, alice), 'alice'), { recursive: true });
+
+    const mgr = new SyncManager(alice);
+    await mgr.saveSession(mkSession({ sessionId: 's-3', title: 'add invoices' }), mkMeta({ sessionId: 's-3' }));
+    expect(mgr.gitCommit('push').status).toBe('committed');
+
+    const committed = git(alice, 'ls-tree', '-r', '--name-only', 'HEAD', 'sessions/repos').split('\n');
+    expect(committed.filter((p) => p.includes('/claude-code_fix-payment_20260102') && p.endsWith('.jsonl'))).toHaveLength(1);
+  });
+
+  it('folds a session held under the current name once, even when that directory has no index', async () => {
+    const alice = path.join(repoRoot, 'alice');
+    git(repoRoot, 'init', '-q', '-b', 'main', alice);
+    initCheckout(alice, 'alice');
+    const first = new SyncManager(alice);
+    await first.saveSession(mkSession(), mkMeta());
+    expect(first.gitCommit('push').status).toBe('committed');
+    git(alice, 'rm', '-q', `sessions/repos/${encodeRepoIdentity(identity)}/_index.json`);
+    git(alice, 'commit', '-qm', 'lose the index');
+    // An older CLI pushes s-1 again, later, under the %XX name.
+    const older = path.join(repoRoot, 'older');
+    await new SyncManager(older).saveSession(mkSession(), mkMeta());
+    const percentDir = path.join(alice, 'sessions', 'repos', 'github.com%2Forg%2Falpha');
+    fs.cpSync(path.join(older, 'sessions', 'repos', encodeRepoIdentity(identity)), percentDir, { recursive: true });
+    git(alice, 'add', '-A');
+    git(alice, 'commit', '-qm', 'older CLI push');
+
+    const mgr = new SyncManager(alice);
+    await mgr.saveSession(mkSession({ sessionId: 's-2', title: 'add refunds' }), mkMeta({ sessionId: 's-2' }));
+    expect(mgr.gitCommit('push').status).toBe('committed');
+
+    const committed = git(alice, 'ls-tree', '-r', '--name-only', 'HEAD', 'sessions/repos').split('\n');
+    expect(committed.filter((p) => p.endsWith('.jsonl'))).toHaveLength(2);
+    expect(mgr.listSessions(identity).map((s) => s.sessionId).sort()).toEqual(['s-1', 's-2']);
+  });
+
+  it('undoes a fold whose commit is rejected while a push updates a held session, and folds on a later push', async () => {
+    const alice = path.join(repoRoot, 'alice');
+    git(repoRoot, 'init', '-q', '-b', 'main', alice);
+    initCheckout(alice, 'alice');
+    const first = new SyncManager(alice);
+    await first.saveSession(mkSession(), mkMeta());
+    expect(first.gitCommit('push').status).toBe('committed');
+    // An older CLI pushes s-4 under the %XX name; its file name is the one s-1 has in the current directory.
+    const older = path.join(repoRoot, 'older');
+    await new SyncManager(older).saveSession(mkSession({ sessionId: 's-4' }), mkMeta({ sessionId: 's-4' }));
+    fs.cpSync(
+      path.join(older, 'sessions', 'repos', encodeRepoIdentity(identity)),
+      path.join(alice, 'sessions', 'repos', 'github.com%2Forg%2Falpha'),
+      { recursive: true },
+    );
+    git(alice, 'add', '-A');
+    git(alice, 'commit', '-qm', 'older CLI push');
+    const hook = path.join(alice, '.git', 'hooks', 'pre-commit');
+    fs.writeFileSync(hook, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const before = git(alice, 'rev-parse', 'HEAD');
+    const updated = mkSession({
+      messages: [...mkSession().messages, { role: 'user', content: [{ type: 'text', text: 'and refunds' }] }],
+    });
+
+    const rejected = new SyncManager(alice);
+    await rejected.saveSession(updated, mkMeta());
+    expect(rejected.gitCommit('push').status).toBe('failed');
+    expect(git(alice, 'rev-parse', 'HEAD')).toBe(before);
+    expect(fs.readdirSync(path.join(repoDirOf(identity).replace(repoRoot, alice), 'alice')).filter((f) => f.endsWith('_1.jsonl'))).toEqual([]);
+    fs.rmSync(hook);
+    for (const [session, sessionId] of [[updated, 's-1'], [mkSession({ sessionId: 's-3', title: 'add invoices' }), 's-3']] as const) {
+      const mgr = new SyncManager(alice);
+      await mgr.saveSession(session, mkMeta({ sessionId }));
+      expect(mgr.gitCommit('push').status).toBe('committed');
+    }
+
+    const committed = git(alice, 'ls-tree', '-r', '--name-only', 'HEAD', 'sessions/repos').split('\n');
+    expect(committed.filter((p) => p.includes('%'))).toEqual([]);
+    expect(committed.filter((p) => p.endsWith('.jsonl'))).toHaveLength(3);
+    expect(git(alice, 'status', '--porcelain')).toBe('');
+    expect(new SyncManager(alice).listSessions(identity).map((s) => s.sessionId).sort()).toEqual(['s-1', 's-3', 's-4']);
+  });
+
+  it('publishes none of the edits staged under both repository directory names', async () => {
+    const alice = path.join(repoRoot, 'alice');
+    git(repoRoot, 'init', '-q', '-b', 'main', alice);
+    initCheckout(alice, 'alice');
+    const first = new SyncManager(alice);
+    await first.saveSession(mkSession(), mkMeta());
+    expect(first.gitCommit('push').status).toBe('committed');
+    const older = path.join(repoRoot, 'older');
+    await new SyncManager(older).saveSession(mkSession({ sessionId: 's-3', title: 'add invoices' }), mkMeta({ sessionId: 's-3' }));
+    fs.cpSync(
+      path.join(older, 'sessions', 'repos', encodeRepoIdentity(identity)),
+      path.join(alice, 'sessions', 'repos', 'github.com%2Forg%2Falpha'),
+      { recursive: true },
+    );
+    git(alice, 'add', '-A');
+    git(alice, 'commit', '-qm', 'older CLI push');
+    const edited = [
+      `sessions/repos/${encodeRepoIdentity(identity)}/alice/claude-code_fix-payment_20260102.jsonl`,
+      'sessions/repos/github.com%2Forg%2Falpha/alice/claude-code_add-invoices_20260102.jsonl',
+    ];
+    for (const file of edited) {
+      fs.appendFileSync(path.join(alice, file), 'local edit\n');
+      git(alice, 'add', file);
+    }
+    const originals = edited.map((file) => git(alice, 'show', `HEAD:${file}`));
+
+    const mgr = new SyncManager(alice);
+    await mgr.saveSession(mkSession({ sessionId: 's-2', title: 'add refunds' }), mkMeta({ sessionId: 's-2' }));
+    expect(mgr.gitCommit('push').status).toBe('committed');
+
+    expect(edited.map((file) => git(alice, 'show', `HEAD:${file}`))).toEqual(originals);
+  });
+
+  it('publishes neither a staged deletion under the percent-escaped name nor a staged edit under the current one', async () => {
+    const alice = path.join(repoRoot, 'alice');
+    git(repoRoot, 'init', '-q', '-b', 'main', alice);
+    initCheckout(alice, 'alice');
+    const first = new SyncManager(alice);
+    await first.saveSession(mkSession(), mkMeta());
+    expect(first.gitCommit('push').status).toBe('committed');
+    const older = path.join(repoRoot, 'older');
+    await new SyncManager(older).saveSession(mkSession({ sessionId: 's-3', title: 'add invoices' }), mkMeta({ sessionId: 's-3' }));
+    fs.cpSync(
+      path.join(older, 'sessions', 'repos', encodeRepoIdentity(identity)),
+      path.join(alice, 'sessions', 'repos', 'github.com%2Forg%2Falpha'),
+      { recursive: true },
+    );
+    git(alice, 'add', '-A');
+    git(alice, 'commit', '-qm', 'older CLI push');
+    const deleted = 'sessions/repos/github.com%2Forg%2Falpha/alice/claude-code_add-invoices_20260102.jsonl';
+    const edited = `sessions/repos/${encodeRepoIdentity(identity)}/alice/claude-code_fix-payment_20260102.jsonl`;
+    const originals = [deleted, edited].map((file) => git(alice, 'show', `HEAD:${file}`));
+    git(alice, 'rm', '-q', deleted);
+    fs.appendFileSync(path.join(alice, edited), 'local edit\n');
+    git(alice, 'add', edited);
+
+    const mgr = new SyncManager(alice);
+    await mgr.saveSession(mkSession({ sessionId: 's-2', title: 'add refunds' }), mkMeta({ sessionId: 's-2' }));
+    expect(mgr.gitCommit('push').status).toBe('committed');
+
+    expect([deleted, edited].map((file) => git(alice, 'show', `HEAD:${file}`))).toEqual(originals);
+  });
+
+  it('publishes no edit made between a rejected move and the next push', async () => {
+    const alice = path.join(repoRoot, 'alice');
+    git(repoRoot, 'init', '-q', '-b', 'main', alice);
+    initCheckout(alice, 'alice');
+    const first = new SyncManager(alice);
+    await first.saveSession(mkSession(), mkMeta());
+    expect(first.gitCommit('push').status).toBe('committed');
+    git(alice, 'mv', `sessions/repos/${encodeRepoIdentity(identity)}`, 'sessions/repos/github.com%2Forg%2Falpha');
+    git(alice, 'commit', '-qm', 'previous layout');
+    const original = git(alice, 'show', 'HEAD:sessions/repos/github.com%2Forg%2Falpha/alice/claude-code_fix-payment_20260102.jsonl');
+    const hook = path.join(alice, '.git', 'hooks', 'pre-commit');
+    fs.writeFileSync(hook, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const rejected = new SyncManager(alice);
+    await rejected.saveSession(mkSession({ sessionId: 's-2', title: 'add refunds' }), mkMeta({ sessionId: 's-2' }));
+    expect(rejected.gitCommit('push').status).toBe('failed');
+    fs.rmSync(hook);
+    // The rejected move was undone, so the session is back under the old name.
+    fs.appendFileSync(path.join(alice, 'sessions/repos/github.com%2Forg%2Falpha/alice/claude-code_fix-payment_20260102.jsonl'), 'local edit\n');
+
+    const retry = new SyncManager(alice);
+    await retry.saveSession(mkSession({ sessionId: 's-3', title: 'add invoices' }), mkMeta({ sessionId: 's-3' }));
+    expect(retry.gitCommit('push').status).toBe('committed');
+
+    const committed = git(alice, 'ls-tree', '-r', '--name-only', 'HEAD', 'sessions/repos').split('\n');
+    const copies = committed.filter((p) => p.endsWith('claude-code_fix-payment_20260102.jsonl'));
+    expect(copies.map((file) => git(alice, 'show', `HEAD:${file}`))).toEqual([original]);
+  });
+
+  it('leaves sessions an older CLI pushed under the percent-escaped name in place while the current directory holds local edits', async () => {
+    const alice = path.join(repoRoot, 'alice');
+    git(repoRoot, 'init', '-q', '-b', 'main', alice);
+    initCheckout(alice, 'alice');
+    const first = new SyncManager(alice);
+    await first.saveSession(mkSession(), mkMeta());
+    expect(first.gitCommit('push').status).toBe('committed');
+    // An older CLI pushes s-1 again, later, under the %XX name.
+    const older = path.join(repoRoot, 'older');
+    await new SyncManager(older).saveSession(mkSession(), mkMeta());
+    const percentDir = path.join(alice, 'sessions', 'repos', 'github.com%2Forg%2Falpha');
+    fs.cpSync(path.join(older, 'sessions', 'repos', encodeRepoIdentity(identity)), percentDir, { recursive: true });
+    const olderMeta = path.join(percentDir, 'alice', 'claude-code_fix-payment_20260102.meta.json');
+    const meta = JSON.parse(fs.readFileSync(olderMeta, 'utf-8')) as { sync: { pushedAt: string } };
+    meta.sync.pushedAt = '2099-01-01T00:00:00.000Z';
+    fs.writeFileSync(olderMeta, JSON.stringify(meta));
+    git(alice, 'add', '-A');
+    git(alice, 'commit', '-qm', 'older CLI push');
+    const edited = path.join(repoDirOf(identity).replace(repoRoot, alice), 'alice', 'claude-code_fix-payment_20260102.jsonl');
+    fs.appendFileSync(edited, 'local edit\n');
+
+    const mgr = new SyncManager(alice);
+    await mgr.saveSession(mkSession({ sessionId: 's-2', title: 'add refunds' }), mkMeta({ sessionId: 's-2' }));
+    expect(mgr.gitCommit('push').status).toBe('committed');
+
+    expect(fs.readFileSync(edited, 'utf-8')).toContain('local edit');
+    const committed = git(alice, 'ls-tree', '-r', '--name-only', 'HEAD', 'sessions/repos').split('\n');
+    expect(committed.filter((p) => p.includes('%'))).toHaveLength(3);
+  });
+
+  it.each([
+    { change: 'an unstaged edit', apply: (checkout: string, file: string) => fs.appendFileSync(path.join(checkout, file), 'local edit\n') },
+    {
+      change: 'a staged edit',
+      apply: (checkout: string, file: string) => {
+        fs.appendFileSync(path.join(checkout, file), 'local edit\n');
+        git(checkout, 'add', file);
+      },
+    },
+    { change: 'an unstaged deletion', apply: (checkout: string, file: string) => fs.rmSync(path.join(checkout, file)) },
+    { change: 'a staged deletion', apply: (checkout: string, file: string) => git(checkout, 'rm', '-q', file) },
+    {
+      change: 'the whole directory deleted',
+      apply: (checkout: string, file: string) => fs.rmSync(path.join(checkout, path.dirname(path.dirname(file))), { recursive: true }),
+    },
+  ])('publishes none of $change under a percent-escaped repository directory', async ({ apply }) => {
+    const alice = path.join(repoRoot, 'alice');
+    git(repoRoot, 'init', '-q', '-b', 'main', alice);
+    initCheckout(alice, 'alice');
+    const first = new SyncManager(alice);
+    await first.saveSession(mkSession(), mkMeta());
+    expect(first.gitCommit('push').status).toBe('committed');
+    git(alice, 'mv', `sessions/repos/${encodeRepoIdentity(identity)}`, 'sessions/repos/github.com%2Forg%2Falpha');
+    git(alice, 'commit', '-qm', 'previous layout');
+    const edited = 'sessions/repos/github.com%2Forg%2Falpha/alice/claude-code_fix-payment_20260102.jsonl';
+    const original = git(alice, 'show', `HEAD:${edited}`);
+    apply(alice, edited);
+
+    const mgr = new SyncManager(alice);
+    await mgr.saveSession(mkSession({ sessionId: 's-2', title: 'add refunds' }), mkMeta({ sessionId: 's-2' }));
+    expect(mgr.gitCommit('push').status).toBe('committed');
+
+    expect(git(alice, 'show', `HEAD:${edited}`)).toBe(original);
+    expect(git(alice, 'diff', '--name-only', 'HEAD').split('\n')).toContain(edited);
+  });
+
+  it('leaves a %-escaped repository directory for the next push to move when rebuilding every index', async () => {
+    const alice = path.join(repoRoot, 'alice');
+    git(repoRoot, 'init', '-q', '-b', 'main', alice);
+    initCheckout(alice, 'alice');
+    const mgr = new SyncManager(alice);
+    await mgr.saveSession(mkSession(), mkMeta());
+    expect(mgr.gitCommit('push').status).toBe('committed');
+    git(alice, 'mv', `sessions/repos/${encodeRepoIdentity(identity)}`, 'sessions/repos/github.com%2Forg%2Falpha');
+    git(alice, 'commit', '-qm', 'previous layout');
+
+    written(await new SyncManager(alice).rebuildAllIndexes());
+
+    expect(git(alice, 'status', '--porcelain')).toBe('');
+    expect(new SyncManager(alice).listSessions(identity).map((s) => s.sessionId)).toEqual(['s-1']);
   });
 });
 
@@ -530,9 +1016,75 @@ describe('encodeRepoIdentity', () => {
     expect(new Set(encoded).size).toBe(ids.length);
   });
 
+  it('leaves no % in the name, which GitHub and GitLab URL-decode back into a separator', () => {
+    expect(encodeRepoIdentity('github.com/org/repo')).not.toContain('%');
+  });
+
   it('round-trips through decodeRepoIdentity', () => {
-    for (const id of ['github.com/org/repo', 'gitlab.company.com/g/a_b']) {
+    for (const id of ['github.com/org/repo', 'gitlab.company.com/g/a_b', 'github.com/org/a~b', 'github.com/org/中']) {
       expect(decodeRepoIdentity(encodeRepoIdentity(id))).toBe(id);
     }
+    expect(decodeRepoIdentity('github.com%2Forg%2Fa~41')).toBe('github.com/org/a~41');
+  });
+});
+
+describe('what an archived session ran as', () => {
+  const agent = {
+    v: 1 as const,
+    tool: { name: 'claude', version: '2.1.301' },
+    model: { requested: 'claude-opus-5-5', reported: 'claude-opus-5-5' },
+    team: { revision: '7a6134a25e74c0de7a6134a25e74c0de7a6134a2', localChanges: false },
+    project: { commit: '8e04ff4308e04ff4308e04ff4308e04ff4308e04', dirty: true },
+    teamai: '0.31.0',
+    driver: 'session',
+  };
+
+  it('keeps the agent in meta.json and its team revision in the index entry, which a rebuild gives again', async () => {
+    const mgr = new SyncManager(repoRoot);
+    const saved = written(await mgr.saveSession(mkSession(), { ...mkMeta(), agent }));
+
+    expect(mgr.loadSession('github.com/org/alpha', path.basename(saved, '.jsonl'), 'alice').meta.agent).toEqual(agent);
+    expect(mgr.listSessions('github.com/org/alpha')[0].teamRevision).toBe(agent.team.revision);
+    await mgr.rebuildIndex('github.com/org/alpha');
+    expect(mgr.listSessions('github.com/org/alpha')[0].teamRevision).toBe(agent.team.revision);
+  });
+
+  it('records no team revision for a session that has no agent', async () => {
+    const mgr = new SyncManager(repoRoot);
+    await mgr.saveSession(mkSession(), mkMeta());
+
+    expect(mgr.listSessions('github.com/org/alpha')[0]).not.toHaveProperty('teamRevision');
+  });
+
+  it('reads an agent that is not an observation, such as one with a path in it, as absent', async () => {
+    const mgr = new SyncManager(repoRoot);
+    const saved = written(await mgr.saveSession(mkSession(), { ...mkMeta(), agent }));
+    const metaFile = path.join(repoRoot, saved.replace(/\.jsonl$/, '.meta.json'));
+    const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8')) as Record<string, unknown>;
+    fs.writeFileSync(metaFile, JSON.stringify({ ...meta, agent: { ...agent, tool: { name: '/Users/alice/bin/claude' } } }));
+
+    expect(mgr.loadSession('github.com/org/alpha', path.basename(saved, '.jsonl'), 'alice').meta).not.toHaveProperty('agent');
+    await mgr.rebuildIndex('github.com/org/alpha');
+    expect(mgr.listSessions('github.com/org/alpha')[0]).not.toHaveProperty('teamRevision');
+  });
+});
+
+describe('an archive written before cwd was relative and agent was recorded', () => {
+  it('lists, loads and rebuilds with its absolute cwd and no agent or team revision', async () => {
+    const mgr = new SyncManager(repoRoot);
+    const saved = written(await mgr.saveSession(mkSession(), mkMeta()));
+    const metaFile = path.join(repoRoot, saved.replace(/\.jsonl$/, '.meta.json'));
+    const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8')) as { origin: Record<string, unknown> };
+    fs.writeFileSync(metaFile, JSON.stringify({ ...meta, origin: { ...meta.origin, cwd: '/home/dev/alpha' } }));
+    fs.rmSync(path.join(path.dirname(path.dirname(metaFile)), '_index.json'));
+
+    await mgr.rebuildIndex('github.com/org/alpha');
+
+    const [entry] = mgr.listSessions('github.com/org/alpha');
+    expect(entry).toMatchObject({ cwd: '/home/dev/alpha', sessionId: 's-1' });
+    expect(entry).not.toHaveProperty('teamRevision');
+    const loaded = mgr.loadSession('github.com/org/alpha', entry.sessionName, entry.author);
+    expect(loaded.session).toMatchObject({ cwd: '/home/dev/alpha', messages: [{ role: 'user' }, { role: 'assistant' }] });
+    expect(loaded.meta).not.toHaveProperty('agent');
   });
 });

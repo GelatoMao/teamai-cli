@@ -83,6 +83,7 @@ vi.mock('../roles.js', async () => ({
 vi.mock('../update.js', () => ({
   acquireLock: vi.fn().mockResolvedValue(true),
   releaseLock: vi.fn().mockResolvedValue(undefined),
+  withFileLock: async <T>(_lock: string, _wait: unknown, body: () => Promise<T>) => ({ held: true, value: await body() }),
 }));
 
 // The real deploy by default; a test makes it fail once to see what pull reports.
@@ -91,7 +92,7 @@ vi.mock('../builtin-skills.js', async (importOriginal) => {
   return { ...actual, deployBuiltinSkills: vi.fn(actual.deployBuiltinSkills) };
 });
 
-import { pull, compileRecallRulesBlock, cleanupInactiveNamespaceSkills } from '../pull.js';
+import { pull, checkoutKey, compileRecallRulesBlock, cleanupInactiveNamespaceSkills } from '../pull.js';
 import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig, loadStateForScope, saveStateForScope } from '../config.js';
 import { getHeadRev, createGit, pullRepo } from '../utils/git.js';
 import { log } from '../utils/logger.js';
@@ -172,6 +173,7 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
       lastPull: '2026-04-01',
       lastPullRev: 'abc1234',
       lastPullTargets: ['claude'],
+      ...await homeRecord(homeDir, ['claude'], { claude: [path.join(homeDir, '.claude', 'skills')] }),
       lastPush: null,
       pushedRules: [],
       pushedSkills: [],
@@ -214,6 +216,7 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
     vi.mocked(loadStateForScope).mockResolvedValue(emptyState({
       lastPullRev: 'abc1234',
       lastPullTargets: ['claude'],
+      ...await homeRecord(homeDir, ['claude'], { claude: [path.join(homeDir, '.claude', 'skills')] }),
     }));
 
     await pull({});
@@ -247,6 +250,7 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
     vi.mocked(loadStateForScope).mockResolvedValue(emptyState({
       lastPullRev: 'abc1234',
       lastPullTargets: ['claude'],
+      ...await homeRecord(homeDir, ['claude'], { claude: [path.join(homeDir, '.claude', 'skills')] }),
     }));
 
     await pull({});
@@ -336,7 +340,11 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
     const { deployBuiltinSkills } = await import('../builtin-skills.js');
     vi.mocked(deployBuiltinSkills).mockRejectedValueOnce(new Error('EACCES: permission denied'));
     vi.mocked(getHeadRev).mockResolvedValue('abc1234');
-    vi.mocked(loadStateForScope).mockResolvedValue(emptyState({ lastPullRev: 'abc1234', lastPullTargets: ['claude'] }));
+    vi.mocked(loadStateForScope).mockResolvedValue(emptyState({
+      lastPullRev: 'abc1234',
+      lastPullTargets: ['claude'],
+      ...await homeRecord(homeDir, ['claude'], { claude: [path.join(homeDir, '.claude', 'skills')] }),
+    }));
 
     await pull({});
 
@@ -359,6 +367,38 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('EACCES: permission denied'));
     // A detached SessionStart pull discards its output: debug.log keeps the record.
     expect(log.persist).toHaveBeenCalledWith(expect.stringContaining('The built-in teamai skill was not deployed: EACCES'));
+  });
+
+  // A reassignment in manifest/members.yaml changes what this member receives
+  // without moving a pinned checkout (#1186): the record's selection gates it.
+  it.each([
+    ['the roles differ', { scope: 'user', primaryRole: 'other', additionalRoles: [] }],
+    ['the roles became assigned', { scope: 'user', primaryRole: 'hai', additionalRoles: [], rolesAssigned: true }],
+  ] as const)('does a full sync when %s from the record, with HEAD unchanged', async (_case, selection) => {
+    vi.mocked(getHeadRev).mockResolvedValue('abc1234');
+    const record = await homeRecord(homeDir, ['claude'], { claude: [path.join(homeDir, '.claude', 'skills')] });
+    const [entry] = Object.values(record.lastPullByWorkspace!);
+    entry.selection = { ...selection, additionalRoles: [...selection.additionalRoles] };
+    vi.mocked(loadStateForScope).mockResolvedValue(emptyState({ lastPull: '2026-04-01', lastPullRev: 'abc1234', lastPullTargets: ['claude'], ...record }));
+
+    await pull({});
+
+    expect(log.success).not.toHaveBeenCalledWith(expect.stringContaining('Already synced'));
+    expect(saveStateForScope).toHaveBeenCalled();
+  });
+
+  // The rest of the selection changes only through commands that clear
+  // lastPullRev; a config edited by hand keeps the fast path, as before.
+  it('still skips when only the recorded projects differ from the config', async () => {
+    vi.mocked(getHeadRev).mockResolvedValue('abc1234');
+    const record = await homeRecord(homeDir, ['claude'], { claude: [path.join(homeDir, '.claude', 'skills')] });
+    const [entry] = Object.values(record.lastPullByWorkspace!);
+    entry.selection = { scope: 'user', primaryRole: 'hai', additionalRoles: [], projects: ['svc-a'] };
+    vi.mocked(loadStateForScope).mockResolvedValue(emptyState({ lastPull: '2026-04-01', lastPullRev: 'abc1234', lastPullTargets: ['claude'], ...record }));
+
+    await pull({});
+
+    expect(log.success).toHaveBeenCalledWith(expect.stringContaining('Already synced at abc1234, skipping'));
   });
 
   it('should do full sync when HEAD rev differs from lastPullRev', async () => {
@@ -583,6 +623,7 @@ describe('pull skip-sync when repo HEAD unchanged', () => {
       lastPull: '2026-04-01',
       lastPullRev: 'abc1234',
       lastPullTargets: ['claude'],
+      ...await homeRecord(homeDir, ['claude'], { claude: [path.join(homeDir, '.claude', 'skills')] }),
       lastPush: null,
       pushedRules: [],
       pushedSkills: [],
@@ -679,6 +720,13 @@ describe('pull skip-sync refreshes CLAUDE.md recall block (CLI upgrade)', () => 
       lastPull: '2026-04-01',
       lastPullRev: 'abc1234', // matches HEAD → triggers "Already synced" fast-path
       lastPullTargets: ['claude'],
+      ...await homeRecord(
+        homeDir,
+        ['claude'],
+        { claude: [path.join(homeDir, '.claude', 'skills')] },
+        { claude: [path.join(homeDir, '.claude', 'agents')] },
+        { claude: [path.join(homeDir, '.claude', 'CLAUDE.md')] },
+      ),
       lastPush: null,
       pushedRules: [],
       pushedSkills: [],
@@ -731,6 +779,17 @@ describe('pull skip-sync refreshes CLAUDE.md recall block (CLI upgrade)', () => 
     expect(after).toContain('# CLAUDE.md');
   });
 
+  it('removes the recall block when TEAMAI_RECALL_DISABLED=1 overrides recallEnabled: true (#1457)', async () => {
+    vi.stubEnv('TEAMAI_RECALL_DISABLED', '1');
+
+    await pull({});
+
+    const after = await fse.readFile(claudeMdPath, 'utf8');
+    expect(after).not.toContain(TEAMAI_RECALL_RULES_START);
+    expect(after).toContain('# CLAUDE.md');
+    expect(await fse.pathExists(path.join(homeDir, '.claude', 'agents', 'teamai-recall.md'))).toBe(false);
+  });
+
   it('refreshes Copilot recall instructions under a custom COPILOT_HOME', async () => {
     const copilotHome = path.join(tmpDir, 'copilot-home');
     const copilotInstructions = path.join(copilotHome, 'copilot-instructions.md');
@@ -769,6 +828,32 @@ describe('pull skip-sync refreshes CLAUDE.md recall block (CLI upgrade)', () => 
     expect(updated).toContain(compileRecallRulesBlock());
   });
 });
+
+/** The record a pull of this CLI leaves for HOME after delivering skills, rules, instruction blocks and agents at abc1234. Pass Claude's instruction-block file when `claudemd` is configured. Otherwise that resource is empty except for Copilot. */
+async function homeRecord(
+  home: string,
+  targets: string[],
+  skillDirs: Record<string, string[]>,
+  agentDirs: Record<string, string[]> = {},
+  blocks: Record<string, string[]> = {},
+): Promise<Pick<State, 'lastPullByWorkspace'>> {
+  const rules: Record<string, string[]> = {};
+  const blockPlaces = { ...blocks };
+  for (const [tool, dirs] of Object.entries(skillDirs)) {
+    const toolHome = path.dirname(dirs[0] ?? home);
+    if (tool === 'copilot') {
+      rules[tool] = [path.join(toolHome, 'instructions')];
+      blockPlaces[tool] ??= [path.join(toolHome, 'copilot-instructions.md')];
+    } else if (tool === 'claude') {
+      rules[tool] = [path.join(toolHome, 'rules')];
+    }
+  }
+  return {
+    lastPullByWorkspace: {
+      [await checkoutKey(home)]: { rev: 'abc1234', targets, places: { skills: skillDirs, rules, blocks: blockPlaces, agents: agentDirs } },
+    },
+  };
+}
 
 function emptyState(overrides: Partial<State> = {}): State {
   return {
@@ -1016,6 +1101,7 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
       lastPull: '2026-04-01',
       lastPullRev: 'abc1234',
       lastPullTargets: ['copilot'],
+      ...await homeRecord(homeDir, ['copilot'], { copilot: [path.join(copilotHome, 'skills')] }, { copilot: [path.join(copilotHome, 'agents')] }),
     }));
 
     await pull({ silent: true });
@@ -1082,6 +1168,7 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
     vi.mocked(loadStateForScope).mockResolvedValue(emptyState({
       lastPullRev: 'abc1234',
       lastPullTargets: ['copilot'],
+      ...await homeRecord(homeDir, ['copilot'], { copilot: [path.join(homeDir, '.copilot', 'skills')] }, { copilot: [path.join(homeDir, '.copilot', 'agents')] }),
     }));
 
     await pull({ silent: true });
@@ -1231,6 +1318,7 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
       lastPull: '2026-04-01',
       lastPullRev: 'abc1234',
       lastPullTargets: ['workbuddy'],
+      ...await homeRecord(homeDir, ['workbuddy'], { workbuddy: [path.join(homeDir, '.workbuddy', 'skills')] }),
     }));
 
     await pull({});

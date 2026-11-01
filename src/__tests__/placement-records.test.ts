@@ -15,7 +15,7 @@ vi.mock('../utils/git.js', async () => ({
 import { execFileSync } from 'node:child_process';
 
 import { reconcilePlacementRecords, isPlacement } from '../utils/pending-push.js';
-import type { PendingPush, ResourceItem } from '../types.js';
+import type { PendingPush, ResourceItem, State } from '../types.js';
 
 /**
  * A placement record says "the author's root copy of <name> IS the team file
@@ -52,12 +52,87 @@ describe('reconcilePlacementRecords', () => {
     return run(['hash-object', rel]);
   };
 
+  it('clears retired agent history when the team re-adds a shared root source', async () => {
+    await land('agents/sample.yaml', 'name: sample\ninstructions: Re-added.\n');
+    const state = { placedRules: {}, placedAgents: {}, pendingPushes: [], retiredPlacedAgents: { sample: 'agents/ops/sample.md' } };
+    await reconcilePlacementRecords(repoPath, state);
+    expect(state.retiredPlacedAgents).toEqual({});
+  });
+
   it('records a placement once the blob it pushed is on the default branch', async () => {
     const blob = await land('rules/fe/my-rule.md', 'x');
     const state = { placedRules: {}, placedAgents: {}, pendingPushes: [pending([{ ...placedRule(), blob }])] };
 
     expect(await reconcilePlacementRecords(repoPath, state)).toBe(true);
     expect(state.placedRules).toEqual({ 'my-rule': 'rules/fe/my-rule.md' });
+  });
+
+  it('keeps the proven agent blob and removes it when the placed file is deleted', async () => {
+    const rel = 'agents/ops/sample.md';
+    const blob = await land(rel, 'Instructions');
+    const state: Pick<State, 'placedAgents' | 'placedAgentSources' | 'retiredPlacedAgents' | 'pendingPushes'> = {
+      pendingPushes: [pending([{ type: 'agents', name: 'sample', relativePath: rel, placed: true, blob }])],
+    };
+    await reconcilePlacementRecords(repoPath, state);
+    expect(state.placedAgentSources).toEqual({ sample: { path: rel, blob } });
+    await fse.remove(path.join(repoPath, rel));
+    await reconcilePlacementRecords(repoPath, state);
+    expect(state.placedAgentSources).toEqual({});
+    expect(state.retiredPlacedAgents).toEqual({ sample: rel });
+  });
+
+  it('records a repo-backed placement by the path the author still edits', async () => {
+    // docs, wiki, prompts and the other repo-backed types have no placedRules /
+    // placedAgents field: the record is keyed by the shared-root path the author
+    // keeps editing, so a self-mode scan can compare it with the destination.
+    const blob = await land('docs/ops/guide.md', 'x');
+    const state = {
+      placedRules: {}, placedAgents: {}, placements: {} as NonNullable<State['placements']>,
+      pendingPushes: [pending([{
+        type: 'docs',
+        name: 'guide.md',
+        relativePath: 'docs/ops/guide.md',
+        namespace: 'ops',
+        sourcePath: 'docs/guide.md',
+        placed: true,
+        blob,
+      }])],
+    };
+
+    expect(await reconcilePlacementRecords(repoPath, state)).toBe(true);
+    expect(state.placements).toEqual({ 'docs:docs/guide.md': { path: 'docs/ops/guide.md', blob } });
+    expect(state.pendingPushes[0]?.items[0]?.placed).toBe(false);
+  });
+
+  it('drops a repo-backed record whose destination was deleted since the last check', async () => {
+    // A removal that merged, then another member's file at the same path: the
+    // record must not route this author's edits onto that file.
+    const run = (args: string[]) => execFileSync('git', args, { cwd: repoPath, encoding: 'utf8', env: {
+      ...process.env, GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@t',
+    } }).trim();
+    const commit = (message: string): string => {
+      run(['add', '-A']);
+      run(['commit', '-q', '-m', message]);
+      return run(['rev-parse', 'HEAD']);
+    };
+    run(['init', '-q', '-b', 'main']);
+    await fse.outputFile(path.join(repoPath, 'docs/ops/guide.md'), 'ours');
+    const blob = run(['hash-object', 'docs/ops/guide.md']);
+    const checkedAt = commit('landed');
+    await fse.remove(path.join(repoPath, 'docs/ops/guide.md'));
+    commit('removed');
+    await fse.outputFile(path.join(repoPath, 'docs/ops/guide.md'), 'somebody else\'s');
+    commit('recreated');
+
+    const state = {
+      placedRules: {}, placedAgents: {},
+      placements: { 'docs:docs/guide.md': { path: 'docs/ops/guide.md', blob } },
+      placementsCheckedAt: checkedAt,
+      pendingPushes: [],
+    };
+
+    expect(await reconcilePlacementRecords(repoPath, state)).toBe(true);
+    expect(state.placements).toEqual({});
   });
 
   it('spends a placement with no blob instead of recording it because the path exists', async () => {

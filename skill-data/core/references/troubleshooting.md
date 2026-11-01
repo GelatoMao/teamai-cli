@@ -75,7 +75,7 @@ This is the #1 onboarding issue. In order:
    then retry removal.
    If you initialized workspace scope but expected machine-wide resources, re-run
    with `--scope user`.
-5. **Tool has no hook surface** (e.g. Gemini CLI, JoyCode): there is no auto-sync;
+5. **Tool has no hook surface** (e.g. Gemini CLI): there is no auto-sync;
    run `teamai pull` manually each time.
 6. **Claude Code or Codex reads a different directory** (`CLAUDE_CONFIG_DIR` or
    `CODEX_HOME` is set). `teamai doctor` reports `Claude Code root matches
@@ -84,7 +84,10 @@ This is the #1 onboarding issue. In order:
    `teamai init` from a shell that has the variable exported; it records the root
    and moves the install. If the check says the value cannot be synced to (outside
    your home, or neither a plain directory in it nor one under `.config/`), fix the
-   variable first.
+   variable first. `<tool> home matches <variable>` (`XDG_CONFIG_HOME`,
+   `HERMES_HOME`, `COPILOT_HOME`, ...) is the same check for the homes recorded in
+   `~/.teamai/tool-homes.json`, and `<tool> home exists` fails when a recorded home
+   is gone; re-run `teamai init` from the shell with the variable you want.
 6. **A command reports a broken manifest** (`Invalid roles manifest…`,
    `Invalid projects manifest…`, `Invalid manifests…`, or `…manifest … could not
    be read`). `pull` skips that scope on purpose, since syncing without the
@@ -108,10 +111,17 @@ This is the #1 onboarding issue. In order:
    for that project: do it only with their consent.
    `recall` refuses the same way with `Nothing was searched: <file>: <reason>`:
    no team knowledge was searched, so do not report that the team has none.
+8. **`pull` says `<file> is not a tool-homes record (<reason>)`.** The file
+   where teamai records moved tool homes, `~/.teamai/tool-homes.json`, cannot
+   be read, so pull syncs nothing in any scope. Hook-run pulls stop the same
+   way and write the line only to `~/.teamai/debug.log`; `teamai doctor`
+   reports it as `tool homes record is readable`. Fix the entry the reason
+   names (each home must be an absolute directory), or delete the file and
+   re-run `teamai init` from a shell your tools run in.
 
 ## Path names appear in skill usage statistics
 
-Slash-command tracking accepts complete `/skill-name` tokens followed by whitespace or the end of the prompt. Absolute paths such as `/Volumes/External/project` and URL components are not skill invocations. Updating prevents new false counts; already recorded usage remains.
+Slash-command tracking accepts a complete `/skill-name` token at the start of the prompt, followed by whitespace or the end of the prompt, and only for a skill installed for the tool. Absolute paths such as `/Volumes/External/project` and URL components are not skill invocations. Updating prevents new false counts; already recorded usage remains.
 
 ## Submodule checkouts and linked skill directories
 
@@ -150,11 +160,11 @@ Existing hook contents and permissions stay unchanged; read/write errors propaga
 from `init` and `hooks inject`, and Git-started pulls record them. An unreadable
 project config prevents sync and keeps its reason in `~/.teamai/debug.log`.
 
-Hosts that skip checkout hooks need `teamai pull` in the new checkout before the AI
-tool starts. For Codex CLI 0.160.0, use `git worktree add`, run `teamai pull` there, then
-launch `codex exec -C <worktree>`. Its native `codex exec --worktree` path creates
-the checkout without `post-checkout`, so SessionStart sync arrives after startup
-discovery.
+Hosts that skip checkout hooks (Claude Code's `EnterWorktree`, Codex CLI's worktrees) get
+the same delivery from teamai's own session start and tool hooks, in the background, the first
+time they run in a checkout with no delivery record. What the tool reads at startup is read
+before that delivery lands: for Codex CLI 0.160.0, use `git worktree add`, run `teamai pull` there, then
+launch `codex exec -C <worktree>`.
 
 ## "KEY is not set. Run `teamai env set KEY`"
 
@@ -175,6 +185,10 @@ or `teamai pull` finds the value.
 reference to VAR (`--from-env`) and VAR is unset in this environment. Ask the
 user whether to set VAR in their shell or replace the reference with the
 command in the line; do not choose for them.
+
+Muse may omit `type` when saving a stdio server. Pull and removal compare that form separately from the document they write, so a change to one server leaves personal servers and unchanged managed entries as saved.
+
+Muse key reordering alone is not a user edit. Removal uses a content fingerprint for new records; a legacy record needs a matching original rendered hash and value from team Git history. Without that proof it keeps the server and warns. Real command, args, env or header edits remain personal.
 
 ## "Did not write <tool>'s MCP servers to <file>" / `withheld:`
 
@@ -246,6 +260,11 @@ teamai doctor          # flags tools whose hooks are missing
 teamai hooks list      # per-tool status + the settings file it checked
 ```
 
+Under each team hook, `hooks list` prints `runs in:` and `not in:`. A tool in
+`not in:` has no hook on that event (Cursor has no `PreToolUse`; OpenCode, Oh My
+Pi, Pi, OpenClaw, Kiro and Hermes run only `SessionStart`, `UserPromptSubmit`,
+`PreToolUse`, `PostToolUse` and `Stop`), so the hook does not run there.
+
 What you will typically see, and why (this is expected CLI behaviour, **not** a
 broken machine):
 
@@ -255,7 +274,7 @@ broken machine):
 | Codex                 | Installed and trusted     | Codex runs only trusted hooks; teamai trusts the ones it writes through `codex app-server`, and `teamai doctor` names any Codex will not run |
 | Cursor                | Installed                 | Also runs `~/.claude/settings.json`. That copy exits only when `~/.cursor/hooks.json` or the project `.cursor/hooks.json` contains `--tool cursor` |
 | Copilot CLI           | Installed                 | Built-ins use `$COPILOT_HOME/hooks/teamai.json` (default `~/.copilot/hooks/teamai.json`); self mode keeps them in the project. Claude built-ins exit for a valid, enabled version-1 file, global or project, with a `--tool copilot` command; self mode checks only the project directory. A Claude team hook exits only when a valid, enabled project version-1 file delivers the same command to Copilot for the same event and matcher. `COPILOT_CLI` alone does not skip |
-| CodeBuddy / WorkBuddy | Installed                 | Claude-format hooks in their own `settings.json`                    |
+| CodeBuddy / WorkBuddy | Installed                 | Claude-format hooks in their own `settings.json`; none on a WorkBuddy with only `.workbuddy-ai/` (see WorkBuddy below) |
 
 Practical rule: if you set up with `--agent claude`, expect **only** Claude to show
 hooks installed. A tool you are not using, or one that is not a supported hook
@@ -269,15 +288,25 @@ Different AI hosts handle the hooks that TeamAI injects differently. When this
 conversation runs in one of these, proactively walk the user through the extra
 step — do not assume auto-sync just works.
 
+### JoyCode Desktop
+
+Review and trust each TeamAI hook in **Settings > Hooks** before it can run.
+Until the hooks are trusted and enabled, run `teamai pull` at the start of each
+session.
+
+
 ### Codex
 
 Codex runs a non-managed hook only once it is **trusted**. `teamai init`, `pull`
 and `teamai hooks inject` trust the hooks they write (and, in a project, the main
 checkout, or the current worktree when Git cannot locate a main checkout) through `codex app-server`.
 Trust written by a session-start pull applies from the next Codex session. `teamai doctor` names any teamai hook Codex will not
-run. Then: run `teamai pull`; if `codex` is not on PATH or `codexTrustEnabled: false`
+run. Then: run `teamai pull`; if teamai finds no Codex (neither `codex` on PATH nor
+the desktop app's bundled one) or `codexTrustEnabled: false`
 is set in `config.yaml`, guide the user to trust the teamai hooks in Codex `/hooks`,
-then reopen a session. A new linked worktree gets the team hooks from its second
+then reopen a session. When pull or doctor says `Codex builds disagree:`, teamai trusted
+with the newest build and the older one skips the hooks it hashes differently: have the
+user update or remove the older build it names, then run `teamai pull`. A new linked worktree gets the team hooks from its second
 Codex session (the first creates its `.codex/`). Member hooks with the same command
 are preserved and remain untouched by automatic trust. Codex ownership uses the
 recorded event, position and complete entry. A moved entry is recovered only by a
@@ -318,13 +347,21 @@ hook entry; if unsure of the exact config, run `teamai doctor` and `teamai hooks
 to see what should be present, then have them replicate it. Until then, they can
 sync with a manual `teamai pull`.
 
+Skip this on WorkBuddy 5.7+ with only `~/.workbuddy-ai/`. teamai does not know yet
+where 5.7 reads hooks, so it writes none, and `teamai doctor` names them under
+`workbuddy receives ...`. Do not hand-register a hook there; sync with `teamai pull`.
+
 ### Muse Code
 
-Hooks go in the `hooks` block of `~/.config/muse/settings.json`, which Muse runs in every workspace; a project's `.muse/hooks.json` runs only once the workspace is trusted. Muse starts each hook with an emptied environment, so a variable set only on the command that launched `muse` (such as `TEAMAI_HOOKS_DISABLED=1 muse`) does not reach the hook. The hook command runs `bash -lc`, so export it in `~/.bash_profile` or `~/.profile` instead.
+Hooks go in the `hooks` block of `~/.config/muse/settings.json` (`$XDG_CONFIG_HOME/muse/settings.json` when that is set), which Muse runs in every workspace; a project's `.muse/hooks.json` runs only once the workspace is trusted. Muse starts each hook with an emptied environment, so a variable set only on the command that launched `muse` (such as `TEAMAI_HOOKS_DISABLED=1 muse`) does not reach the hook. The hook command runs `bash -lc`, so export it in `~/.bash_profile` or `~/.profile` instead.
+
+### Antigravity
+
+The agy CLI, Antigravity 2.0 and Antigravity IDE read hooks only from `~/.gemini/config/hooks.json`, in every workspace, so teamai's are user-wide: one named hook, `teamai`, beside the member's own. Team hooks with `tools: [agy]` run through it and get the Claude Code payload. When the file is not valid JSON, pull leaves it as it is and warns; fix the JSON, then run `teamai hooks inject`. A hook named `hooks` with `teamai hook-dispatch` commands is what a team's own `toolPaths.agy` wrote before agy was built in; the next pull removes those commands.
 
 ### Tools without a writable hook surface
 
-Gemini CLI, JoyCode, and similar tools have no TeamAI-writable hook surface —
+Gemini CLI and similar tools have no TeamAI-writable hook surface —
 there is no auto-sync. Tell the user to run `teamai pull` manually at the start of
 each session.
 
@@ -334,7 +371,7 @@ A recalled doc is upvoted once per session when the session that ran the recall
 opens it within 24 hours: a file read, a reader command (`cat`, `sed -n`, …), or
 a search whose output shows its lines. Listing the doc does not count, and
 neither does working from the recall subagent's summary alone; only the opt-in
-judge (`TEAMAI_UPVOTE_JUDGE=1`) credits that. `teamai stats` shows each recent
+judge (`TEAMAI_UPVOTE_JUDGE=1`) credits that. For Codex, Muse and ZCode it uses the Stop payload's final reply and this session's settled recall log; a Claude transcript is not required. `teamai stats` shows each recent
 session's runs, recalled docs and adopted docs. Per agent:
 
 - **Claude Code, Codex (0.134+), CodeBuddy (2.103.1+), WorkBuddy, Qoder,
@@ -342,11 +379,13 @@ session's runs, recalled docs and adopted docs. Per agent:
   `teamai-recall` subagent runs are credited when the main agent opens the doc.
   On OMP the subagent's recall needs the main session's file on disk, so a
   `--no-session` run credits only the main agent's own recalls.
-- **Cursor, Copilot CLI, ZCode, Pi**: only a recall the main agent runs
+- **Cursor, Copilot CLI, ZCode, Pi, JoyCode**: only a recall the main agent runs
   itself. A subagent's recall is not linked to the main session, and Pi has no
   TeamAI subagent.
-- **OpenClaw, Hermes, Kiro, JoyCode, Trae**: no PostToolUse hook, so recalls never
+- **OpenClaw, Hermes, Kiro, Trae**: no PostToolUse hook, so recalls never
   vote.
+- **Antigravity**: its PostToolUse carries no tool output, so a recall never
+  reaches the recall log and never votes.
 
 A read after the session's last Stop is credited at SubagentStop, at Copilot CLI's
 SessionEnd, or at the next `teamai pull`.
@@ -355,6 +394,16 @@ Pending votes reach the team repo's `teamai-reports` branch on the next Stop or
 `teamai pull`. A push that fails — offline, no write access, a crashed run —
 keeps the deltas pending; the next session re-sends them, and each delta is
 added to the team totals exactly once.
+
+Index rebuilds (including `teamai pull`) use confirmed team votes plus pending
+local votes, even when reporting is disabled or a push fails. A busy votes lock
+makes that rebuild use confirmed counts only; it does not wait for the lock.
+
+Manual `teamai recall feedback --positive <docId>` adds an upvote without adding
+a recall. Confidence caps the upvote-to-recall ratio at 1: more feedback cannot
+exceed that factor's 30% weight. Recency uses the later of the last recall and
+the last upvote, so a fresh upvote also refreshes recency. This is an activity score,
+not proof of knowledge correctness or task success.
 
 ## OpenCode V2 rejects the hooks plugin
 
@@ -368,6 +417,10 @@ built-in and enterprise plugins support both OpenCode 1.18.23 (`server`) and V2
 
 - Re-run the failing command with `-v` / `--verbose` for detail.
 - `teamai status` shows exactly how local differs from the team repo.
+- If status shows `auto-report: pending since <time>`, report data is still
+  local after an unconfirmed push. Run `teamai pull --verbose` to retry and
+  see the cause. A successful report, or a pull after reporting is disabled,
+  clears the notice. Disabling reporting keeps the local data.
 - Report unexpected behavior at https://github.com/Tencent/teamai-cli/issues
   with the agent name, platform, and the step that failed.
 
@@ -394,7 +447,10 @@ An HTTP prompt sync that cannot clean retired blocks reports a failed ACK and
 keeps its previous cache and manifest for the server's retry.
 OpenClaw HTTP prompts require an existing resolved user workspace, but not an
 existing `AGENTS.md`: the prompt sync creates that file and preserves personal
-text already in it.
+text already in it. When the server sends no workspace and `openclaw.json` is
+not plain JSON, OpenClaw is skipped and the ACK names that reason; the ACK
+fails only when no tool received the prompt. Make the file plain JSON, then
+retry.
 
 OpenCode registration saves ownership before activating a new config entry.
 If the state write fails, repair the state directory's permissions and retry
@@ -402,9 +458,45 @@ If the state write fails, repair the state directory's permissions and retry
 If the config write fails, ownership stays available for retry. Entries the
 member already listed are never claimed.
 
+CodeBuddy CLI and WorkBuddy use compressed project directory names above 255 UTF-8 bytes (a code-point-safe 180-byte prefix plus the native hash). Session listing, reading and migration follow those names; do not rename the native directories manually.
+
 ## GitHub MR/PR import API error
 
 When import falls back from `gh` to the REST API, a failed metadata, commits,
 or diff request stops before AI extraction and names the HTTP status and
 response body. Check PR visibility and authentication for 404/403, the rate
 limit for 429, or retry a temporary server failure. The error page is not a diff.
+
+## Session archive publication is busy or failed
+
+Session archive writers (`session push`, `migrate --push`, and `session pull`) wait up to ten seconds for another publication on the same machine. If busy, retry once it finishes. A failed save removes the new pair or restores the previous pair; a rollback failure names the retained backups. Remote push failures still keep the local commit.
+
+## OpenCode hooks cannot start the CLI
+
+If OpenCode hooks stopped after moving or reinstalling Node or TeamAI, run `teamai hooks inject` or `teamai pull` and restart OpenCode. The plugin records the installed Node and CLI paths so it also works without `teamai` on the service PATH. Doctor accepts those live paths when another installation with the same handler inspects the plugin; invalid saved launcher files or a changed handler still fail the check.
+
+## ZCode registered hooks but missing project rules
+
+Doctor checks the serialized rules reply against the user config `hooks.maxOutputBytes` (default 32768), counting UTF-8 bytes and JSON escaping. Other session hints make the complete stdout larger. Shorten the rules or raise the positive integer byte cap enough for the whole reply, then start a new session; registration alone does not prove the rules fit.
+
+## Pi user instructions with an override file
+
+Pi reads `AGENTS.override.md` before `AGENTS.md` in the same directory. In user scope, pull writes rules and instruction blocks into the existing override and strips only TeamAI blocks from the older configured file. Personal text in both files is preserved, including on uninstall. Without an override, the configured user file remains the target.
+
+## A file blocks skill delivery
+
+When a file occupies a tool skills directory, doctor fails the directory check even if delivery skipped that tool. Move the file aside and run `teamai pull`. Uninstall keeps the blocking file and cleans the other managed resources.
+
+## Kiro default-agent synchronization
+
+Kiro CLI V3 uses the generated user hook `~/.kiro/hooks/teamai.json`, independently of custom agents. Missing or edited hooks appear in doctor; reinject after moving aside a same-named personal file. User uninstall removes the managed file, project uninstall keeps it, and personal hook files remain. Upgrade Kiro 2.x to V3 for this lifecycle integration.
+
+## Placed agent edits and format changes behind the default branch
+
+An edit of the root copy overwrites the agent this machine placed, and a `.md`/`.yaml` conversion may retire it after its merge is proven. If the team changed the placed file since this machine's last merged push, the push stops and prints a `teamai push --carried <path>@<blob>` command: update the checkout, carry its changes into the root copy, then run it. The option accepts only that version, so a plain retry or a later team change stops again. If the team deleted it, the remaining root copy is not a new agent to publish. Older records without a delivered blob catch a team change only while the checkout is behind it, until the first edit pushed through them merges and records its blob. Until then, compare with the team file before editing or converting.
+
+A recreated namespace source can be edited directly; the retired flattened copy is kept as a backup. Retired tool copies do not become new agents when the root copy is removed. The retirement warning names the former source so the member can restore it before pushing edits.
+
+## Hermes hooks after moving Node or TeamAI
+
+The generated status script and instructions plugin capture the installed Node executable and TeamAI entry. After moving or reinstalling either, run `teamai pull` or `teamai hooks inject`, then restart Hermes.

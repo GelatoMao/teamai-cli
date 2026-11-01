@@ -317,7 +317,7 @@ function viewRoot(index: LogIndex, target: string): RootView {
     return docsOpened(e.path, docs).filter((d) => d.eligible);
   };
   const evidence = lines.filter((e): e is EvidenceLine => e.kind === 'evidence' && rootOf(e.session) === target
-    // A read of unknown status (Codex's shell) counts only as a simple read, never as a pipeline's head.
+    // A read of unknown status (Codex's shell) counts only as a simple read, never as a pipeline's head or an item of a list.
     && (e.status === 'success' || (e.status === 'unknown' && e.simple === true)));
   const credited = evidence.filter((e) => consumed.has(e.id)).flatMap(opened);
   const done = new Set(credited.map(creditOf));
@@ -347,12 +347,19 @@ async function creditRoot(config: LocalConfig, index: LogIndex, sessionId: strin
   for (const id of crediting) consumed.add(id);
   try {
     const ts = new Date().toISOString();
-    await appendRecallLines(config, crediting.map((evidence) => ({ kind: 'consumed', ts, evidence })));
+    await appendRecallLines(config, crediting.map((evidenceId) => ({ kind: 'consumed', ts, evidence: evidenceId })));
   } catch (e) {
     // The ledger still holds the credit for its window; past it this evidence could credit again.
     log.debug(`recall adoption: could not mark ${crediting.length} evidence line(s) consumed: ${(e as Error).message}`);
   }
   return { credited, recalled };
+}
+
+/** Eligible docs from this session's settled, linked recall runs, keyed for voting. */
+export async function recalledDocsForSession(config: LocalConfig, sessionId: string): Promise<RecalledDoc[]> {
+  const index = indexLog(await readRecallLog(config));
+  const { runs } = viewRoot(index, index.rootOf(sessionId));
+  return [...new Map(runs.flatMap(r => r.docs.filter(d => d.eligible).map(d => [d.key, d] as const))).values()];
 }
 
 /**

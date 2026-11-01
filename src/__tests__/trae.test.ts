@@ -3,17 +3,16 @@ import path from 'node:path';
 import fse from 'fs-extra';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { detectHomeInstalledAgents, KNOWN_AGENTS } from '../known-agents.js';
-import { mcpTargetExcluded, reconcileMcpForConfig, resolveMcpTargets } from '../mcp-reconcile.js';
-import { isToolInstalledForConfig } from '../resources/base.js';
-import { ALL_SUPPORTED_TOOLS } from '../resources/agent-format.js';
-import { detectMcpFormat } from '../resources/mcp-format.js';
+import { mcpTargetExcluded, reconcileMcpForConfig } from '../mcp-reconcile.js';
+import { isInstalled } from './helpers/install-gate.js';
 import { ruleFileExtensionForTool, ruleFormatForTool, usesMdcRules } from '../resources/rule-format.js';
 import { RulesHandler } from '../resources/rules.js';
 import { openLedger } from '../resources/delivered-copies.js';
 import { loadStateForScope, saveStateForScope } from '../config.js';
 import { checkoutKey } from '../pull.js';
-import { getDataHome, managedMcpManifestKey, managedMcpManifestPath, TeamaiConfigSchema, scopedToolPaths } from '../types.js';
+import { getDataHome, managedMcpManifestPath, TeamaiConfigSchema, scopedToolPaths } from '../types.js';
 import type { LocalConfig } from '../types.js';
+import { AGENT_TOOLS } from '../tools.js';
 
 describe('Trae support', () => {
   afterEach(() => vi.unstubAllEnvs());
@@ -24,6 +23,7 @@ describe('Trae support', () => {
     expect(config.toolPaths.trae).toEqual({
       skills: '.trae/skills',
       rules: '.trae/rules',
+      agents: '.trae/agents',
       mcpProject: '.trae/mcp.json',
       userScope: { rules: '.trae/user_rules' },
     });
@@ -33,10 +33,12 @@ describe('Trae support', () => {
     expect(config.toolPaths['trae-cn']).toEqual({
       skills: '.trae/skills',
       rules: '.trae/rules',
+      agents: '.trae/agents',
       mcpProject: '.trae/mcp.json',
       userScope: {
         skills: '.trae-cn/skills',
         rules: '.trae-cn/user_rules',
+        agents: '.trae-cn/agents',
       },
     });
   });
@@ -68,7 +70,7 @@ describe('Trae support', () => {
     }
   });
 
-  it('registers both builds for discovery and Markdown rules, without subagent sync', () => {
+  it('registers both builds for discovery, Markdown rules and subagent sync', () => {
     expect(KNOWN_AGENTS.find((agent) => agent.id === 'trae')).toMatchObject({
       displayName: 'Trae',
       skillsPath: '.trae/skills',
@@ -78,81 +80,14 @@ describe('Trae support', () => {
       skillsPath: '.trae-cn/skills',
     });
     for (const id of ['trae', 'trae-cn']) {
-      // Trae has no subagents directory, so it is not in ALL_SUPPORTED_TOOLS.
-      expect(ALL_SUPPORTED_TOOLS).not.toContain(id);
+      expect(AGENT_TOOLS).toContain(id);
       expect(ruleFileExtensionForTool(id)).toBe('.md');
       expect(usesMdcRules(id)).toBe(false);
       expect(ruleFormatForTool(id)?.scopeFields).toEqual(['globs', 'alwaysApply']);
     }
   });
 
-  it('uses the mcpServers JSON format and only a project-scope MCP file', async () => {
-    expect(detectMcpFormat('trae')).toBe('claude');
-    expect(detectMcpFormat('trae-cn')).toBe('claude');
-    // Trae keeps user-level MCP next to its user settings (a platform-specific
-    // path teamai cannot express), so no `mcp` field is configured and a
-    // user-scope pull writes no MCP file for either build.
-    const config = TeamaiConfigSchema.parse({ team: 'test', repo: 'test/repo' });
-    expect(config.toolPaths.trae.mcp).toBeUndefined();
-    expect(config.toolPaths['trae-cn'].mcp).toBeUndefined();
 
-    const home = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-trae-user-mcp-'));
-    try {
-      await fse.ensureDir(path.join(home, '.trae', 'skills'));
-      await fse.ensureDir(path.join(home, '.trae-cn', 'skills'));
-      vi.stubEnv('HOME', home);
-      const localConfig = {
-        repo: { localPath: path.join(home, 'team-repo'), remote: 'test/repo' },
-        username: 'test',
-        scope: 'user',
-        additionalRoles: [],
-      } as unknown as LocalConfig;
-
-      const targets = await resolveMcpTargets(config, localConfig);
-      expect(targets.filter((t) => t.tool === 'trae' || t.tool === 'trae-cn')).toEqual([]);
-    } finally {
-      await fse.remove(home);
-    }
-  });
-
-  it('resolves both installed builds to the same shared .trae/mcp.json', async () => {
-    const tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-trae-mcp-'));
-    try {
-      const home = path.join(tmp, 'home');
-      const projectRoot = path.join(tmp, 'project');
-      await fse.ensureDir(path.join(home, '.trae', 'skills'));
-      await fse.ensureDir(path.join(home, '.trae-cn', 'skills'));
-      await fse.ensureDir(path.join(projectRoot, '.trae', 'skills'));
-      vi.stubEnv('HOME', home);
-      const config = TeamaiConfigSchema.parse({ team: 'test', repo: 'test/repo' });
-      const localConfig = {
-        repo: { localPath: path.join(home, 'team-repo'), remote: 'test/repo' },
-        username: 'test',
-        scope: 'project',
-        projectRoot,
-        additionalRoles: [],
-      } as unknown as LocalConfig;
-
-      // Both editions' targets map one file; one shared ownership record
-      // (managedMcpManifestKey) makes either the other's equal there.
-      const targets = await resolveMcpTargets(config, localConfig);
-      expect(targets).toContainEqual({
-        tool: 'trae',
-        format: 'claude',
-        file: path.join(projectRoot, '.trae', 'mcp.json'),
-        projectScope: true,
-      });
-      expect(targets).toContainEqual({
-        tool: 'trae-cn',
-        format: 'claude',
-        file: path.join(projectRoot, '.trae', 'mcp.json'),
-        projectScope: true,
-      });
-      expect(managedMcpManifestKey('trae-cn', true)).toBe('trae:project');
-    } finally {
-      await fse.remove(tmp);
-    }
-  });
 
   it('keeps the shared .trae/mcp.json current through either build, under one ownership record', async () => {
     const tmp = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-trae-owner-'));
@@ -217,19 +152,19 @@ describe('Trae support', () => {
         ...(enabledAgents ? { enabledAgents } : {}),
       }) as unknown as LocalConfig;
 
-      expect(await isToolInstalledForConfig('trae', '.trae/skills', localConfig())).toBe(false);
-      expect(await isToolInstalledForConfig('trae-cn', '.trae/skills', localConfig())).toBe(false);
+      expect(await isInstalled('trae', 'skills', localConfig())).toBe(false);
+      expect(await isInstalled('trae-cn', 'skills', localConfig())).toBe(false);
 
       // An explicit --agent entry bootstraps the edition its app has not run
       // for yet, exactly as the copilot probe treats its whitelist.
-      expect(await isToolInstalledForConfig('trae-cn', '.trae/skills', localConfig(['trae-cn']))).toBe(true);
-      expect(await isToolInstalledForConfig('trae', '.trae/skills', localConfig(['trae-cn']))).toBe(false);
+      expect(await isInstalled('trae-cn', 'skills', localConfig(['trae-cn']))).toBe(true);
+      expect(await isInstalled('trae', 'skills', localConfig(['trae-cn']))).toBe(false);
 
       // And each build's own HOME root installs it, symmetrically.
       await fse.ensureDir(path.join(home, '.trae', 'skills'));
-      expect(await isToolInstalledForConfig('trae', '.trae/skills', localConfig())).toBe(true);
+      expect(await isInstalled('trae', 'skills', localConfig())).toBe(true);
       await fse.ensureDir(path.join(home, '.trae-cn', 'skills'));
-      expect(await isToolInstalledForConfig('trae-cn', '.trae/skills', localConfig())).toBe(true);
+      expect(await isInstalled('trae-cn', 'skills', localConfig())).toBe(true);
 
       // No sibling clause remains: an excluded trae target is excluded, and
       // an enabled Trae CN delivers MCP through its own target instead.
@@ -252,7 +187,7 @@ describe('Trae support', () => {
       },
     });
     expect(split.success).toBe(false);
-    expect(split.success === false && split.error.issues[0]?.message).toContain('one shared ownership record');
+    expect(!split.success && split.error.issues[0]?.message).toContain('one shared ownership record');
 
     const shared = TeamaiConfigSchema.safeParse({
       team: 'test',

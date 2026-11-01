@@ -1,9 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { MUSE_TOOL_ID, TEAMAI_HOOK_DESCRIPTION_PREFIX } from './types.js';
+import { TEAMAI_HOOK_DESCRIPTION_PREFIX } from './types.js';
 import { CODEX_TOOL_IDS, isCodexTool } from './utils/tool-names.js';
-import type { HookDef } from './types.js';
+import type { HookDef, ToolId } from './types.js';
 import { getUserHome } from './utils/home.js';
 import { log } from './utils/logger.js';
 import { bundledShellFor, findGitBashWindows, resetBundledRuntimeCache, resolveCodebuddyNode, resolveWorkbuddyNode } from './bundled-runtime.js';
@@ -33,6 +33,7 @@ import { bundledShellFor, findGitBashWindows, resetBundledRuntimeCache, resolveC
 
 export const TEAMAI_BIN_DIR = '.teamai/bin';
 const WRAPPER_NAME = 'teamai';
+const CODEBUDDY_HOOK_WRAPPER = 'teamai-codebuddy-hook';
 
 /**
  * Tools whose hook commands need a shell to execute at all: their hook runner
@@ -41,7 +42,7 @@ const WRAPPER_NAME = 'teamai';
  * bundled-runtime.ts. Injection is skipped for a tool when no shell resolves,
  * because its hook commands could never run.
  */
-export const SHELL_DEPENDENT_TOOLS = new Set(['workbuddy', 'codebuddy']);
+export const SHELL_DEPENDENT_TOOLS = new Set<string>(['workbuddy', 'codebuddy'] satisfies ToolId[]);
 
 /**
  * Check whether /bin/sh exists.  Remote containers (e.g. CloudStudio AI
@@ -137,6 +138,11 @@ export function ensureTeamaiWrapper(): string | null {
     fs.writeFileSync(wrapperPath, script, { mode: 0o755 });
     if (process.platform === 'win32') {
       fs.writeFileSync(path.join(binDir, `${WRAPPER_NAME}.cmd`), cmdScript);
+      fs.writeFileSync(path.join(binDir, CODEBUDDY_HOOK_WRAPPER), [
+        '#!/bin/sh',
+        `"${nodeBin}" "${entryScript}" "$@"`,
+        '',
+      ].join('\n'), { mode: 0o755 });
     }
     return binDir;
   } catch {
@@ -171,7 +177,10 @@ export function skipToolsWithoutShell(tools: string[]): Set<string> {
       skipped.add(tool);
     }
   }
-  if (withShell) ensureTeamaiWrapper();
+  // Non-login POSIX dispatch must not rely on a project git hook creating this.
+  const nonLoginWrapper = process.platform !== 'win32'
+    && tools.some(tool => tool === 'zcode' || tool === 'dsh') && hasShell();
+  if (withShell || nonLoginWrapper) ensureTeamaiWrapper();
   if (skipped.size > 0) {
     log.warn(
       `Skipping hook injection for ${[...skipped].join(', ')}: no shell is available in this environment to execute hooks. ` +
@@ -239,7 +248,7 @@ const WINDOWS_PWSH_TOOLS = new Set(['dsh']);
 /**
  * True when this tool's hook runner is PowerShell on this platform, so the
  * rendered command must be PowerShell syntax (getPwshDispatchCommand). Kept
- * platform-gated: the same tool's POSIX hosts keep the bash wrapper.
+ * platform-gated: POSIX hosts use their shell and TeamAI's PATH wrapper.
  */
 export function toolUsesPwshShell(tool: string): boolean {
   return process.platform === 'win32' && WINDOWS_PWSH_TOOLS.has(tool);
@@ -249,15 +258,52 @@ export function toolUsesPwshShell(tool: string): boolean {
  * The command of a team-hook dispatcher entry (#915): it runs the team hooks of
  * the project the hook's cwd belongs to. Unlike the built-ins it keeps stderr
  * and the exit status, which carry a team hook's blocking decision (exit 2).
+ * A Codex tool keeps bare `bash` on Windows too: Codex runs its Windows form
+ * from the entry's `commandWindows` (getTeamHookDispatchCommandWindows), and a
+ * machine-specific Git Bash path here would rewrite a committed hooks.json.
  */
 export function getTeamHookDispatchCommand(event: string, tool: string): string {
-  return `${getHookShellCommand()} -lc "teamai hook-dispatch ${event} --tool ${tool} --team-hooks"`;
+  const shell = isCodexTool(tool) ? 'bash' : getHookShellCommand();
+  return `${shell} -lc "teamai hook-dispatch ${event} --tool ${tool} --team-hooks"`;
+}
+
+/**
+ * CodeBuddy's project hooks share one settings entry between two Windows
+ * runners: the IDE starts it with cmd.exe, while the CLI starts it with Git
+ * Bash. Launch the Git-Bash wrapper explicitly, then let hook-dispatch apply
+ * the project gate and preserve the team hook's exit status. The arguments are
+ * base64url strings emitted by codebuddy-team-hooks.ts, so cmd.exe and Bash can
+ * both pass them through without interpreting a project path or shell command.
+ */
+export function getCodebuddyTeamHookDispatchCommand(
+  event: string,
+  id: string,
+  encodedGate: string,
+  encodedCommand: string,
+  timeout?: number,
+): string {
+  const wrapper = path.join(getUserHome(), TEAMAI_BIN_DIR, CODEBUDDY_HOOK_WRAPPER).split(path.sep).join('/');
+  const timeoutArg = timeout === undefined ? '' : ` --team-hook-timeout ${timeout}`;
+  return `${getHookShellCommand()} "${wrapper}" hook-dispatch ${event} --tool codebuddy --team-hooks`
+    + ` --team-hook-id ${id} --team-hook-gate ${encodedGate} --team-hook-command ${encodedCommand}${timeoutArg}`;
+}
+
+/**
+ * The `commandWindows` of a team-hook dispatcher entry: the bare dispatch,
+ * without the POSIX form's bash wrapper. Unlike the built-in fail-open command,
+ * this form contains no shell metacharacters, so it is safe for both Codex's
+ * cmd.exe fallback and an explicitly configured PowerShell shell. Keeping it
+ * bare also preserves the dispatcher's block contract: exit 2 and stderr must
+ * reach the host instead of being swallowed (#1209, #1215).
+ */
+export function getTeamHookDispatchCommandWindows(event: string, tool: string): string {
+  return `teamai hook-dispatch ${event} --tool ${tool} --team-hooks`;
 }
 
 /**
  * Raw dispatch command without a shell wrapper. Used by ZCode, whose hook
  * entries are `process`-typed (an executable plus an argv vector): the writer
- * puts `bash -lc <raw>` into `args` itself, so the wrapper must not be baked
+ * puts `bash -c <raw>` into `args` itself, so the wrapper must not be baked
  * into the command string.
  */
 export function getRawDispatchCommand(event: string, tool: string, matcher?: string): string {
@@ -268,12 +314,18 @@ export function getRawDispatchCommand(event: string, tool: string, matcher?: str
 /**
  * Build a hook command that prepends `$HOME/.teamai/bin` to PATH so the
  * wrapper script is found even without the user's login shell PATH.
- * Used by GUI tools (WorkBuddy, CodeBuddy) that spawn hook subprocesses
+ * Used by GUI tools (WorkBuddy, CodeBuddy) and POSIX DSH that spawn hook subprocesses
  * with a limited environment. The PATH value uses the `$HOME` shell literal
- * so that golden fixture output stays stable across machines.
+ * so that golden fixture output stays stable across machines. On Windows,
+ * CodeBuddy IDE runs commands in cmd.exe while CodeBuddy CLI uses Git Bash;
+ * both can invoke the same explicitly named Git Bash and script.
  */
 function getWrapperDispatchCommand(event: string, tool: string, matcher?: string): string {
   const matcherArg = matcher && matcher !== '*' ? ` --matcher ${matcher}` : '';
+  if (tool === 'codebuddy' && process.platform === 'win32') {
+    const wrapper = path.join(getUserHome(), TEAMAI_BIN_DIR, CODEBUDDY_HOOK_WRAPPER).split(path.sep).join('/');
+    return `${getHookShellCommand()} "${wrapper}" hook-dispatch ${event} --tool ${tool}${matcherArg} || exit 0`;
+  }
   return `PATH="$HOME/${TEAMAI_BIN_DIR}:$PATH" teamai hook-dispatch ${event} --tool ${tool}${matcherArg} 2>/dev/null || true`;
 }
 
@@ -317,7 +369,6 @@ const BUILTIN_HOOK_SPECS: BuiltinHookSpec[] = [
   { key: 'Hook dispatch session-start', event: 'SessionStart', dispatchEvent: 'session-start', matcher: '*', timeoutSec: 15 },
   { key: 'Hook dispatch stop', event: 'Stop', dispatchEvent: 'stop', matcher: '*', timeoutSec: 15 },
   { key: 'Hook dispatch post-tool-use wildcard', event: 'PostToolUse', dispatchEvent: 'post-tool-use', matcher: '*', timeoutSec: 10 },
-  { key: 'Hook dispatch post-tool-use Skill', event: 'PostToolUse', dispatchEvent: 'post-tool-use', matcher: 'Skill', timeoutSec: 10 },
   { key: 'Hook dispatch post-tool-use TodoWrite', event: 'PostToolUse', dispatchEvent: 'post-tool-use', matcher: 'TodoWrite', timeoutSec: 3 },
   { key: 'Hook dispatch prompt-submit', event: 'UserPromptSubmit', dispatchEvent: 'prompt-submit', matcher: '*', timeoutSec: 10 },
 ];
@@ -364,9 +415,9 @@ const SUBAGENT_START_SPEC: BuiltinHookSpec = {
  * to the parent; not ZCode, which has no such event and rejects the whole
  * hooks block on an unknown key.
  */
-const SUBAGENT_STOP_TOOLS = new Set([
+const SUBAGENT_STOP_TOOLS = new Set<string>([
   'claude', 'claude-internal', 'tclaude', ...CODEX_TOOL_IDS, 'codebuddy', 'qoder', 'qoder-cn',
-]);
+] satisfies ToolId[]);
 
 /**
  * Build the built-in hook definitions for a tool.
@@ -378,26 +429,23 @@ const SUBAGENT_STOP_TOOLS = new Set([
  * HookDef into each tool's on-disk shape.
  *
  * GUI tools (WorkBuddy, CodeBuddy) use the wrapper dispatch command so their
- * hook subprocesses can find `teamai` even without the user's full PATH. Both
- * run hook commands through a POSIX shell on every platform — WorkBuddy
- * through the MSYS sh in its bundled PortableGit, CodeBuddy through Git Bash,
- * which it requires on Windows — so the POSIX wrapper form always applies.
+ * hook subprocesses can find `teamai` even without the user's full PATH.
+ * WorkBuddy runs through its bundled MSYS shell. On Windows CodeBuddy's CLI
+ * uses Git Bash but its IDE uses cmd.exe, so its built-ins launch Git Bash
+ * explicitly through a script that keeps the fail-open contract.
  */
 const WRAPPER_TOOLS = SHELL_DEPENDENT_TOOLS;
 
 
-/** What a tool names its Skill tool, where not `Skill`; dispatcher still uses --matcher Skill. Cursor loads skills via Read of SKILL.md (#1156). */
-const SKILL_TOOL_MATCHER: Readonly<Record<string, string>> = { cursor: 'Read', copilot: 'skill', [MUSE_TOOL_ID]: 'read_skill' };
-
 export function builtinHookDefs(tool: string): HookDef[] {
   // ZCode renders per-event timeouts from the ZCODE_TIMEOUT_MS table in its own
   // writer (toZcodeEntry), so def.timeout stays unset for it.
-  const withTimeout = tool === 'cursor' || tool === 'copilot' || tool === 'workbuddy' || tool === 'codebuddy' || isCodexTool(tool);
+  const withTimeout = tool === 'cursor' || tool === 'copilot' || tool === 'workbuddy' || tool === 'codebuddy' || tool === 'joycode' || isCodexTool(tool);
   const buildCommand = tool === 'zcode'
     ? getRawDispatchCommand
     : toolUsesPwshShell(tool)
       ? getPwshDispatchCommand
-      : WRAPPER_TOOLS.has(tool)
+      : WRAPPER_TOOLS.has(tool) || tool === 'dsh'
         ? getWrapperDispatchCommand
         : getDispatchCommand;
   const specs = [
@@ -410,8 +458,9 @@ export function builtinHookDefs(tool: string): HookDef[] {
     source: 'builtin' as const,
     key: spec.key,
     event: spec.event,
-    matcher: spec.matcher === 'Skill' ? SKILL_TOOL_MATCHER[tool] ?? spec.matcher : spec.matcher,
-    command: buildCommand(spec.dispatchEvent, tool, spec.matcher),
+    matcher: spec.matcher,
+    command: (tool === 'zcode' && process.platform !== 'win32' ? `PATH="$HOME/${TEAMAI_BIN_DIR}:$PATH" ` : '')
+      + buildCommand(spec.dispatchEvent, tool, spec.matcher),
     timeout: withTimeout ? spec.timeoutSec : undefined,
     // The team rules reach the Codex family through its start hooks (#938);
     // Codex would otherwise keep only the start and end of a large rule set.
@@ -429,18 +478,26 @@ export function builtinHookDefs(tool: string): HookDef[] {
  * cover a narrower slice, and spawn the dispatcher directly — so the shell
  * wrapper the settings tools carry would misreport what is on disk.
  *
- * A tool in neither place is not listed: JoyCode has no hook surface at all,
- * and Kiro's session-start command is embedded per agent by the agent sync
- * (`renderForKiro`), so it exists only for agents that were actually synced
- * rather than coming from the hook pipeline.
+ * A tool in neither place is not listed: it has no hook surface teamai writes.
  */
 const ADAPTER_BUILTIN_HOOKS: Record<string, { keys: string[]; suffix?: string }> = {
+  kiro: { keys: ['Hook dispatch session-start'] },
+  // agy-hooks.ts maps the same four events as OMP into agy's hooks.json
+  // (SessionStart, PreInvocation, PostToolUse, Stop).
+  agy: {
+    keys: [
+      'Hook dispatch session-start',
+      'Hook dispatch stop',
+      'Hook dispatch post-tool-use wildcard',
+      'Hook dispatch prompt-submit',
+    ],
+  },
   // hermes-hooks.ts registers one on_session_start script whose single line is
   // the dispatch command with errors swallowed (buildReportScript).
   hermes: { keys: ['Hook dispatch session-start'], suffix: ' >/dev/null 2>&1 || true' },
   // omp-hooks.ts subscribes to four OMP extension events and spawns the
-  // dispatcher with argv; `tool_result` carries no matcher, so the Skill /
-  // TodoWrite passes do not exist there.
+  // dispatcher with argv; `tool_result` carries no matcher, so the TodoWrite
+  // pass does not exist there.
   omp: {
     keys: [
       'Hook dispatch session-start',
@@ -449,12 +506,18 @@ const ADAPTER_BUILTIN_HOOKS: Record<string, { keys: string[]; suffix?: string }>
       'Hook dispatch prompt-submit',
     ],
   },
-  // opencode-hooks.ts covers the same four events plus the matcher-scoped
-  // post-tool-use passes (TOOL_MATCHER), i.e. the whole built-in set.
-  opencode: { keys: BUILTIN_HOOK_SPECS.map((spec) => spec.key) },
+  // opencode-hooks.ts maps the same four events as OMP.
+  opencode: {
+    keys: [
+      'Hook dispatch session-start',
+      'Hook dispatch stop',
+      'Hook dispatch post-tool-use wildcard',
+      'Hook dispatch prompt-submit',
+    ],
+  },
   // pi-hooks.ts maps the same four lifecycle events as OMP (session_start,
   // agent_settled, tool_execution_end, before_agent_start); Pi has no
-  // Skill/TodoWrite matcher concept, so post-tool-use is wildcard-only there
+  // TodoWrite matcher concept, so post-tool-use is wildcard-only there
   // too. tool_execution_start only caches the tool input for the later
   // post-tool-use dispatch — it never calls hook-dispatch itself.
   pi: {

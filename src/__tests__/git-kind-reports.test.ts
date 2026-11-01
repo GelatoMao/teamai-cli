@@ -2,8 +2,9 @@
  * Real-git coverage for independent clones writing reports to teamai-reports.
  * No mocks of the units under test.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { simpleGit } from 'simple-git';
@@ -12,12 +13,13 @@ import { getDataHome, getReportsDir, getVotesDir, REPORTS_WORKTREE_DIRNAME, type
 import { commitAndPushReports, ensureReportsWorktree, refreshReportsWorktree, updateReports } from '../utils/reports-branch.js';
 import { isPublished } from '../utils/branch-worktree.js';
 import { pushRepoDirectly } from '../utils/git.js';
-import { reportUsageToTeam } from '../team-push.js';
+import { reportUsage } from '../team-push.js';
 import { dataHomeKey, resolveHookConfig } from '../dashboard-collector.js';
 import { listMembers } from '../members.js';
 import { resolveProjectDataHome, saveLocalConfigForScope } from '../config.js';
 import { buildHandlerRegistry } from '../hook-handlers.js';
 import YAML from 'yaml';
+import { getUserHome } from '../utils/home.js';
 
 let tmp: string;
 let originalHome: string;
@@ -121,7 +123,7 @@ describe('git-kind reports branch', () => {
       `${JSON.stringify({ type: 'session_start', timestamp: ts, sessionId: 's1', tool: 'claude', cwd: '/p', dataHomeKey: key })}\n` +
       `${JSON.stringify({ type: 'stop', timestamp: ts, sessionId: 's1', tool: 'claude', dataHomeKey: key, interventions: { interrupt: 1, toolReject: 0 } })}\n`,
     );
-    await reportUsageToTeam(clone, 'alice', { skipTruncate: true, selfConfig: cfg });
+    await reportUsage(clone, 'alice', { skipTruncate: true, selfConfig: cfg });
 
     const originGit = simpleGit(origin);
     const reportsTree = await originGit.raw(['ls-tree', '-r', '--name-only', 'teamai-reports']);
@@ -136,6 +138,42 @@ describe('git-kind reports branch', () => {
     expect(fs.existsSync(path.join(clone, 'members', 'alice.yaml'))).toBe(false);
     expect(fs.existsSync(path.join(clone, 'stats', 'alice.yaml'))).toBe(false);
   });
+
+  it('pushes an earlier unpushed report commit when the retry has no new files', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+    const wt = await ensureReportsWorktree(cfg);
+    const memberPath = path.join(wt, 'members', 'alice.yaml');
+    fs.mkdirSync(path.dirname(memberPath), { recursive: true });
+    fs.writeFileSync(memberPath, 'username: alice\n');
+
+    const rejectFlag = path.join(origin, 'reject-reports');
+    const hook = path.join(origin, 'hooks', 'pre-receive');
+    fs.writeFileSync(hook, `#!/bin/sh
+if [ -f "$(dirname "$0")/../reject-reports" ]; then
+  echo "reports push rejected" >&2
+  exit 1
+fi
+exit 0
+`);
+    fs.writeFileSync(rejectFlag, '');
+    fs.chmodSync(hook, 0o755);
+
+    expect(await updateReports(cfg, async () => ({
+      files: ['members/alice.yaml'],
+      message: '[teamai] Register member: alice',
+    }))).toMatchObject({ status: 'failed' });
+    const originGit = simpleGit(origin);
+    const reportsTreeBeforeRetry = await originGit.raw(['ls-tree', '-r', '--name-only', 'teamai-reports']);
+    expect(reportsTreeBeforeRetry).not.toContain('members/alice.yaml');
+
+    fs.rmSync(rejectFlag);
+    expect(await updateReports(cfg, async () => ({
+      files: [],
+      message: '[teamai] Register member: alice',
+    }))).toEqual({ status: 'published' });
+    expect(await originGit.raw(['show', 'teamai-reports:members/alice.yaml'])).toBe('username: alice\n');
+  }, 30_000);
 
   it('does not copy or delete leftover default-branch members when writing reports', async () => {
     const { origin, clone } = await seedBareOrigin();
@@ -285,6 +323,32 @@ async function originHasReportsBranch(origin: string): Promise<boolean> {
   const heads = await simpleGit(origin).raw(['for-each-ref', '--format=%(refname:short)', 'refs/heads']);
   return heads.split('\n').includes('teamai-reports');
 }
+
+describe('git-kind reports: commit identity', () => {
+  async function reportsCommitIdentity(origin: string): Promise<string> {
+    return (await simpleGit(origin).raw(['log', '-1', '--format=%an <%ae> / %cn <%ce>', 'teamai-reports'])).trim();
+  }
+
+  it('commits as TeamAI where git can resolve no identity', async () => {
+    const { origin } = await seedBareOrigin();
+    const clone = path.join(tmp, 'ci', 'team-repo');
+    fs.mkdirSync(path.dirname(clone), { recursive: true });
+    await simpleGit().clone(origin, clone);
+    // Stands in for a CI runner with no user.email whose hostname gives git no usable one.
+    await simpleGit(clone).addConfig('user.useConfigOnly', 'true');
+
+    expect(await publish(gitConfig(clone, origin), 'members/alice.yaml', 'username: alice\n')).toBe(true);
+    expect(await reportsCommitIdentity(origin)).toBe('TeamAI <teamai@localhost> / TeamAI <teamai@localhost>');
+  });
+
+  it('keeps the identity the member configured', async () => {
+    const { origin } = await seedBareOrigin();
+    const cfg = await cloneCheckout(origin, 'member');
+
+    expect(await publish(cfg, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+    expect(await reportsCommitIdentity(origin)).toBe('t <t@t.com> / t <t@t.com>');
+  });
+});
 
 describe('git-kind reports: read-only cold start (#558)', () => {
   it('materializes a local reports view without publishing the branch', async () => {
@@ -451,7 +515,7 @@ describe('git-kind reports: refresh before reading (#557)', () => {
 });
 
 describe('git-kind reports: inherited member root (#735)', () => {
-  let consoleSpy: ReturnType<typeof vi.spyOn>;
+  let consoleSpy: MockInstance<typeof console.log>;
 
   beforeEach(() => {
     consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -671,8 +735,12 @@ describe('skill usage stays in the scope that recorded it (#748)', () => {
   }
 
   async function useSkill(cwd: string, skill: string): Promise<void> {
-    const track = buildHandlerRegistry().find((r) => r.handler.name === 'track');
-    if (!track) throw new Error('track handler is not registered');
+    const track = buildHandlerRegistry().find((r) => r.handler.name === 'skill-use');
+    if (!track) throw new Error('skill-use handler is not registered');
+    // Only an installed skill counts (#1221).
+    const skillDir = path.join(getUserHome(), '.claude', 'skills', skill);
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), `# ${skill}\n`);
     // The handler records under the scope the dispatcher resolved for the hook (#810).
     const payload = { session_id: `s-${skill}`, cwd, tool_name: 'Skill', tool_input: { skill } };
     await track.handler.execute(payload, 'claude', await resolveHookConfig(payload, 'claude'));
@@ -690,10 +758,10 @@ describe('skill usage stays in the scope that recorded it (#748)', () => {
     await useSkill(a.root, 'skill-a');
     await useSkill(c.root, 'skill-c');
 
-    await reportUsageToTeam(a.config.repo.localPath, 'alice', { selfConfig: a.config });
+    await reportUsage(a.config.repo.localPath, 'alice', { selfConfig: a.config });
     expect(await reportedSkills(a.origin)).toEqual(['skill-a']);
 
-    await reportUsageToTeam(c.config.repo.localPath, 'alice', { selfConfig: c.config });
+    await reportUsage(c.config.repo.localPath, 'alice', { selfConfig: c.config });
     expect(await reportedSkills(c.origin)).toEqual(['skill-c']);
   });
 });
@@ -704,10 +772,10 @@ describe('skill usage stays in the scope that recorded it (#748)', () => {
  * locks, real worktree — only the hook dispatch around it is left out.
  */
 async function syncLikeTheHandler(cfg: LocalConfig, votesDir: string, votePath: string): Promise<boolean> {
-  const { updateReports, readReportsOriginFile } = await import('../utils/reports-branch.js');
+  const { updateReports: updateReportsForVotes, readReportsOriginFile } = await import('../utils/reports-branch.js');
   const { isDelivered } = await import('../utils/branch-worktree.js');
   const { stageVotesMerge, confirmVotesSynced, readUserVotesFromContent } = await import('../votes.js');
-  const result = await updateReports(cfg, async (wt, { onDelivered }) => {
+  const result = await updateReportsForVotes(cfg, async (wt, { onDelivered }) => {
     const originContent = await readReportsOriginFile(wt, `votes/${cfg.username}.yaml`);
     const staged = await stageVotesMerge(
       wt,
@@ -772,6 +840,55 @@ exit 0
   }, 60_000);
 });
 
+describe('git-kind reports: a retry that finds its content already committed', () => {
+  /** Makes `origin` refuse every push while it holds a `refuse-push` file, and returns that file. */
+  function refusePushes(origin: string): string {
+    const hook = path.join(origin, 'hooks', 'pre-receive');
+    fs.writeFileSync(hook, '#!/bin/sh\nif [ -f "$(dirname "$0")/../refuse-push" ]; then echo "push refused" >&2; exit 1; fi\nexit 0\n');
+    fs.chmodSync(hook, 0o755);
+    const flag = path.join(origin, 'refuse-push');
+    fs.writeFileSync(flag, '');
+    return flag;
+  }
+
+  /** Writes `stats/alice.yaml` unless the worktree already holds it, then names it, or no file when it was there. */
+  async function writeStats(wt: string): Promise<{ files: string[]; message: string }> {
+    const file = path.join(wt, 'stats', 'alice.yaml');
+    const there = fs.existsSync(file);
+    if (!there) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, 'runs: 1\n');
+    }
+    return { files: there ? [] : ['stats/alice.yaml'], message: '[teamai] Update stats' };
+  }
+
+  it('pushes the commit a refused push left behind when the retry writes no file', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+    expect(await publish(cfg, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+    const flag = refusePushes(origin);
+    expect(await updateReports(cfg, writeStats)).toMatchObject({ status: 'failed' });
+    fs.rmSync(flag);
+
+    expect(await updateReports(cfg, writeStats)).toEqual({ status: 'published' });
+    expect(await originReportsFile(origin, 'stats/alice.yaml')).toBe('runs: 1\n');
+  }, 60_000);
+
+  it('pushes nothing for a write that returns null, and leaves the commit for the next writer', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+    expect(await publish(cfg, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+    const flag = refusePushes(origin);
+    expect(await updateReports(cfg, writeStats)).toMatchObject({ status: 'failed' });
+    fs.rmSync(flag);
+
+    expect(await updateReports(cfg, async () => null)).toEqual({ status: 'already-present' });
+    await expect(originReportsFile(origin, 'stats/alice.yaml')).rejects.toThrow();
+    expect(await updateReports(cfg, writeStats)).toEqual({ status: 'published' });
+    expect(await originReportsFile(origin, 'stats/alice.yaml')).toBe('runs: 1\n');
+  }, 60_000);
+});
+
 describe('git-kind reports: a delivered push without its confirmation (#1027)', () => {
   it('recognizes the landed counts on the next sync instead of replaying them', async () => {
     const { origin, clone } = await seedBareOrigin();
@@ -805,4 +922,68 @@ describe('git-kind reports: a delivered push without its confirmation (#1027)', 
     const votes = readUserVotesFromContent(await originReportsFile(origin, 'votes/alice.yaml'));
     expect(votes.votes['doc-a']).toMatchObject({ recalled_count: 1, upvoted_count: 1 });
   }, 60_000);
+});
+
+describe('git-kind reports: a stalled origin', () => {
+  let server: http.Server;
+  let stalledUrl: string;
+
+  beforeEach(async () => {
+    server = http.createServer((_req, res) => {
+      res.write('HTTP/1.1 200 OK\r\n');
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('failed to bind test server');
+    stalledUrl = `http://127.0.0.1:${addr.port}/team.git`;
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('fails the write within the block timeout and releases the reports lock', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+    await ensureReportsWorktree(cfg);
+    await simpleGit(clone).remote(['set-url', 'origin', stalledUrl]);
+    vi.stubEnv('TEAMAI_INIT_PUSH_TIMEOUT_MS', '1000');
+
+    const start = Date.now();
+    const result = await updateReports(cfg, async (wt) => {
+      fs.mkdirSync(path.join(wt, 'stats'), { recursive: true });
+      fs.writeFileSync(path.join(wt, 'stats', 'alice.yaml'), 'sessions: 1\n');
+      return { files: ['stats/alice.yaml'], message: '[teamai] Update stats for alice' };
+    });
+
+    expect(result).toMatchObject({ status: 'failed', reason: expect.stringMatching(/block timeout/) });
+    // One stalled fetch and one stalled push; retrying the push would add a
+    // stalled fetch and push per attempt, 10s or more.
+    expect(Date.now() - start).toBeLessThan(6_000);
+    expect((await updateReports(cfg, async () => null)).status).toBe('already-present');
+  }, 30_000);
+
+  it('drops every connection to the stalled origin once the write fails, so the CLI can exit', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+    await ensureReportsWorktree(cfg);
+    await simpleGit(clone).remote(['set-url', 'origin', stalledUrl]);
+    vi.stubEnv('TEAMAI_INIT_PUSH_TIMEOUT_MS', '1000');
+
+    const result = await updateReports(cfg, async (wt) => {
+      fs.mkdirSync(path.join(wt, 'stats'), { recursive: true });
+      fs.writeFileSync(path.join(wt, 'stats', 'alice.yaml'), 'sessions: 1\n');
+      return { files: ['stats/alice.yaml'], message: '[teamai] Update stats for alice' };
+    });
+
+    expect(result).toMatchObject({ status: 'failed' });
+    const openConnections = () => new Promise<number>((resolve, reject) => {
+      server.getConnections((err, count) => (err ? reject(err) : resolve(count)));
+    });
+    // curl averages the speed over about six seconds, and this origin sent a
+    // body chunk, so its stall limit lands that long after the kill.
+    await vi.waitFor(async () => expect(await openConnections()).toBe(0), { timeout: 20_000, interval: 100 });
+  }, 30_000);
 });

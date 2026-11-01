@@ -4,7 +4,7 @@
  * The team repo always stores rules as tool-neutral `<name>.md`. A tool with
  * a rules format of its own gets a render of it (`RULE_FORMATS`): Cursor and
  * JoyCode `.mdc`, Copilot `.instructions.md`, Kiro steering, Qoder, CodeBuddy
- * (which WorkBuddy shares), Oh My Pi and Trae rules `.md` with their own
+ * (which WorkBuddy shares), Oh My Pi, Trae and Antigravity CLI rules `.md` with their own
  * frontmatter. A tool with no rules format reads the team rules from a block
  * in a file of its own in user scope (`userRulesFile`, instruction-targets.ts),
  * or takes a verbatim `.md` copy.
@@ -15,10 +15,13 @@
  * through it, so a new format never has to be re-discovered call site by call
  * site. Adding one is a render module exporting a `RuleFormat`, whose
  * `previousRenders` names what the tool got before (the team `.md` verbatim,
- * usually), plus one entry below.
+ * usually), one entry in `RULE_FORMATS`, and its id in the tool's descriptor
+ * (`TOOLS[tool].rules`, tools.ts), which says which tools take it.
  */
 
+import { ruleFormatIdOf, runTimeRulesOf } from '../tools.js';
 import type { Scope } from '../types.js';
+import { AGY_RULE_FORMAT } from './agy-rule.js';
 import { CODEBUDDY_RULE_FORMAT } from './codebuddy-rule.js';
 import { COPILOT_INSTRUCTIONS_FORMAT } from './copilot-instructions.js';
 import { CURSOR_MDC_FORMAT } from './cursor-mdc.js';
@@ -51,44 +54,33 @@ export interface RuleFormat {
 }
 
 /**
- * The tools with a rules format of their own. A copy there is a render, so
- * push compares and sends back its body only, and a file teamai did not
- * deliver is the member's own rule in the tool's format, never a new team
- * rule.
+ * The rules formats, by the id a tool's descriptor names (`RulesDir.format` in
+ * tools.ts). A copy in one is a render, so push compares and sends back its
+ * body only, and a file teamai did not deliver is the member's own rule in the
+ * tool's format, never a new team rule.
  */
-const RULE_FORMATS: Readonly<Record<string, RuleFormat>> = {
-  cursor: CURSOR_MDC_FORMAT,
+const RULE_FORMATS = {
+  'cursor-mdc': CURSOR_MDC_FORMAT,
   joycode: JOYCODE_RULE_FORMAT,
-  copilot: COPILOT_INSTRUCTIONS_FORMAT,
-  kiro: KIRO_STEERING_FORMAT,
+  'copilot-instructions': COPILOT_INSTRUCTIONS_FORMAT,
+  'kiro-steering': KIRO_STEERING_FORMAT,
   qoder: QODER_RULE_FORMAT,
-  'qoder-cn': QODER_RULE_FORMAT,
   trae: TRAE_RULE_FORMAT,
-  'trae-cn': TRAE_RULE_FORMAT,
   codebuddy: CODEBUDDY_RULE_FORMAT,
-  // Same engine as CodeBuddy; in a project it reads .codebuddy/rules too.
-  workbuddy: CODEBUDDY_RULE_FORMAT,
   omp: OMP_RULE_FORMAT,
-};
+  agy: AGY_RULE_FORMAT,
+} as const satisfies Readonly<Record<string, RuleFormat>>;
 
-/**
- * The tools with no rules format whose session-start hook adds a project's
- * team rules: the Codex family (#938), ZCode, whose CLI runs only user-level
- * hooks, DeepSeek Harness through teamai's `--patch` (#946), and Muse Code,
- * whose SessionStart hook adds stdout to the model context.
- */
-const SESSION_HOOK_RULE_TOOLS = new Set(['codex', 'codex-internal', 'tcodex', 'zcode', 'dsh', 'muse']);
+export type RuleFormatId = keyof typeof RULE_FORMATS;
 
-/**
- * The tools whose teamai extension adds a project's team rules to each run's
- * system prompt, with the instruction blocks it fetches through
- * `hook-dispatch instructions`: Pi (#946).
- */
-const EXTENSION_RULE_TOOLS = new Set(['pi']);
+export function ruleFormatById(id: RuleFormatId): RuleFormat {
+  return RULE_FORMATS[id];
+}
 
 /** The tool's own rules format; undefined when it takes the team `.md` verbatim. */
 export function ruleFormatForTool(tool: string): RuleFormat | undefined {
-  return Object.hasOwn(RULE_FORMATS, tool) ? RULE_FORMATS[tool] : undefined;
+  const id = ruleFormatIdOf(tool);
+  return id === 'verbatim' ? undefined : RULE_FORMATS[id];
 }
 
 /**
@@ -199,12 +191,12 @@ export function usesCopilotInstructions(tool: string): boolean {
  * DeepSeek Harness, #946; Muse Code). Pull writes no rule file for it.
  */
 export function getsRulesFromSessionHook(tool: string): boolean {
-  return SESSION_HOOK_RULE_TOOLS.has(tool);
+  return runTimeRulesOf(tool) === 'session-hook';
 }
 
 /** True when, in a project, teamai's extension for the tool adds the team rules to its prompt (Pi, #946). */
 export function getsRulesFromExtension(tool: string): boolean {
-  return EXTENSION_RULE_TOOLS.has(tool);
+  return runTimeRulesOf(tool) === 'extension';
 }
 
 /** A managed block pull writes into a tool's instructions file (`claudemd`). */
@@ -316,9 +308,9 @@ export const LEGACY_RULE_DIRS: readonly LegacyRuleDir[] = [
     scopes: ['user'],
     dir: '.pi/agent/rules',
     ext: '.md',
-    why: 'Pi does not read ~/.pi/agent/rules (team rules now reach it through ~/.pi/agent/AGENTS.md)',
+    why: 'Pi does not read the rules folder under its agent directory (~/.pi/agent by default, or PI_CODING_AGENT_DIR when set; team rules now reach AGENTS.override.md when present, otherwise AGENTS.md)',
     toolPathsFix: 'remove `userScope.rules` (and `rules`) from toolPaths.pi',
-    advice: 'Delete what you did not edit; to keep your changes, move them into ~/.pi/agent/AGENTS.md outside the teamai markers, then delete the copy.',
+    advice: 'Delete what you did not edit; to keep your changes, move them into the user AGENTS.override.md when present, otherwise AGENTS.md, outside the teamai markers, then delete the copy.',
   },
   {
     tool: 'pi',

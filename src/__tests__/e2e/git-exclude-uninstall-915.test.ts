@@ -32,7 +32,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { trackDetachedProcesses } from '../helpers/detached-processes.js';
+import { waitForDetachedChildren } from '../helpers/detached-processes.js';
 import { startMockServer, type MockServerHandle } from '../helpers/mock-server.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -51,7 +51,6 @@ const isRoot = process.getuid?.() === 0;
 interface Run { code: number | null; output: string }
 
 let sandbox: string;
-let detached: ReturnType<typeof trackDetachedProcesses>;
 
 const write = (file: string, content: string): void => {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -109,7 +108,6 @@ function member(name: string, files: Record<string, string> = TEAM, sharing = ON
     };
     delete e.CLAUDE_CONFIG_DIR;
     delete e.CODEX_HOME;
-    e.NODE_OPTIONS = [e.NODE_OPTIONS, detached.nodeOptions].filter(Boolean).join(' ');
     return e;
   };
   const run = (command: string, args: string[], cwd: string): Run => {
@@ -156,10 +154,10 @@ function member(name: string, files: Record<string, string> = TEAM, sharing = ON
     },
     worktree: async (repo, dir) => {
       git(['worktree', 'add', '-q', dir, '-b', path.basename(dir)], repo);
-      await detached.waitForExit();
+      await waitForDetachedChildren();
       const real = fs.realpathSync.native(dir);
       teamai(['pull'], real);
-      await detached.waitForExit();
+      await waitForDetachedChildren();
       return real;
     },
   };
@@ -181,7 +179,7 @@ const excludeFileOf = (m: Member, dir: string): string =>
 function blockLines(file: string, owner = 'delivered'): string[] {
   const lines = fs.existsSync(file) ? read(file).split('\n') : [];
   const start = lines.findIndex((line) => line.startsWith(`# [teamai:${owner}:start]`));
-  const end = lines.findIndex((line) => line === `# [teamai:${owner}:end]`);
+  const end = lines.indexOf(`# [teamai:${owner}:end]`);
   return start < 0 || end < start ? [] : lines.slice(start + 1, end);
 }
 
@@ -197,11 +195,10 @@ const partitionDirs = (m: Member): string[] => {
 beforeAll(() => {
   if (!fs.existsSync(CLI)) throw new Error(`CLI binary not found at ${CLI}. Run "npm run build" first.`);
   sandbox = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-git-exclude-uninstall-e2e-')));
-  detached = trackDetachedProcesses(sandbox);
 });
 
 afterAll(async () => {
-  if (detached) await detached.waitForExit();
+  await waitForDetachedChildren();
   if (sandbox) fs.rmSync(sandbox, { recursive: true, force: true });
 }, 65_000);
 
@@ -537,7 +534,6 @@ describe.skipIf(process.platform === 'win32')('uninstall in HTTP mode (#915)', (
     const env: NodeJS.ProcessEnv = {
       ...process.env, ...GIT_ENV, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'),
       GIT_CONFIG_NOSYSTEM: '1', SHELL: '/bin/bash', FORCE_COLOR: '0',
-      NODE_OPTIONS: [process.env.NODE_OPTIONS, detached.nodeOptions].filter(Boolean).join(' '),
     };
     delete env.CLAUDE_CONFIG_DIR;
     delete env.TEAMAI_API_TOKEN;
@@ -557,6 +553,9 @@ describe.skipIf(process.platform === 'win32')('uninstall in HTTP mode (#915)', (
     const app = fs.realpathSync.native(project);
     const initRun = await cli(['init', '--http', server.url, '--token', API_KEY, '--scope', 'project', '--agent', 'claude', '--force'], app);
     expect(initRun.code, initRun.output).toBe(0);
+    // The local agent serves only a workspace enrolled by `teamai bind-project`.
+    const enroll = await cli(['bind-project', '--skip'], app);
+    expect(enroll.code, enroll.output).toBe(0);
 
     const install = (id: number, slug: string) => ({
       id, type: 'install_skill', skill_slug: slug, skill_version: '1.0.0',
@@ -565,7 +564,7 @@ describe.skipIf(process.platform === 'win32')('uninstall in HTTP mode (#915)', (
     server.seedCommands([install(1, 'http-skill'), install(2, 'renamed-slug')] as never);
     const session = await cli(['hook-dispatch', 'session-start', '--tool', 'claude'], app,
       JSON.stringify({ cwd: app, session_id: 'http-session', hook_event_name: 'SessionStart', source: 'startup' }));
-    await detached.waitForExit();
+    await waitForDetachedChildren();
     expect(session.code, session.output).toBe(0);
     const skills = path.join(app, '.claude', 'skills');
     expect(fs.existsSync(path.join(skills, 'http-skill', 'SKILL.md'))).toBe(true);

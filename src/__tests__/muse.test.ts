@@ -1,11 +1,12 @@
 import os from 'node:os';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import fse from 'fs-extra';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { reconcileHooks } from '../hooks.js';
-import { mcpRelocated, reconcileMcpForConfig } from '../mcp-reconcile.js';
+import { loadMcpManifest, mcpRelocated, reconcileMcpForConfig } from '../mcp-reconcile.js';
 import { buildMcpDeliveryChecks, mcpTransportNotes } from '../doctor-delivery.js';
-import { isToolInstalledForConfig } from '../resources/base.js';
+import { isInstalled } from './helpers/install-gate.js';
 import { AgentsHandler } from '../resources/agents.js';
 import { museAgentDrops, renderForTool, type AgentSpec } from '../resources/agent-format.js';
 import matter from 'gray-matter';
@@ -57,14 +58,13 @@ describe('Muse Code hooks', () => {
     }
   });
 
-  // Muse names its skill tool `read_skill`; a `Skill` matcher never fires there.
-  it("runs the skill-usage hook on Muse's read_skill tool", async () => {
+  it("runs the skill-usage hook on Muse's read_skill tool through the wildcard pass", async () => {
     await reconcileHooks(settingsPath, 'muse');
 
     const settings = await fse.readJson(settingsPath) as MuseSettings;
-    const skillGroups = (settings.hooks?.PostToolUse ?? [])
-      .filter((group) => group.hooks.some((handler) => String(handler.command).includes('--matcher Skill')));
-    expect(skillGroups.map((group) => group.matcher)).toEqual(['read_skill']);
+    const groups = settings.hooks?.PostToolUse ?? [];
+    expect(groups.some((group) => group.hooks.some((handler) => String(handler.command).includes('--matcher Skill')))).toBe(false);
+    expect(groups.map((group) => group.matcher)).toEqual([undefined, 'TodoWrite']);
   });
 
   it('keeps the rest of an existing settings.json and its schema_version', async () => {
@@ -140,6 +140,130 @@ describe('Muse Code MCP', () => {
   afterEach(async () => {
     vi.unstubAllEnvs();
     await fse.remove(root);
+  });
+
+  it.each(['add', 'update', 'remove'])('preserves foreign Muse-saved entries when a pull must %s team servers', async (operation) => {
+    await fse.outputJson(settingsPath, { schema_version: 1 });
+    await reconcileMcpForConfig(team, config);
+    const settings = await fse.readJson(settingsPath);
+    const foreign = { command: 'my-server', args: ['--local'], env: { B: 'two', A: 'one' } };
+    settings.mcpServers.personal = foreign;
+    delete settings.mcpServers.local.type;
+    const savedLocal = structuredClone(settings.mcpServers.local);
+    if (operation === 'add') delete settings.mcpServers.remote;
+    if (operation === 'update') {
+      const file = path.join(root, 'repo', 'mcp', 'mcp.yaml');
+      await fse.writeFile(file, (await fse.readFile(file, 'utf8')).replace('command: node', 'command: new-node'));
+    }
+    await fse.writeJson(settingsPath, settings);
+
+    await reconcileMcpForConfig(team, config, { removeAll: operation === 'remove' });
+
+    const after = await fse.readJson(settingsPath);
+    expect(JSON.stringify(after.mcpServers.personal)).toBe(JSON.stringify(foreign));
+    if (operation === 'add') expect(after.mcpServers.local).toEqual(savedLocal);
+    if (operation === 'update') expect(after.mcpServers.local.command).toBe('new-node');
+    if (operation === 'remove') expect(after.mcpServers).not.toHaveProperty('local');
+  });
+
+  it.each(['local', 'remote'])('removes the managed %s server after Muse reorders its object keys', async (name) => {
+    const file = path.join(root, 'repo', 'mcp', 'mcp.yaml');
+    await fse.writeFile(file, (await fse.readFile(file, 'utf8')).replace('env: { MODE: test }', 'env: { MODE: test, EXTRA: value }'));
+    await fse.outputJson(settingsPath, { schema_version: 1 });
+    await reconcileMcpForConfig(team, config);
+    const settings = await fse.readJson(settingsPath);
+    const server = settings.mcpServers[name];
+    if (name === 'local') {
+      delete server.type;
+      server.env = Object.fromEntries(Object.entries(server.env).toReversed());
+    }
+    settings.mcpServers[name] = Object.fromEntries(Object.entries(server).toReversed());
+    await fse.writeJson(settingsPath, settings);
+
+    const context = { localConfig: config, teamConfig: team, toolPaths: team.toolPaths, hookToolPaths: team.toolPaths, baseDir: home };
+    const check = (await buildMcpDeliveryChecks(context)).find(item => item.name === 'MCP servers delivered to muse');
+    expect(await check!.check()).toBe(true);
+    await reconcileMcpForConfig(team, config, { removeAll: true });
+    expect((await fse.readJson(settingsPath)).mcpServers).not.toHaveProperty(name);
+  });
+
+  it.each(['command', 'args', 'env'])('keeps a reordered Muse server with a real %s edit', async (field) => {
+    await fse.outputJson(settingsPath, { schema_version: 1 });
+    await reconcileMcpForConfig(team, config);
+    const settings = await fse.readJson(settingsPath);
+    const server = settings.mcpServers.local;
+    delete server.type;
+    server[field] = field === 'command' ? 'my-node' : field === 'args' ? ['my-server.mjs'] : { MODE: 'personal' };
+    settings.mcpServers.local = Object.fromEntries(Object.entries(server).toReversed());
+    await fse.writeJson(settingsPath, settings);
+
+    await reconcileMcpForConfig(team, config, { removeAll: true });
+    expect((await fse.readJson(settingsPath)).mcpServers.local[field]).toEqual(server[field]);
+  });
+
+  it.each([false, true])('uses the legacy hash to distinguish reordering from a different historical value (edited=%s)', async (edited) => {
+    const repo = path.join(root, 'repo');
+    const git = (...args: string[]) => execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.com', ...args], { cwd: repo });
+    git('init', '-q', '-b', 'main');
+    git('add', '.');
+    git('commit', '-q', '-m', 'original MCP');
+    await fse.outputJson(settingsPath, { schema_version: 1 });
+    await reconcileMcpForConfig(team, config);
+    const { manifestPath, manifest } = await loadMcpManifest(config, true);
+    for (const record of manifest.muse) delete record.valueHash;
+    await fse.writeJson(manifestPath, manifest);
+    const file = path.join(repo, 'mcp', 'mcp.yaml');
+    await fse.writeFile(file, (await fse.readFile(file, 'utf8')).replace('command: node', 'command: different-node'));
+    git('add', '.');
+    git('commit', '-q', '-m', 'new MCP');
+    const settings = await fse.readJson(settingsPath);
+    const server = settings.mcpServers.local;
+    delete server.type;
+    if (edited) server.command = 'different-node';
+    settings.mcpServers.local = Object.fromEntries(Object.entries(server).toReversed());
+    await fse.writeJson(settingsPath, settings);
+
+    await reconcileMcpForConfig(team, config, { removeAll: true });
+    expect((await fse.readJson(settingsPath)).mcpServers.local !== undefined).toBe(edited);
+  });
+
+  it('keeps an unverifiable reordered legacy server when team history is unavailable', async () => {
+    await fse.outputJson(settingsPath, { schema_version: 1 });
+    await reconcileMcpForConfig(team, config);
+    const { manifestPath, manifest } = await loadMcpManifest(config, true);
+    for (const record of manifest.muse) delete record.valueHash;
+    await fse.writeJson(manifestPath, manifest);
+    const settings = await fse.readJson(settingsPath);
+    settings.mcpServers.local = Object.fromEntries(Object.entries(settings.mcpServers.local).toReversed());
+    await fse.writeJson(settingsPath, settings);
+    await reconcileMcpForConfig(team, config, { removeAll: true });
+    expect((await fse.readJson(settingsPath)).mcpServers.local).toEqual(settings.mcpServers.local);
+  });
+
+  it('preserves a member-edited stdio server after Muse omits type', async () => {
+    await fse.outputJson(settingsPath, { schema_version: 1 });
+    await reconcileMcpForConfig(team, config);
+    const settings = await fse.readJson(settingsPath);
+    delete settings.mcpServers.local.type;
+    settings.mcpServers.local.command = 'my-node';
+    await fse.writeJson(settingsPath, settings);
+
+    await reconcileMcpForConfig(team, config, { removeAll: true });
+    expect((await fse.readJson(settingsPath)).mcpServers.local.command).toBe('my-node');
+  });
+
+  it('keeps a stdio server managed after Muse saves it without type', async () => {
+    await fse.outputJson(settingsPath, { schema_version: 1 });
+    await reconcileMcpForConfig(team, config);
+    const settings = await fse.readJson(settingsPath);
+    delete settings.mcpServers.local.type;
+    await fse.writeJson(settingsPath, settings);
+    const context = { localConfig: config, teamConfig: team, toolPaths: team.toolPaths, hookToolPaths: team.toolPaths, baseDir: home };
+    const checks = await buildMcpDeliveryChecks(context);
+    const delivery = checks.find(check => check.name === 'MCP servers delivered to muse');
+    expect(await delivery!.check()).toBe(true);
+    await reconcileMcpForConfig(team, config, { removeAll: true });
+    expect((await fse.readJson(settingsPath)).mcpServers).not.toHaveProperty('local');
   });
 
   it('writes stdio and http servers into settings.json, keeping its schema_version and hooks, and leaves sse out', async () => {
@@ -304,11 +428,11 @@ describe('Muse Code detection', () => {
   it('finds Muse Code in a project scope by ~/.config/muse', async () => {
     await fse.ensureDir(path.join(home, '.config', 'muse'));
 
-    expect(await isToolInstalledForConfig('muse', '.agents/skills', projectConfig())).toBe(true);
+    expect(await isInstalled('muse', 'skills', projectConfig())).toBe(true);
   });
 
   it('does not take a project .agents directory for Muse Code', async () => {
-    expect(await isToolInstalledForConfig('muse', '.agents/skills', projectConfig())).toBe(false);
+    expect(await isInstalled('muse', 'skills', projectConfig())).toBe(false);
   });
 });
 

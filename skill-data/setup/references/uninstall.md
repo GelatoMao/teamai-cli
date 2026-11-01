@@ -88,7 +88,7 @@ and give it your team repo URL."*
 - Uninstall removes the team-rules block from the file a tool with no rules
   format reads in user scope (`~/.codex/AGENTS.md`, `~/.zcode/AGENTS.md`,
   `$DSH_HOME/AGENTS.md`, the OpenClaw workspace `AGENTS.md`,
-  `~/.pi/agent/AGENTS.md`, `~/.joycode/rules.txt`, `~/.config/muse/AGENTS.md`), and the file when teamai
+  `$PI_CODING_AGENT_DIR/AGENTS.override.md` when set and present, otherwise `$PI_CODING_AGENT_DIR/AGENTS.md` (or the same paths under `~/.pi/agent` when unset), `$JOYCODE_HOME/rules.txt` when set, otherwise `~/.joycode/rules.txt`, `${XDG_CONFIG_HOME:-~/.config}/muse/AGENTS.md`), and the file when teamai
   created it for the block alone.
 - Uninstall cleans legacy Codex rule copies at the recorded `toolRoots`
   location, including publishers' bare local filenames, and the copies earlier
@@ -112,13 +112,14 @@ and give it your team repo URL."*
   and retry the same uninstall command. Uninstall reports failure and keeps
   its ownership record and shared data directory, even for the last tool.
 - Project uninstall keeps the global Pi and Oh My Pi extensions, Hermes
-  plugin and config, OpenCode's user plugin, and the Codex family's
-  user-level hooks, which the user
+  plugin and config, OpenCode's user plugin, Antigravity's `teamai` hook in
+  `~/.gemini/config/hooks.json`, and the Codex family's user-level hooks, which the user
   scope, the HTTP agent or another project may use, and names them. If none
   does, run `teamai hooks remove` in the project first: it removes them.
   Targeted project Codex uninstall keeps project config and records its
   exclusion, even without local resources. Legacy project hook copies go.
-  User-scope uninstall removes these global channels.
+  User-scope uninstall removes these global channels, the Hermes and Oh My
+  Pi ones from every home and profile teamai wrote.
   The retained adapters respect project exclusions, including cached HTTP
   prompt injection and HTTP sync. An excluded tool does not download its
   resources again on the next session start.

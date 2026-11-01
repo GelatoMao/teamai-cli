@@ -70,4 +70,62 @@ describe('computeConfidence', () => {
       expect(score).toBeLessThanOrEqual(1);
     }
   });
+
+  it('caps the ratio when manual feedback exceeds recall count', () => {
+    const score = computeConfidence({
+      recalledCount: 1,
+      upvotedCount: 5,
+      lastRecalledAt: new Date().toISOString(),
+    });
+
+    expect(score).toBe(1);
+  });
+
+  it('keeps feedback without any recalls within the base and ratio weights', () => {
+    const score = computeConfidence({
+      recalledCount: 0,
+      upvotedCount: 5,
+      lastRecalledAt: '',
+    });
+
+    expect(score).toBe(0.7);
+  });
+
+  it('does not let excess feedback replace the expired recency weight', () => {
+    const score = computeConfidence({
+      recalledCount: 1,
+      upvotedCount: 5,
+      lastRecalledAt: new Date(Date.now() - 200 * 24 * 60 * 60 * 1000).toISOString(),
+    });
+
+    expect(score).toBe(0.7);
+  });
+
+  // #1278: a recent upvote with no recall must not be treated as 180 days stale.
+  it('uses lastUpvotedAt for recency when there is no recall (#1278)', () => {
+    const now = new Date().toISOString();
+    const score = computeConfidence({
+      recalledCount: 0,
+      upvotedCount: 1,
+      lastRecalledAt: '',
+      lastUpvotedAt: now,
+    });
+    // base = 0.3, recency = 1.0, ratio = 1.0
+    // confidence = 0.3*0.4 + 1.0*0.3 + 1.0*0.3 = 0.72
+    expect(score).toBe(0.72);
+  });
+
+  it('takes recency from the later of recall and upvote timestamps (#1278)', () => {
+    const oldRecall = new Date(Date.now() - 200 * 24 * 60 * 60 * 1000).toISOString();
+    const recentUpvote = new Date().toISOString();
+    const score = computeConfidence({
+      recalledCount: 1,
+      upvotedCount: 1,
+      lastRecalledAt: oldRecall,
+      lastUpvotedAt: recentUpvote,
+    });
+    // base = 0.4, recency ≈ 1.0 (from upvote), ratio = 1.0
+    // confidence = 0.4*0.4 + 1.0*0.3 + 1.0*0.3 = 0.76
+    expect(score).toBe(0.76);
+  });
 });

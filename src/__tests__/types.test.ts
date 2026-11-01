@@ -8,7 +8,10 @@ import {
   getInterventionSharing,
   StateSchema,
   LocalConfigSchema,
+  MemberSettingsSchema,
+  LOCAL_CONFIG_INSTALL_KEYS,
   resolveLegacyProjectHookScope,
+  DEFAULT_TOOL_PATHS,
 } from '../types.js';
 import type { LocalConfig } from '../types.js';
 
@@ -80,6 +83,20 @@ describe('LocalConfigSchema', () => {
   });
 });
 
+describe('LocalConfigSchema key ownership', () => {
+  it('keeps install and member settings declarations exhaustive and disjoint', () => {
+    const localKeys = Object.keys(LocalConfigSchema.shape).filter((key) => key !== 'scope')
+      .concat('scope');
+    const memberKeys = Object.keys(MemberSettingsSchema.shape);
+    const installKeys = [...LOCAL_CONFIG_INSTALL_KEYS];
+
+    expect(new Set(installKeys).size).toBe(installKeys.length);
+    expect(new Set(memberKeys).size).toBe(memberKeys.length);
+    expect(installKeys.filter((key) => memberKeys.includes(key))).toEqual([]);
+    expect([...installKeys, ...memberKeys].sort()).toEqual(localKeys.sort());
+  });
+});
+
 describe('TeamaiConfigSchema', () => {
   it.each(['github', 'tgit', 'cnb', 'git'] as const)(
     'accepts the %s provider',
@@ -147,6 +164,64 @@ describe('TeamaiConfigSchema', () => {
     });
   });
 
+  it('should export DEFAULT_TOOL_PATHS matching default parse', () => {
+    const result = TeamaiConfigSchema.parse({
+      team: 'test-team',
+      repo: 'https://git.woa.com/test/repo.git',
+    });
+    expect(result.toolPaths).toEqual(DEFAULT_TOOL_PATHS);
+    expect(DEFAULT_TOOL_PATHS.codebuddy.mcpProject).toBe('.mcp.json');
+    expect(DEFAULT_TOOL_PATHS.claude.mcpProject).toBe('.mcp.json');
+  });
+
+  it('merges custom toolPaths over defaults tool by tool (#1185)', () => {
+    // When a team config provides custom toolPaths for one tool,
+    // that tool is overridden while other built-in tools retain their defaults
+    const result = TeamaiConfigSchema.parse({
+      team: 'test-team',
+      repo: 'https://git.woa.com/test/repo.git',
+      toolPaths: {
+        codebuddy: {
+          skills: '.codebuddy/skills',
+          rules: '.codebuddy/rules',
+          mcpProject: '.mcp.json',
+        },
+      },
+    });
+
+    // The specified tool has the declared paths
+    expect(result.toolPaths.codebuddy).toEqual({
+      skills: '.codebuddy/skills',
+      rules: '.codebuddy/rules',
+      mcpProject: '.mcp.json',
+    });
+
+    // Other built-in tools remain intact with their default paths
+    expect(result.toolPaths.claude).toEqual(DEFAULT_TOOL_PATHS.claude);
+    expect(result.toolPaths.cursor).toEqual(DEFAULT_TOOL_PATHS.cursor);
+    expect(result.toolPaths.codex).toEqual(DEFAULT_TOOL_PATHS.codex);
+    expect(result.toolPaths.trae).toEqual(DEFAULT_TOOL_PATHS.trae);
+  });
+
+  it('retains default toolPaths when custom tool adds a third-party agent', () => {
+    const result = TeamaiConfigSchema.parse({
+      team: 'test-team',
+      repo: 'https://git.woa.com/test/repo.git',
+      toolPaths: {
+        'custom-agent': {
+          skills: '.custom/skills',
+          rules: '.custom/rules',
+        },
+      },
+    });
+
+    expect(result.toolPaths['custom-agent']).toEqual({
+      skills: '.custom/skills',
+      rules: '.custom/rules',
+    });
+    expect(result.toolPaths.codebuddy).toEqual(DEFAULT_TOOL_PATHS.codebuddy);
+    expect(result.toolPaths.claude).toEqual(DEFAULT_TOOL_PATHS.claude);
+  });
 });
 
 describe('TeamaiConfigSchema reviewers', () => {

@@ -21,12 +21,12 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { AgentAdapter, type SessionMeta, type SessionReadRef } from './base.js';
-import type { Session, Message, ContentBlock } from '../ir.js';
+import { z } from 'zod';
+import { AgentAdapter, type SessionMeta, type SessionReadRef, type Subagent, type SubagentsRead } from './base.js';
+import type { Session, Message, ContentBlock, ImageBlock } from '../ir.js';
 import { assertSafeSessionFileId, deriveTargetSessionId } from '../ids.js';
 import { imagePlaceholderText } from '../ir.js';
 import {
-  getClaudeCodeProjectsDir,
   encodeCwdClaude,
   bestEffortDecodeCwdClaude,
   decodeCwdClaude,
@@ -39,6 +39,7 @@ import {
   removeDirRecursive,
   mayReadLocalImageFile,
 } from '../fs.js';
+import { sessionStoreDir } from '../../locate.js';
 import {
   cleanTitleText,
   fallbackTitle,
@@ -152,7 +153,11 @@ function toCcTimestamp(isoStr: string | undefined): string {
 // Content-block parsing (CC → IR)
 // ---------------------------------------------------------------------------
 
-function parseCcContentBlocks(content: unknown): ContentBlock[] {
+/**
+ * Images returned inside a tool_result (e.g. Read on a screenshot) have no slot in the IR tool_result;
+ * they go to `toolResultImages` so the caller can place them after the tool-result message.
+ */
+function parseCcContentBlocks(content: unknown, toolResultImages: ImageBlock[] = []): ContentBlock[] {
   const blocks: ContentBlock[] = [];
 
   if (typeof content === 'string') {
@@ -189,6 +194,9 @@ function parseCcContentBlocks(content: unknown): ContentBlock[] {
         for (const part of rawContent) {
           if (part && typeof part === 'object' && (part as Record<string, unknown>).type === 'text') {
             parts.push(String((part as Record<string, unknown>).text ?? ''));
+          } else if (part && typeof part === 'object' && (part as Record<string, unknown>).type === 'image') {
+            const image = parseCcImage(part as Record<string, unknown>);
+            if (image) toolResultImages.push(image);
           } else if (typeof part === 'string') {
             parts.push(part);
           }
@@ -204,24 +212,31 @@ function parseCcContentBlocks(content: unknown): ContentBlock[] {
         isError: Boolean(b.is_error ?? false),
       });
     } else if (btype === 'image') {
-      // Screenshot pasted into the input box: Anthropic format is
-      // {type:'image', source:{type:'base64', media_type, data}} (also {type:'url', url}).
+      // Screenshot pasted into the input box.
       // If it is not parsed, the image never enters the IR or the target, yet fidelity still reports 100% (silent undercount).
-      const src = b.source as Record<string, unknown> | undefined;
-      const data = typeof src?.data === 'string' ? src.data : undefined;
-      const url = typeof b.url === 'string' ? b.url : (typeof src?.url === 'string' ? src.url : undefined);
-      if (!data && !url) continue;
-      blocks.push({
-        type: 'image',
-        mimeType: String(src?.media_type ?? 'image/png'),
-        // Carry base64 as-is; a URL-only form keeps just the pointer (the write side degrades by target capability)
-        ...(data ? { data } : {}),
-        ...(url ? { filePath: url } : {}),
-        label: guessImageLabel(String(src?.media_type ?? 'image/png')),
-      });
+      const image = parseCcImage(b);
+      if (image) blocks.push(image);
     }
   }
   return blocks;
+}
+
+/**
+ * Anthropic image format: {type:'image', source:{type:'base64', media_type, data}} (also {type:'url', url}).
+ */
+function parseCcImage(b: Record<string, unknown>): ImageBlock | undefined {
+  const src = b.source as Record<string, unknown> | undefined;
+  const data = typeof src?.data === 'string' ? src.data : undefined;
+  const url = typeof b.url === 'string' ? b.url : (typeof src?.url === 'string' ? src.url : undefined);
+  if (!data && !url) return undefined;
+  return {
+    type: 'image',
+    mimeType: String(src?.media_type ?? 'image/png'),
+    // Carry base64 as-is; a URL-only form keeps just the pointer (the write side degrades by target capability)
+    ...(data ? { data } : {}),
+    ...(url ? { filePath: url } : {}),
+    label: guessImageLabel(String(src?.media_type ?? 'image/png')),
+  };
 }
 
 /** Inline images have no filename; derive a readable placeholder from the mime type (used when writing back or degrading to a placeholder). */
@@ -281,6 +296,24 @@ function irBlockToCc(block: ContentBlock, session?: Session): Record<string, unk
   }
 }
 
+const SubagentMetaSchema = z.object({
+  toolUseId: z.string().optional(),
+  spawnDepth: z.number().int().positive().optional(),
+  finished: z.boolean().optional(),
+});
+
+function readJsonFile(file: string): unknown {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf-8')) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function toolCallIds(session: Session): string[] {
+  return session.messages.flatMap((message) => message.content.flatMap((block) => (block.type === 'tool_call' ? [block.callId] : [])));
+}
+
 // ---------------------------------------------------------------------------
 // ClaudeCodeAdapter
 // ---------------------------------------------------------------------------
@@ -296,15 +329,7 @@ export class ClaudeCodeAdapter extends AgentAdapter {
   constructor(platform = 'claude-code', storageRoot?: string) {
     super();
     this.platform = platform;
-    this.storageRoot = storageRoot ?? getClaudeCodeProjectsDir();
-  }
-
-  static isAvailable(): boolean {
-    return dirExists(getClaudeCodeProjectsDir());
-  }
-
-  static getDefaultStoragePath(): string {
-    return getClaudeCodeProjectsDir();
+    this.storageRoot = storageRoot ?? sessionStoreDir('claude-code', undefined);
   }
 
   isReady(): boolean {
@@ -444,6 +469,44 @@ export class ClaudeCodeAdapter extends AgentAdapter {
         `Claude Code session file not found: session_id=${ref.sessionId}, project_path=${ref.projectPath ?? 'undefined'}`,
       );
     }
+    return this.readTranscript(jsonlPath, 'main');
+  }
+
+  /**
+   * The agents a session started: `<session id>/subagents/agent-<id>.jsonl` beside its transcript, each with a
+   * `.meta.json` naming the tool call that started it (`toolUseId`). Each agent follows the session or agent whose
+   * call started it, in call order; one whose call is not found goes last.
+   */
+  async readSubagents(session: Session, ref: SessionReadRef): Promise<SubagentsRead> {
+    const jsonlPath = ref.filePath ?? this.findSessionFile(session.sessionId, ref.projectPath);
+    if (!jsonlPath) return { status: 'unread', reason: `The transcript of session ${session.sessionId} was not found again` };
+    const dir = path.join(path.dirname(jsonlPath), path.basename(jsonlPath, '.jsonl'), 'subagents');
+    if (!dirExists(dir)) return { status: 'read', agents: [] };
+    const read = fs.readdirSync(dir).filter((name) => /^agent-.+\.jsonl$/.test(name)).sort().map((name) => {
+      const meta = SubagentMetaSchema.safeParse(readJsonFile(path.join(dir, name.replace(/\.jsonl$/, '.meta.json'))));
+      const agent = this.readTranscript(path.join(dir, name), 'subagent');
+      return { agent, meta: meta.success ? meta.data : {} };
+    });
+    const ordered: Subagent[] = [];
+    const placed = new Set<number>();
+    const visit = (parent: Session, depth: number): void => {
+      for (const callId of toolCallIds(parent)) {
+        read.forEach((item, index) => {
+          if (placed.has(index) || item.meta.toolUseId !== callId) return;
+          placed.add(index);
+          ordered.push({ session: item.agent, depth: item.meta.spawnDepth ?? depth, finished: item.meta.finished === true });
+          visit(item.agent, depth + 1);
+        });
+      }
+    };
+    visit(session, 1);
+    read.forEach((item, index) => {
+      if (!placed.has(index)) ordered.push({ session: item.agent, depth: item.meta.spawnDepth ?? 1, finished: item.meta.finished === true });
+    });
+    return { status: 'read', agents: ordered };
+  }
+
+  private readTranscript(jsonlPath: string, chain: 'main' | 'subagent'): Session {
     // The file name is the id: a listed file decides it, not the request.
     const sessionId = path.basename(jsonlPath, '.jsonl');
 
@@ -479,7 +542,7 @@ export class ClaudeCodeAdapter extends AgentAdapter {
     const sessionCwd = nativeCwd ?? bestEffortDecodeCwdClaude(cwd) ?? cwd;
 
     // Flatten the DAG
-    const messages = this.flattenDag(rawRecords);
+    const messages = this.flattenDag(rawRecords, chain);
 
     // Extract the title: prefer the summary title line (written on disk, and also used by CC /resume),
     // then unwrapped user text (mixed messages with an injection header plus a real question can still be unwrapped), and finally fall back to the id prefix.
@@ -541,9 +604,8 @@ export class ClaudeCodeAdapter extends AgentAdapter {
    * Note: the parentUuid chain may pass through skipped line types (attachment/file-history-snapshot and similar),
    * which breaks the chain. Orphan nodes whose parentUuid points at a missing record are treated as roots.
    */
-  private flattenDag(rawRecords: Record<string, unknown>[]): Message[] {
-    // Filter out sidechains
-    const mainChain = rawRecords.filter((r) => !r.isSidechain);
+  private flattenDag(rawRecords: Record<string, unknown>[], chain: 'main' | 'subagent'): Message[] {
+    const mainChain = rawRecords.filter((r) => Boolean(r.isSidechain) === (chain === 'subagent'));
 
     // uuid → record (main-chain records only)
     const uuidToRecord = new Map<string, Record<string, unknown>>();
@@ -572,7 +634,7 @@ export class ClaudeCodeAdapter extends AgentAdapter {
     // Depth-first over the main chain, so each root's chain stays in one piece
     const ordered: Record<string, unknown>[] = [];
     const visited = new Set<string>();
-    const stack: Record<string, unknown>[] = [...roots].reverse();
+    const stack: Record<string, unknown>[] = roots.toReversed();
 
     while (stack.length > 0) {
       const record = stack.pop()!;
@@ -581,20 +643,34 @@ export class ClaudeCodeAdapter extends AgentAdapter {
       if (uid) visited.add(uid);
       ordered.push(record);
       if (uid) {
-        stack.push(...[...(childrenMap.get(uid) ?? [])].reverse());
+        stack.push(...(childrenMap.get(uid) ?? []).toReversed());
       }
     }
 
     // Convert to IR Message
     const messages: Message[] = [];
+    // Images returned by tools go in a user message of their own after the round's tool results
+    // (Claude Code writes each parallel tool_result as its own record)
+    let toolImages: ImageBlock[] = [];
+    const flushToolImages = (timestamp?: string) => {
+      if (toolImages.length === 0) return;
+      messages.push({ role: 'user', content: toolImages, timestamp });
+      toolImages = [];
+    };
     for (const record of ordered) {
-      const msg = this.recordToMessage(record);
-      if (msg) messages.push(msg);
+      const images: ImageBlock[] = [];
+      const msg = this.recordToMessage(record, images);
+      if (!msg) continue;
+      const toolResultsOnly = msg.role === 'user' && msg.content.length > 0 && msg.content.every((b) => b.type === 'tool_result');
+      if (!toolResultsOnly) flushToolImages(messages[messages.length - 1]?.timestamp);
+      messages.push(msg);
+      toolImages.push(...images);
     }
+    flushToolImages(messages[messages.length - 1]?.timestamp);
     return messages;
   }
 
-  private recordToMessage(record: Record<string, unknown>): Message | null {
+  private recordToMessage(record: Record<string, unknown>, toolResultImages?: ImageBlock[]): Message | null {
     const rtype = record.type as string;
     if (rtype !== 'user' && rtype !== 'assistant') return null;
 
@@ -602,7 +678,7 @@ export class ClaudeCodeAdapter extends AgentAdapter {
     if (!msgObj || typeof msgObj !== 'object') return null;
 
     const content = msgObj.content;
-    const blocks = parseCcContentBlocks(content);
+    const blocks = parseCcContentBlocks(content, toolResultImages);
 
     const timestamp = parseCcTimestamp(record.timestamp as string);
     const messageId = record.uuid as string | undefined;

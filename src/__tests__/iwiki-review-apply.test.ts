@@ -15,21 +15,23 @@ import fs from 'fs-extra';
 
 // ─── Mocks ──────────────────────────────────────────────
 
-vi.mock('../utils/ai-client.js', () => ({
-    callClaude: vi.fn(),
+vi.mock('../tool-launch/call.js', () => ({
+    callTool: vi.fn(),
 }));
 
 vi.mock('../utils/iwiki-client.js', () => ({
-    IWikiClient: vi.fn().mockImplementation(() => ({
-        fetchAllPages: vi.fn().mockResolvedValue([
-            { docid: '456', title: 'Test Wiki Page' },
-        ]),
-        getDocument: vi.fn().mockResolvedValue({
-            docid: '456',
-            title: 'Test Wiki Page',
-            content: '这是测试内容，包含业务接口和外部知识',
-        }),
-    })),
+    IWikiClient: vi.fn().mockImplementation(function () {
+        return {
+            fetchAllPages: vi.fn().mockResolvedValue([
+                { docid: '456', title: 'Test Wiki Page' },
+            ]),
+            getDocument: vi.fn().mockResolvedValue({
+                docid: '456',
+                title: 'Test Wiki Page',
+                content: '这是测试内容，包含业务接口和外部知识',
+            }),
+        };
+    }),
 }));
 
 vi.mock('../utils/prompt.js', () => ({
@@ -42,7 +44,7 @@ vi.mock('../utils/prompt.js', () => ({
 import { importFromIWikiDual } from '../iwiki-dual.js';
 import { reviewCmd } from '../review-cmd.js';
 import { loadPendingReview } from '../review-store.js';
-import { callClaude } from '../utils/ai-client.js';
+import { callTool } from '../tool-launch/call.js';
 
 // ─── 常量 ────────────────────────────────────────────────
 
@@ -92,7 +94,7 @@ describe('iwiki review apply 闭环 e2e', () => {
         originalCwd = process.cwd();
         process.chdir(cwd);
         vi.clearAllMocks();
-        (callClaude as ReturnType<typeof vi.fn>).mockResolvedValue(AI_OUTPUT);
+        (callTool as ReturnType<typeof vi.fn>).mockResolvedValue({ text: AI_OUTPUT, tool: 'claude' });
     });
 
     afterEach(async () => {

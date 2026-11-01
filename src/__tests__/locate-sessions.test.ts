@@ -1,0 +1,96 @@
+import path from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { installOf, locate, sessionStoreDir } from '../locate.js';
+import type { Host } from '../tool-home.js';
+import { describeLocateMatrix, type FilesRow, type OtherRow } from './helpers/locate-matrix.js';
+
+const CODEBUDDY_SOURCE = '@tencent-ai/codebuddy-code 2.176.0 dist/codebuddy.js: resolveCliHomeDir() is CODEBUDDY_CONFIG_DIR, else ~/.codebuddy; getHomeProjectsDir() joins "projects", "all project transcripts (.jsonl)"';
+const OPENCODE_SOURCE = 'opencode v2.1.2 binary, Global.Path: data = (XDG_DATA_HOME || ~/.local/share)/opencode';
+const PI_SOURCE = 'Pi 1.4.0: v3 JSONL under PI_CODING_AGENT_SESSION_DIR, else the resolved agent home/sessions';
+const OMP_SOURCE = 'Oh My Pi 18.12.6: Pi v3 JSONL under PI_CODING_AGENT_SESSION_DIR, else the resolved profile agent home/sessions';
+const IGNORED_ROOT = 'toolRoots takes claude, codex, cursor-data and cursor-config only (RELOCATABLE_TOOLS): an entry for an internal build is ignored for its store as for its other files';
+
+const store = (tool: string, at: `~/${string}` | `/${string}`, rest: Omit<Partial<FilesRow>, 'tool' | 'writes' | 'reads'> = {}): FilesRow => ({
+  tool, scope: 'user', existingDirs: [], installed: null, gates: 'none',
+  writes: [at], reads: [{ at, when: 'always' }],
+  source: 'issue #1221 matrix, Sessions column',
+  ...rest,
+});
+
+const ROWS: readonly (FilesRow | OtherRow)[] = [
+  store('claude', '~/.claude/projects'),
+  store('claude', '~/.claude-work/projects', { toolRoots: { claude: '~/.claude-work' }, source: 'CLAUDE_CONFIG_DIR recorded by teamai init (RELOCATABLE_TOOLS)' }),
+  store('claude', '~/.claude-work/projects', { scope: 'project', userToolRoots: { claude: '~/.claude-work' }, source: 'a project config that records no toolRoots follows the user config (resolveMemberToolRoots)' }),
+  store('claude-internal', '~/.claude-internal/projects'),
+  store('claude-internal', '~/.claude-internal/projects', { toolRoots: { 'claude-internal': '~/.ci-work' }, source: IGNORED_ROOT }),
+  store('tclaude', '~/.tclaude/projects'),
+  store('codex', '~/.codex/sessions'),
+  store('codex', '~/.codex-work/sessions', { toolRoots: { codex: '~/.codex-work' }, source: 'CODEX_HOME recorded by teamai init (RELOCATABLE_TOOLS)' }),
+  store('codex-internal', '~/.codex-internal/sessions', { toolRoots: { 'codex-internal': '~/.cx-work' }, source: IGNORED_ROOT }),
+  store('tcodex', '~/.tcodex/sessions'),
+  store('cursor', '~/.cursor/projects'),
+  store('cursor', '~/.cursor-data/projects', { toolRoots: { 'cursor-data': '~/.cursor-data' }, source: 'cursor-agent 2026.09.28: transcripts under CURSOR_DATA_DIR (RELOCATABLE_TOOLS)' }),
+  store('cursor', '~/.cursor/projects', { toolRoots: { 'cursor-config': '~/.cursor-config' }, source: 'CURSOR_CONFIG_DIR moves cli-config.json only (RELOCATABLE_TOOLS)' }),
+  store('codebuddy', '~/.codebuddy/projects', { source: CODEBUDDY_SOURCE }),
+  store('codebuddy', '/cb/projects', { env: { CODEBUDDY_CONFIG_DIR: '/cb' }, source: CODEBUDDY_SOURCE }),
+  store('codebuddy', '/cb/projects', { scope: 'project', env: { CODEBUDDY_CONFIG_DIR: '/cb' }, source: `${CODEBUDDY_SOURCE}; a project's sessions go to the same store` }),
+  store('codebuddy', '/cb/projects', { toolRoots: { codebuddy: '~/.cb-work' }, env: { CODEBUDDY_CONFIG_DIR: '/cb' }, source: `${IGNORED_ROOT}, so the moved home still holds it` }),
+  store('codebuddy', '/recorded/codebuddy/projects', { toolHomes: { codebuddy: '/recorded/codebuddy' }, source: `${CODEBUDDY_SOURCE}; a recorded home wins over a shell without the variable` }),
+  store('qoder', '~/.qoder/projects'),
+  store('qoder', '/qoder/projects', { env: { QODER_CONFIG_DIR: '/qoder' }, source: 'Qoder CLI 1.1.78: QODER_CONFIG_DIR moves ~/.qoder' }),
+  store('qoder', '/qoder-cli/.qoder/projects', { env: { QODER_CLI_HOME: '/qoder-cli' }, source: 'Qoder CLI 1.1.78: QODER_CLI_HOME supplies the parent of .qoder' }),
+  store('qoder', '/qoder/projects', { scope: 'project', env: { QODER_CONFIG_DIR: '/qoder' }, source: 'Qoder CLI 1.1.78: project sessions use the user-view store' }),
+  store('qoder', '/qoder-cli/.qoder/projects', { scope: 'project', env: { QODER_CLI_HOME: '/qoder-cli' }, source: 'Qoder CLI 1.1.78: project sessions use the user-view store under QODER_CLI_HOME/.qoder' }),
+  store('qoder-cn', '~/.qoder-cn/projects'),
+  store('qoder-cn', '/qodercn/projects', { env: { QODERCN_CONFIG_DIR: '/qodercn' }, source: 'Qoder CN: QODERCN_CONFIG_DIR moves ~/.qoder-cn' }),
+  store('qoder-cn', '/qodercn-cli/.qoder-cn/projects', { env: { QODERCN_CLI_HOME: '/qodercn-cli' }, source: 'Qoder CN: QODERCN_CLI_HOME supplies the parent of .qoder-cn' }),
+  store('qoder-cn', '/qodercn/projects', { scope: 'project', env: { QODERCN_CONFIG_DIR: '/qodercn' }, source: 'Qoder CN: project sessions use the user-view store' }),
+  store('qoder-cn', '/qodercn-cli/.qoder-cn/projects', { scope: 'project', env: { QODERCN_CLI_HOME: '/qodercn-cli' }, source: 'Qoder CN: project sessions use the user-view store under QODERCN_CLI_HOME/.qoder-cn' }),
+  store('workbuddy', '~/.workbuddy/projects', { source: 'WorkBuddy: <uuid>.jsonl and <uuid>.meta.json under ~/.workbuddy/projects (session-flow/adapters/workbuddy.ts)' }),
+  store('opencode', '~/.local/share/opencode', { source: OPENCODE_SOURCE }),
+  store('opencode', '/data/opencode', { env: { XDG_DATA_HOME: '/data' }, source: OPENCODE_SOURCE }),
+  store('opencode', '~/.local/share/opencode', { env: { XDG_CONFIG_HOME: '/xdg' }, source: `${OPENCODE_SOURCE}: the config home does not move the data directory` }),
+  { tool: 'copilot', scope: 'user', channel: 'none', existingDirs: [], installed: null, gates: 'none', source: 'issue #1221 matrix: Copilot keeps sessions teamai reads none of (+s)' },
+  store('pi', '~/.pi/agent/sessions', { source: PI_SOURCE }),
+  store('pi', '/pi-agent/sessions', { env: { PI_CODING_AGENT_DIR: '/pi-agent' }, source: PI_SOURCE }),
+  store('pi', '/pi-agent/sessions', { scope: 'project', env: { PI_CODING_AGENT_DIR: '/pi-agent' }, source: `${PI_SOURCE}; project sessions use the user-view store` }),
+  store('pi', '/pi-sessions', { env: { PI_CODING_AGENT_SESSION_DIR: '/pi-sessions' }, source: PI_SOURCE }),
+  store('pi', '/pi-sessions', { scope: 'project', env: { PI_CODING_AGENT_SESSION_DIR: '/pi-sessions' }, source: `${PI_SOURCE}; project sessions use the user-view store` }),
+  store('pi', '~/pi-settings-sessions', { texts: [{ at: '~/.pi/agent/settings.json', text: '{"sessionDir":"~/pi-settings-sessions"}' }], source: `${PI_SOURCE}; sessionDir in settings.json follows the same path expansion` }),
+  store('pi', '~/pi-settings-sessions', { scope: 'project', texts: [{ at: '~/.pi/agent/settings.json', text: '{"sessionDir":"~/pi-settings-sessions"}' }], source: `${PI_SOURCE}; project sessions use the user-view setting` }),
+  store('omp', '~/.omp/agent/sessions', { source: OMP_SOURCE }),
+  store('omp', '~/.omp/profiles/work/agent/sessions', { envLiterals: { OMP_PROFILE: 'work' }, source: OMP_SOURCE }),
+  store('omp', '~/.omp/profiles/work/agent/sessions', { scope: 'project', envLiterals: { OMP_PROFILE: 'work' }, source: `${OMP_SOURCE}; project sessions use the user-view store` }),
+  store('omp', '~/.omp-alt/profiles/work/agent/sessions', { envLiterals: { PI_CONFIG_DIR: '.omp-alt', PI_PROFILE: 'work' }, source: OMP_SOURCE }),
+  store('omp', '~/.omp-alt/profiles/work/agent/sessions', { scope: 'project', envLiterals: { PI_CONFIG_DIR: '.omp-alt', PI_PROFILE: 'work' }, source: `${OMP_SOURCE}; project sessions use the user-view store` }),
+  store('omp', '/omp-sessions', { env: { PI_CODING_AGENT_SESSION_DIR: '/omp-sessions' }, source: OMP_SOURCE }),
+  store('omp', '/omp-sessions', { scope: 'project', env: { PI_CODING_AGENT_SESSION_DIR: '/omp-sessions' }, source: `${OMP_SOURCE}; project sessions use the user-view store` }),
+  store('joycode', '~/.joycode/sessions', { source: 'JoyCode: rollout JSONL under ~/.joycode/sessions (session-flow/adapters/codex.ts)' }),
+  store('joycode', '/joycode/sessions', { env: { JOYCODE_HOME: '/joycode' }, source: 'JoyCode Desktop: JOYCODE_HOME moves the rollout store' }),
+  store('joycode', '/joycode/sessions', { scope: 'project', env: { JOYCODE_HOME: '/joycode' }, source: 'JoyCode Desktop: project sessions use the user-view store under JOYCODE_HOME' }),
+  { tool: 'my-tool', scope: 'user', channel: 'unknown', existingDirs: [], installed: null, gates: 'none', source: 'a custom tool id has no descriptor' },
+];
+
+describeLocateMatrix('sessions', ROWS);
+
+describe('a session store on Windows when HOME is not the profile home', () => {
+  const host: Host = {
+    platform: 'win32', path: path.win32, home: 'D:\\member', profileHome: 'C:\\Users\\member', env: {}, toolHomes: { kind: 'missing' },
+    cwd: () => 'D:\\repo', exists: async () => false, readJson: async () => ({ kind: 'missing' }),
+    realpath: async (file) => file, readText: async () => null, existsNow: () => false, readTextNow: () => null, userToolRoots: async () => undefined,
+  };
+  const at = (toolRoots: Record<string, string>) => installOf({ toolPaths: {} }, { scope: 'user', repo: {}, toolRoots });
+
+  it('puts the default store under the profile home, where the tool writes it, and agrees with the adapters', async () => {
+    const located = await locate('cursor', 'sessions', at({}), host);
+
+    expect(located.channel === 'files' && located.own?.path).toBe('C:\\Users\\member\\.cursor\\projects');
+    expect(sessionStoreDir('cursor', {}, host)).toBe('C:\\Users\\member\\.cursor\\projects');
+  });
+
+  it('keeps a recorded root, which teamai init accepted under HOME', async () => {
+    const located = await locate('cursor', 'sessions', at({ 'cursor-data': 'D:\\member\\.cursor-data' }), host);
+
+    expect(located.channel === 'files' && located.own?.path).toBe('D:\\member\\.cursor-data\\projects');
+  });
+});

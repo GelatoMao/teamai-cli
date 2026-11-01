@@ -1,21 +1,27 @@
 import type http from 'node:http';
-import { dashboardWorkspaces, workspaceEvents, type DashboardWorkspace } from './dashboard/workspaces.js';
+import { dashboardWorkspaces, ownSessionEvents, workspaceEvents, type DashboardWorkspace } from './dashboard/workspaces.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { log } from './utils/logger.js';
 import { ensureDir } from './utils/fs.js';
-import { readEvents, rebuildSessions, appendEvent } from './dashboard-collector.js';
+import { dataHomeKey, readEvents, readLocalRequestRecords, readSessionOutcomes, rebuildSessions, appendEvent, memberEvents, sessionRuns } from './dashboard-collector.js';
 import { isProcessAlive } from './pid-monitor.js';
 import {
   DASHBOARD_DEFAULT_PORT,
   DASHBOARD_PID_CHECK_INTERVAL_MS,
   type DashboardEvent,
+  getDataHome,
+  type LocalConfig,
+  type RunModeSplit,
 } from './types.js';
 import { getDashboardHtml } from './dashboard-html.js';
 import { getUserHome } from './utils/home.js';
 import type { VizSummary } from './viz.js';
 import { aggregateDailySessions, computeDailyStatsDelta, summarizeTrendWindow, summarizeSessionCosts } from './session-trends.js';
 import { HttpError, isLocalWrite, readJsonBody } from './dashboard/http.js';
+import { SessionOutcomes } from './session-outcomes.js';
+import { summarizeTokenCosts } from './dashboard/token-costs.js';
+import type { ReportedHistory } from './dashboard/workflow-runs.js';
 
 // ─── Dashboard server architecture ──────────────────────
 //
@@ -84,13 +90,13 @@ export async function startDashboard(port?: number): Promise<void> {
   const pushSessions = async () => {
     pushedStamp = await eventsStamp();
     try {
-      const events = await readEvents(eventsPath);
+      const [events, outcomes] = await Promise.all([readEvents(eventsPath), readSessionOutcomes(eventsPath)]);
       const workspaces = await getWorkspaces(events);
-      const sessions = rebuildSessions(events);
+      const sessions = rebuildSessions(events, outcomes);
       const data = JSON.stringify(sessions);
       for (const client of clients) {
         const workspace = workspaces.find(w => w.id === clientScopes.get(client));
-        client.write(`data: ${workspace ? JSON.stringify(rebuildSessions(workspaceEvents(events, workspace, workspaces))) : data}\n\n`);
+        client.write(`data: ${workspace ? JSON.stringify(rebuildSessions(workspaceEvents(events, workspace, workspaces), outcomes)) : data}\n\n`);
       }
     } catch (e) {
       log.debug(`dashboard: SSE push error: ${(e as Error).message}`);
@@ -133,6 +139,7 @@ export async function startDashboard(port?: number): Promise<void> {
     try {
       const events = await readEvents(eventsPath);
       const sessions = rebuildSessions(events);
+      const runs = sessionRuns(events);
 
       for (const session of sessions) {
         // Only check non-stopped sessions with a monitorPid
@@ -150,7 +157,9 @@ export async function startDashboard(port?: number): Promise<void> {
             // The session's own data home, so its scope's report still sees it end.
             dataHomeKey: events.find((e) => e.sessionId === session.sessionId && e.dataHomeKey)?.dataHomeKey,
             // And its repo, which the cwd may no longer lead to (a removed worktree).
-            projectAnchor: [...events].reverse().find((e) => e.sessionId === session.sessionId && e.projectAnchor)?.projectAnchor,
+            projectAnchor: events.toReversed().find((e) => e.sessionId === session.sessionId && e.projectAnchor)?.projectAnchor,
+            // And its mode and who launched it, so a step's exit stays out of the member's sessions.
+            ...runs.get(session.sessionId),
           };
           await appendEvent(exitEvent);
           log.info(
@@ -181,9 +190,9 @@ export async function startDashboard(port?: number): Promise<void> {
       res.end(JSON.stringify(body));
     };
     const route = pathname.slice('/api/distribution'.length);
-    const writeRoutes = ['/preview', '/roles', '/projects'];
-    if (route === '' ? req.method !== 'GET' : !writeRoutes.includes(route) || req.method !== 'POST') {
-      json(route === '' || writeRoutes.includes(route) ? 405 : 404, { error: 'Not supported.' });
+    const writeRoutes = new Set(['/preview', '/roles', '/projects']);
+    if (route === '' ? req.method !== 'GET' : !writeRoutes.has(route) || req.method !== 'POST') {
+      json(route === '' || writeRoutes.has(route) ? 405 : 404, { error: 'Not supported.' });
       return;
     }
     const distribution = await import('./dashboard/distribution.js');
@@ -218,6 +227,113 @@ export async function startDashboard(port?: number): Promise<void> {
       }
       log.debug(`dashboard: ${pathname} failed: ${(e as Error).message}`);
       json(500, { error: 'Failed to update distribution.' });
+    }
+  };
+
+  // Workflow Runs (#1088). The team history refreshes the reports checkout
+  // from origin, so it is cached like the KB report; local runs are read fresh.
+  const loadReportedHistory = async (config: LocalConfig): Promise<ReportedHistory> => {
+    try {
+      const { listHandoffs, listReportedRuns } = await import('./dashboard/workflow-runs.js');
+      // listReportedRuns refreshes the reports checkout the hand-offs are read from.
+      const runs = await listReportedRuns(config);
+      return { state: 'ok', runs, handoffs: await listHandoffs(config) };
+    } catch (e) {
+      log.debug(`dashboard: reported workflow runs failed: ${e instanceof Error ? e.message : String(e)}`);
+      return { state: 'unavailable' };
+    }
+  };
+  const reportedCaches = new Map<string, { ts: number; last: Promise<ReportedHistory>; refreshing: boolean }>();
+  // The last history answers while a refresh fetches, so a slow or unreachable origin holds the live local runs only
+  // on the first load.
+  const reportedHistory = (key: string, config: LocalConfig): Promise<ReportedHistory> => {
+    const cached = reportedCaches.get(key);
+    if (cached && (cached.refreshing || Date.now() - cached.ts <= KB_SUMMARY_TTL_MS)) return cached.last;
+    const refresh = loadReportedHistory(config);
+    const entry = { ts: Date.now(), last: cached?.last ?? refresh, refreshing: true };
+    reportedCaches.set(key, entry);
+    void refresh.then((data) => Object.assign(entry, { ts: Date.now(), last: Promise.resolve(data), refreshing: false }));
+    return entry.last;
+  };
+  const handleWorkflows = async (req: http.IncomingMessage, res: http.ServerResponse, url: URL, workspace: DashboardWorkspace | undefined) => {
+    const config = workspace?.config ?? null;
+    const json = (status: number, body: unknown) => {
+      res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(body));
+    };
+    const route = url.pathname.slice('/api/workflows'.length);
+    const method = route === '/respond' ? 'POST' : 'GET';
+    if (!['', '/run', '/respond'].includes(route)) {
+      json(404, { error: 'Not supported.' });
+      return;
+    }
+    if (req.method !== method) {
+      json(405, { error: 'Not supported.' });
+      return;
+    }
+    const runs = await import('./dashboard/workflow-runs.js');
+    try {
+      if (route === '') {
+        json(200, workspace?.config
+          ? { configured: true, local: await runs.listLocalRuns(workspace.config), reported: await reportedHistory(workspace.id, workspace.config) }
+          : { configured: false });
+        return;
+      }
+      if (!config) throw new HttpError(400, 'Select a workspace with a teamai config.');
+      if (route === '/run') {
+        const source = url.searchParams.get('source') === 'reported' ? 'reported' : 'local';
+        const detail = await runs.workflowRunDetail(config, source, url.searchParams.get('id') ?? '');
+        if (detail) json(200, detail);
+        else json(404, { error: 'This run is not in the selected workspace.' });
+        return;
+      }
+      // A browser sends Origin with every fetch POST, so a request without one
+      // did not come from the dashboard page. Like the TTY channel, this is a
+      // convention, not protection against a local process that sets it.
+      if (req.headers.origin === undefined) throw new HttpError(403, 'Answer HITL requests from the dashboard page.');
+      json(200, await runs.answerFromDashboard(config, await readJsonBody(req)));
+    } catch (e) {
+      if (e instanceof HttpError) {
+        json(e.status, { error: e.message });
+        return;
+      }
+      log.debug(`dashboard: ${url.pathname} failed: ${(e as Error).message}`);
+      json(500, { error: 'Failed to load workflow runs.' });
+    }
+  };
+
+  // Scorer results (#1182). Like the team run history, the reports checkout is refreshed from origin at most once per
+  // TTL; the page asks again on every change of scorer, cohort, window, grouping or commit.
+  const scorersRefreshed = new Map<string, number>();
+  const handleScorers = async (req: http.IncomingMessage, res: http.ServerResponse, url: URL, workspace: DashboardWorkspace | undefined) => {
+    const json = (status: number, body: unknown) => {
+      res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(body));
+    };
+    if (req.method !== 'GET') {
+      json(405, { error: 'Not supported.' });
+      return;
+    }
+    if (!workspace?.config) {
+      json(200, { configured: false });
+      return;
+    }
+    try {
+      const { parseScorerQuery, scorerResults } = await import('./dashboard/scorers.js');
+      const query = parseScorerQuery(url.searchParams);
+      const refresh = Date.now() - (scorersRefreshed.get(workspace.id) ?? 0) > KB_SUMMARY_TTL_MS;
+      const allEvents = await readEvents(eventsPath);
+      const events = ownSessionEvents(allEvents, workspace, await getWorkspaces(allEvents));
+      const view = await scorerResults({ config: workspace.config, query, events, refresh });
+      if (refresh) scorersRefreshed.set(workspace.id, Date.now());
+      json(200, { configured: true, ...view });
+    } catch (e) {
+      if (e instanceof HttpError) {
+        json(e.status, { error: e.message });
+        return;
+      }
+      log.debug(`dashboard: ${url.pathname} failed: ${e instanceof Error ? e.message : String(e)}`);
+      json(500, { error: 'Failed to load scorer results.' });
     }
   };
 
@@ -261,8 +377,8 @@ export async function startDashboard(port?: number): Promise<void> {
     if (url.pathname === '/api/sessions') {
       // Return current sessions as JSON
       try {
-        const events = await scopedEvents(scopeId);
-        const sessions = rebuildSessions(events);
+        const [events, outcomes] = await Promise.all([scopedEvents(scopeId), readSessionOutcomes(eventsPath)]);
+        const sessions = rebuildSessions(events, outcomes);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(sessions));
       } catch (e) {
@@ -272,21 +388,100 @@ export async function startDashboard(port?: number): Promise<void> {
       return;
     }
 
+    if (url.pathname === '/api/outcomes') {
+      try {
+        // A scope's sessions are those its report counted; an unassigned session is in no scope's report.
+        const key = workspace?.config ? await dataHomeKey(getDataHome(workspace.config)) : undefined;
+        const events = workspace && !key ? [] : await readSessionOutcomes(eventsPath);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(SessionOutcomes.summarize(events, { ...(key ? { dataHomeKey: key } : {}), now: Date.now() })));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }));
+      }
+      return;
+    }
+
     if (url.pathname === '/api/trends') {
       try {
-        const events = await scopedEvents(scopeId);
+        // The member's own sessions: a session teamai launched is not theirs.
+        const events = memberEvents(await scopedEvents(scopeId));
         const snapshots = aggregateDailySessions(events);
         const daily = computeDailyStatsDelta(snapshots, {}).delta;
         const trends = summarizeTrendWindow(daily);
         const costs = summarizeSessionCosts(snapshots);
+        // The sessions that ended in the current window, by the run mode they recorded.
+        const runs = sessionRuns(events);
+        const ended = (keep: (sessionId: string) => boolean) =>
+          summarizeTrendWindow(computeDailyStatsDelta(new Map([...snapshots].filter(([sessionId]) => keep(sessionId))), {}).delta).current.sessionsEnded;
+        const runModes: RunModeSplit = {
+          attended: ended((sessionId) => runs.get(sessionId)?.runMode === 'attended'),
+          unattended: ended((sessionId) => runs.get(sessionId)?.runMode === 'unattended'),
+          notRecorded: ended((sessionId) => !runs.has(sessionId)),
+        };
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           current: { ...trends.current, ...costs.current },
           previous: { ...trends.previous, ...costs.previous },
+          runModes,
         }));
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: (e as Error).message }));
+      }
+      return;
+    }
+
+    if (url.pathname === '/api/tokens') {
+      // The member's requests over 7, 30 or 90 days, from the local request log.
+      try {
+        const days = Number(url.searchParams.get('days') ?? 7);
+        if (![7, 30, 90].includes(days)) throw new HttpError(400, 'days must be 7, 30 or 90');
+        // A workspace's requests are those its data home recorded; older ones, those of its sessions still in the event log.
+        const scope = workspace ? {
+          ...(workspace.config ? { dataHomeKey: await dataHomeKey(getDataHome(workspace.config)) } : {}),
+          sessionIds: new Set(memberEvents(await scopedEvents(scopeId)).map((event) => event.sessionId)),
+        } : undefined;
+        const records = [...(await readLocalRequestRecords()).values()];
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(summarizeTokenCosts(records, { days, now: new Date(), scope })));
+      } catch (e) {
+        const status = e instanceof HttpError ? e.status : 500;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }));
+      }
+      return;
+    }
+
+    if (url.pathname === '/api/session-sharing') {
+      // Whether the workspace's sessions are published and scored (#1385): counts
+      // and setting names, never a session's text or path.
+      try {
+        const { readSessionSharing } = await import('./dashboard/session-sharing.js');
+        const sharing = workspace?.config
+          ? await readSessionSharing(workspace.config, { env: process.env, platform: process.platform, now: new Date().toISOString() })
+          : { configured: false };
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(sharing));
+      } catch (e) {
+        log.debug(`dashboard: /api/session-sharing failed: ${e instanceof Error ? e.message : String(e)}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Failed to load session sharing.' }));
+      }
+      return;
+    }
+
+    if (url.pathname === '/api/member-settings') {
+      // Each member setting a level sets for the workspace, as `teamai doctor` lists them (#1459).
+      try {
+        const { readMemberSettingsPanel } = await import('./dashboard/member-settings.js');
+        const settings = workspace?.config ? await readMemberSettingsPanel(workspace.config) : { configured: false };
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(settings));
+      } catch (e) {
+        log.debug(`dashboard: /api/member-settings failed: ${e instanceof Error ? e.message : String(e)}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Failed to load member settings.' }));
       }
       return;
     }
@@ -325,6 +520,16 @@ export async function startDashboard(port?: number): Promise<void> {
 
     if (url.pathname === '/api/distribution' || url.pathname.startsWith('/api/distribution/')) {
       await handleDistribution(req, res, url.pathname, scopeId);
+      return;
+    }
+
+    if (url.pathname === '/api/workflows' || url.pathname.startsWith('/api/workflows/')) {
+      await handleWorkflows(req, res, url, workspace);
+      return;
+    }
+
+    if (url.pathname === '/api/scorers') {
+      await handleScorers(req, res, url, workspace);
       return;
     }
 
@@ -460,8 +665,8 @@ export async function startDashboard(port?: number): Promise<void> {
 
       // Send initial state immediately
       try {
-        const events = await scopedEvents(scopeId);
-        const sessions = rebuildSessions(events);
+        const [events, outcomes] = await Promise.all([scopedEvents(scopeId), readSessionOutcomes(eventsPath)]);
+        const sessions = rebuildSessions(events, outcomes);
         res.write(`data: ${JSON.stringify(sessions)}\n\n`);
       } catch {
         // Ignore initial send errors

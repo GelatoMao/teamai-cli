@@ -158,6 +158,14 @@ same pull makes `~/.codex/hooks.json` hold one
 recorded project has hooks for, with the largest timeout, before the built-ins;
 at run time it resolves the project from the hook's `cwd` and runs that
 project's hooks from the index.
+A tool whose host reads no Claude hook file (OpenCode, Oh My Pi, Pi, OpenClaw,
+Kiro, Hermes) keeps its team hooks, and the local agent's agent hooks for it,
+in `~/.teamai/team-hooks/<tool>.json`: a Claude-shaped file the same reconcile,
+records and project gates write as a settings file. The tool's plugin,
+extension or native hook entries run
+`teamai hook-dispatch <Event> --tool <tool> --team-hooks`, which reads it.
+Uninstalling a tool removes its file; the directory stays while a project
+still uses it.
 `state.gitExcludeFiles` records, per owner, the exclude
 files holding its block. A pull nobody watches (session start, git hooks) keeps
 what it could not say about the block in `<dataHome>/git-exclude-notices.json`:
@@ -634,6 +642,21 @@ stays in the checkout's `.teamai/`.
 Acceptance: after slimming, `git status` is clean (the A1 data is physically gone,
 not merely ignored) and a teammate's fresh clone bootstraps into the partition.
 
+Both scopes of one self-mode repository share those checkouts too (#1443). A
+hand-written user-scope `~/.teamai/config.yaml` next to the workspace install
+would otherwise compute `~/.teamai/reports-wt` while the partition computes
+`~/.teamai/projects/<slug>/reports-wt`, so one scope could take the branch and
+the other could never take it back. The loader attaches a runtime-only
+`branchHome` — a `side-branches/` subdirectory of the project partition,
+resolved from the shared project anchor — to a `kind: self` config of either
+scope; `getWorktreeDir` and the lock path beside it follow it, and every reader
+goes through them. The subdirectory matters when a git-mode team clone lives in
+the same partition: its checkouts are siblings of the clone, directly under the
+partition, so the two installs never claim one path. The first upgraded pull
+removes a checkout left in `~/.teamai/`, in a legacy `<checkout>/.teamai/`, or
+at the partition root from a pre-#1443 install, under the lock beside that old
+checkout so a command still using it is never deleted from under.
+
 ### Self mode and linked worktrees (#808)
 
 Git checks a branch out in one worktree only. Self mode used to derive the
@@ -647,8 +670,9 @@ every checkout, so that is where they live now:
 
 ```text
 ~/.teamai/projects/<slug>/                     one per project, every checkout
-├── learnings-wt/                              getWorktreeDir → <dataHome>/<dirname>
-├── reports-wt/                                (the side-branch locks sit beside them)
+├── side-branches/                             self mode's branchHome: getWorktreeDir → <partition>/side-branches/<dirname>
+│   ├── learnings-wt/                          for BOTH scopes (#1443); the locks sit beside each checkout
+│   └── reports-wt/                            a git-mode clone in this partition uses <partition>/<dirname> instead
 ├── pending-learnings/                         pendingLearningsDir → <dataHome>/pending-learnings
 ├── managed-main-checkout-hooks.json           legacy ownership, adopted into the original main checkout's workspace index (#1041)
 │                                              team hooks teamai wrote ungated into the main checkout's Claude Code / Codex
@@ -881,7 +905,10 @@ Upgrading from the per-checkout layout:
   `recall maintenance` and `recall promote` stop with exit code 1 and write
   nothing when either the reports lock (they rank by its votes) or the
   learnings lock is taken; the error names the lock and says to run the command
-  again, or to check that the partition is writable.
+  again, or to check that the partition is writable. Their refresh fetches into
+  the team clone, so it also takes the sync lock: while a pull or push holds
+  it, `recall maintenance` stops the same way, and the `recall promote` listing
+  reads both checkouts as they are.
 
 A git-mode install keeps the same checkouts and queue at the same partition
 paths (beside `<partition>/team-repo`), so after a project switches mode the
@@ -914,6 +941,22 @@ checkout's learnings: the queue, docs, rules, skills and older learnings stay
 recallable, and a plain `recall` runs no git. `digest` and the dashboard (`viz`:
 its throwaway index and its promotion and prune candidates) use the same roots.
 
+Promotion publishes the new knowledge entry from a disposable worktree based on
+the freshly fetched default branch, for both separate team repositories and self
+mode. Only the new entry is staged on a review branch; the user's active branch,
+index and working files are left alone. The artifact push must succeed before
+`promoted_to` is written to the learning. That marker is then published through
+the existing learnings maintenance journal, so a failed marker push can retry on
+the next pull without generating the knowledge entry again. A failed artifact
+push leaves the learning eligible. Existing targets are refused, never replaced.
+The marker keeps the learning out of the candidates only while a commit on
+origin's default branch or on a `teamai/push/*` review branch has touched its
+target, so renaming or deleting the merged entry later does not offer it again.
+`recall promote` fetches both first, under the sync lock, and prunes the review
+branches origin deleted, so a review closed unmerged, once its branch is
+deleted, offers the learning again. While a pull or push holds the lock, the
+listing skips the fetch and uses the last one. Promoting it again replaces the
+marker. The dashboard applies the same rule to the refs as last fetched.
 
 Those builds, and the reports checkout `teamai recall feedback --negative` counts
 the team's upvotes from, take the votes directory from `indexableVotesDir`,

@@ -10,13 +10,18 @@ import {
   countInterventions,
   appendEvent,
   readEvents,
+  readSessionOutcomes,
   rebuildSessions,
   aggregateSessionInterventions,
   aggregateSessionMetrics,
   compactEvents,
+  memberEvents,
   reconcileRequestLog,
+  type LocalRequestRecord,
   dedupeEvents,
   dashboardReport,
+  GIT_AT_START_PAYLOAD_KEY,
+  readLocalRequestRecords,
 } from '../dashboard-collector.js';
 import { collectSession } from '../session-collector.js';
 import type { DashboardEvent } from '../types.js';
@@ -187,6 +192,9 @@ describe('parseHookEvent', () => {
           cache_read: { tokenCount: 17 },
           cache_write: { tokenCount: 3 },
         },
+        modelMetrics: {
+          'claude-sonnet-5': { tokenDetails: { input: { tokenCount: 101 }, output: { tokenCount: 29 }, cache_read: { tokenCount: 17 }, cache_write: { tokenCount: 3 } } },
+        },
         prompt: secret,
       },
     });
@@ -206,6 +214,8 @@ describe('parseHookEvent', () => {
         tokens: { input: 101, output: 29, cacheRead: 17, cacheCreation: 3 },
         tokenScope: 'session',
       }));
+      // Sonnet 5 at $2 / $10 / $0.20 / $2.50 per million tokens, rounded to the micro-dollar.
+      expect(event?.requestMetrics).toMatchObject({ pricedRequests: 1, costMicros: 503 });
       expect(event?.transcriptPath).toBeUndefined();
       expect(event?.stoppedOutput).toBeUndefined();
       expect(JSON.stringify(event)).not.toContain(secret);
@@ -1159,6 +1169,46 @@ describe('parseHookEvent', () => {
     expect(event!.tool).toBe('claude-internal');
   });
 
+  it('extracts Codex answers before the summary limit and ignores question metadata', async () => {
+    const prompt = '<send_user_message_question_reply>' + JSON.stringify([
+      { questionItemId: 'id'.repeat(200), question: 'wrong?', answer: 'Use the web interface.' },
+      { question: 'Language?', answer: '简体中文' },
+    ]) + '</send_user_message_question_reply>';
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt }), 'codex');
+    expect(event?.promptSummary).toBe('Use the web interface.\n简体中文');
+    expect(event?.correction).toBe(false);
+  });
+
+  it.each(['tcodex', 'codex-internal'])('extracts Codex answers for %s', async (tool) => {
+    const prompt = '<send_user_message_question_reply>[{"questionItemId":"q1","answer":"Use the web interface."}]</send_user_message_question_reply>';
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt }), tool);
+    expect(event?.promptSummary).toBe('Use the web interface.');
+  });
+
+  it('redacts and caps extracted Codex answers', async () => {
+    const answer = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ' + 'x'.repeat(250) + ' wrong';
+    const prompt = '<send_user_message_question_reply>' + JSON.stringify([{ answer }]) + '</send_user_message_question_reply>';
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt }), 'codex');
+    expect(event?.promptSummary).toContain('<REDACTED:gh_tok>');
+    expect(event?.promptSummary).not.toContain('ghp_');
+    expect(event?.promptSummary).toHaveLength(200);
+    expect(event?.correction).toBe(true);
+  });
+
+  it.each(['not JSON', '[]', '[{"answer":42}]', '[{"answer":"Yes"},{}]', '[{"answer":""}]'])('preserves unsupported Codex reply payloads: %s', async (payload) => {
+    const prompt = '<send_user_message_question_reply>' + payload + '</send_user_message_question_reply>';
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt }), 'codex');
+    expect(event?.promptSummary).toBe(prompt);
+  });
+
+  it('preserves ordinary prompts and wrappers from other tools', async () => {
+    const wrapper = '<send_user_message_question_reply>[{"answer":"Yes"}]</send_user_message_question_reply>';
+    for (const [tool, prompt] of [['claude', wrapper], ['codex', 'Explain ' + wrapper], ['codex', 'A normal prompt']]) {
+      const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt }), tool);
+      expect(event?.promptSummary).toBe(prompt);
+    }
+  });
+
   it('flags a correction prompt on UserPromptSubmit', async () => {
     const raw = JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 's', prompt: 'wrong, redo it' });
     const event = await parseHookEvent(raw, 'claude');
@@ -1539,7 +1589,152 @@ describe('parseHookEvent: Muse Code session tokens', () => {
   });
 });
 
+describe('parseHookEvent: Antigravity CLI session tokens', () => {
+  const sessionId = '06073d60-63d2-43f8-a8c2-062189a4ddd2';
+  const transcript = () => path.join(tmpDir, '.gemini', 'antigravity-cli', 'brain', sessionId, '.system_generated', 'logs', 'transcript.jsonl');
+  const stop = () => parseHookEvent(JSON.stringify({ hook_event_name: 'Stop', session_id: sessionId, cwd: '/work/project' }), 'agy');
+
+  it('sums the model steps of the transcript into session tokens, cached input apart', async () => {
+    fs.mkdirSync(path.dirname(transcript()), { recursive: true });
+    // As agy 1.4.8 writes them: counts are strings, on each PLANNER_RESPONSE.
+    fs.writeFileSync(transcript(), [
+      { step_index: '0', source: 'USER_EXPLICIT', type: 'USER_INPUT', content: '<USER_REQUEST>\nhi\n</USER_REQUEST>' },
+      { step_index: '1', source: 'MODEL', type: 'PLANNER_RESPONSE', input_tokens: '14518', cache_read_tokens: '0', output_tokens: '39' },
+      { step_index: '2', source: 'MODEL', type: 'GENERIC', content: 'Showing lines 1-5 of 5' },
+      { step_index: '3', source: 'MODEL', type: 'PLANNER_RESPONSE', input_tokens: '14706', cache_read_tokens: '12000', output_tokens: '49' },
+    ].map((step) => JSON.stringify(step)).join('\n') + '\n');
+
+    expect(await stop()).toEqual(expect.objectContaining({
+      type: 'stop',
+      tool: 'agy',
+      tokens: { input: 17224, output: 88, cacheRead: 12000, cacheCreation: 0 },
+      tokenScope: 'session',
+    }));
+  });
+
+  it('reads a session of the Antigravity app from its own store', async () => {
+    const appTranscript = path.join(tmpDir, '.gemini', 'antigravity', 'brain', sessionId, '.system_generated', 'logs', 'transcript.jsonl');
+    fs.mkdirSync(path.dirname(appTranscript), { recursive: true });
+    // As the Antigravity app 2.24 writes them: counts are numbers, and input_tokens leaves out the cache reads
+    // (the app's own sessions hold steps such as 10,378 input with 21,400 cached).
+    fs.writeFileSync(appTranscript, JSON.stringify({ step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', input_tokens: 9100, cache_read_tokens: 100, output_tokens: 18 }) + '\n');
+
+    expect((await stop())?.tokens).toEqual({ input: 9100, output: 18, cacheRead: 100, cacheCreation: 0 });
+  });
+
+  it('logs the session as one unpriced request without a model, updated at each Stop', async () => {
+    const step = (input: number) => JSON.stringify({ step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', input_tokens: input, cache_read_tokens: 0, output_tokens: 10 }) + '\n';
+    fs.mkdirSync(path.dirname(transcript()), { recursive: true });
+    fs.writeFileSync(transcript(), step(1_000));
+    await stop();
+    fs.appendFileSync(transcript(), step(2_000));
+    await stop();
+
+    const logged = [...(await readLocalRequestRecords()).values()];
+    expect(logged).toEqual([expect.objectContaining({
+      tool: 'agy', sessionId, model: '', inputTokens: 3_000, outputTokens: 20, costMicros: null, priceVersion: null,
+    })]);
+  });
+
+  it('records no tokens when the session has no transcript', async () => {
+    expect((await stop())?.tokens).toBeUndefined();
+  });
+});
+
 describe('local request log', () => {
+  const requestLog = () => fs.readFileSync(path.join(tmpDir, '.teamai', 'dashboard', 'requests.jsonl'), 'utf-8')
+    .trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+  const claudeRequest = (id: string, model: string) => JSON.stringify({
+    type: 'assistant', timestamp: '2026-10-30T09:15:02.118Z',
+    message: { id, model, usage: { input_tokens: 1_000, output_tokens: 200, cache_read_input_tokens: 5_000, cache_creation_input_tokens: 400 }, content: [] },
+  });
+
+  it('logs every request of a Stop with its tool and session, and prices an unknown model once an alias names it', async () => {
+    const transcriptPath = path.join(tmpDir, 'gateway.jsonl');
+    fs.writeFileSync(transcriptPath, [claudeRequest('msg_1', 'claude-sonnet-5'), claudeRequest('msg_2', 'gateway-model-42')].join('\n') + '\n');
+    const stop = (modelAliases?: Record<string, string>) => parseHookEvent(JSON.stringify({
+      hook_event_name: 'Stop', session_id: 'sess-gateway', transcript_path: transcriptPath,
+    }), 'claude', { modelAliases, dataHomeKey: 'acme-home' });
+
+    // Sonnet 5: input $0.002 + output $0.002 + cache read $0.001 + 5m cache write $0.001
+    expect((await stop())?.requestMetrics).toMatchObject({ pricedRequests: 1, costMicros: 6_000 });
+    expect(requestLog().map(({ tool, sessionId, model, costMicros, costSource }) => ({ tool, sessionId, model, costMicros, costSource }))).toEqual([
+      { tool: 'claude', sessionId: 'sess-gateway', model: 'claude-sonnet-5', costMicros: 6_000, costSource: 'catalog' },
+      { tool: 'claude', sessionId: 'sess-gateway', model: 'gateway-model-42', costMicros: null, costSource: undefined },
+    ]);
+    // 5,000 cache reads billed as input would cost $0.009 more ($2 instead of $0.20 per million).
+    expect(requestLog()[0].cacheSavingsMicros).toBe(9_000);
+    // The recording scope, so its workspace finds the request after compaction.
+    expect(requestLog()[0].dataHomeKey).toBe('acme-home');
+
+    expect((await stop({ 'gateway-model-42': 'claude-sonnet-5' }))?.requestMetrics).toMatchObject({ pricedRequests: 2, costMicros: 12_000 });
+  });
+
+  it('keeps the cost a request was logged with when prices change', async () => {
+    const transcriptPath = path.join(tmpDir, 'priced.jsonl');
+    fs.writeFileSync(transcriptPath, claudeRequest('msg_1', 'claude-sonnet-5') + '\n');
+    const stop = () => parseHookEvent(JSON.stringify({ hook_event_name: 'Stop', session_id: 's', transcript_path: transcriptPath }), 'claude');
+    await stop();
+    const [logged] = requestLog();
+    await reconcileRequestLog([{ ...(logged as LocalRequestRecord), costMicros: 4_000, priceVersion: 'litellm-2026-01-05-aaaaaaa' }]);
+
+    expect((await stop())?.requestMetrics).toMatchObject({ costMicros: 4_000, priceVersion: 'litellm-2026-01-05-aaaaaaa' });
+  });
+
+  it('keeps a request in the workspace that recorded it when its session resumes in another', async () => {
+    const transcriptPath = path.join(tmpDir, 'resumed.jsonl');
+    fs.writeFileSync(transcriptPath, claudeRequest('msg_1', 'claude-sonnet-5') + '\n');
+    const stop = (dataHomeKey: string) => parseHookEvent(JSON.stringify({ hook_event_name: 'Stop', session_id: 's', transcript_path: transcriptPath }), 'claude', { dataHomeKey });
+    await stop('workspace-a');
+    fs.appendFileSync(transcriptPath, claudeRequest('msg_2', 'claude-sonnet-5') + '\n');
+    await stop('workspace-b');
+
+    expect(requestLog().map((record) => record.dataHomeKey)).toEqual(['workspace-a', 'workspace-b']);
+  });
+
+  it('keeps the cost Pi reported for each request', async () => {
+    const transcriptPath = path.join(tmpDir, 'pi-session.jsonl');
+    fs.writeFileSync(transcriptPath, JSON.stringify({
+      type: 'message', id: '8b1d4e6a', timestamp: '2026-09-01T15:01:51.019Z',
+      message: { role: 'assistant', provider: 'openai-codex', model: 'gpt-5.6-sol', usage: { input: 2_039, output: 921, cacheRead: 87_808, cacheWrite: 0, cost: { total: 0.0616992 } } },
+    }) + '\n');
+
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'Stop', session_id: 'pi-sess', transcript_path: transcriptPath }), 'pi');
+
+    expect(event?.tokens).toEqual({ input: 2_039, output: 921, cacheRead: 87_808, cacheCreation: 0 });
+    expect(event?.requestMetrics).toMatchObject({ pricedRequests: 1, costMicros: 61_699, priceVersion: 'reported' });
+    expect(requestLog()[0]).toMatchObject({ tool: 'pi', model: 'gpt-5.6-sol', costSource: 'reported' });
+  });
+
+  it('leaves usage and the request log alone for a caller that needs only the event', async () => {
+    const transcriptPath = path.join(tmpDir, 'skip.jsonl');
+    fs.writeFileSync(transcriptPath, claudeRequest('msg_1', 'claude-sonnet-5') + '\n');
+
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'Stop', session_id: 's', transcript_path: transcriptPath }), 'claude', { readUsage: false });
+
+    expect(event).toMatchObject({ type: 'stop', sessionId: 's' });
+    expect(event?.tokens).toBeUndefined();
+    expect(fs.existsSync(path.join(tmpDir, '.teamai', 'dashboard', 'requests.jsonl'))).toBe(false);
+  });
+
+  it('reads a tool teamai does not list as a Claude transcript, as before tools named their format', async () => {
+    const transcriptPath = path.join(tmpDir, 'wrapper.jsonl');
+    fs.writeFileSync(transcriptPath, claudeRequest('msg_1', 'claude-sonnet-5') + '\n');
+
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'Stop', session_id: 's', transcript_path: transcriptPath }), 'acme-claude-wrapper');
+
+    expect(event?.tokens).toEqual({ input: 1_000, output: 200, cacheRead: 5_000, cacheCreation: 400 });
+    expect(event?.requestMetrics).toMatchObject({ pricedRequests: 1, costMicros: 6_000 });
+  });
+
+  it('reads no transcript for an empty transcript_path', async () => {
+    const event = await parseHookEvent(JSON.stringify({ hook_event_name: 'Stop', session_id: 'dsh-sess', transcript_path: '' }), 'dsh');
+
+    expect(event?.type).toBe('stop');
+    expect(event?.transcriptPath).toBeUndefined();
+    expect(event?.tokens).toBeUndefined();
+  });
+
   it('deduplicates requests and prunes details older than 90 days', async () => {
     const old = { id: 'old', timestamp: '2026-05-01T00:00:00Z', model: 'claude-sonnet-5', inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, costMicros: 1, priceVersion: 'v1' };
     const current = { ...old, id: 'current', timestamp: '2026-09-01T00:00:00Z' };
@@ -1691,6 +1886,21 @@ describe('rebuildSessions', () => {
     expect(sessions).toHaveLength(1);
     expect(sessions[0].status).toBe('running');
     expect(sessions[0].cwd).toBe('/proj');
+  });
+
+  it('folds in what each session delivered so far, each outcome once (#1387)', () => {
+    const events: DashboardEvent[] = [
+      { type: 'session_start', timestamp: now, sessionId: 's1', tool: 'claude', cwd: '/proj' },
+      { type: 'session_start', timestamp: now, sessionId: 's2', tool: 'codex', cwd: '/proj' },
+    ];
+    const learning = { kind: 'learning' as const, id: 'k8s/pod-startup-timeouts-2026-10-24-k3x9q2' };
+    const commit = { kind: 'commit' as const, sha: 'c'.repeat(40) };
+    const sessions = rebuildSessions(events, [
+      { type: 'session_outcome', timestamp: now, sessionId: 's1', outcomes: [learning] },
+      { type: 'session_outcome', timestamp: now, sessionId: 's1', outcomes: [commit, learning], counted: { tokens: { input: 1, output: 1 }, interventions: 0 } },
+      { type: 'session_outcome', timestamp: now, sessionId: 'gone', outcomes: [commit] },
+    ]);
+    expect(sessions.map((s) => [s.sessionId, s.outcomes])).toEqual([['s1', [learning, commit]], ['s2', []]]);
   });
 
   it('updates session on tool_use', () => {
@@ -2192,6 +2402,36 @@ describe('aggregateSessionInterventions', () => {
 // ─── compactEvents ──────────────────────────────────────
 
 describe('compactEvents', () => {
+  it('keeps a session\'s outcomes for 30 days after its own events are compacted away, as they were written (#1387)', async () => {
+    const eventsPath = path.join(tmpDir, '.teamai', 'dashboard', 'events.jsonl');
+    fs.mkdirSync(path.dirname(eventsPath), { recursive: true });
+    const daysAgo = (days: number) => new Date(Date.now() - days * 24 * 3_600_000).toISOString();
+    const outcome = (sessionId: string, days: number) => JSON.stringify({ type: 'session_outcome', timestamp: daysAgo(days), sessionId, tool: 'claude', outcomes: [{ kind: 'learning', id: `${sessionId}-notes` }], pendingId: `p-${sessionId}` });
+    const filler = JSON.stringify({ type: 'session_end', timestamp: daysAgo(1), sessionId: 'filler', tool: 'claude' });
+    const recent = outcome('recent', 2);
+    fs.writeFileSync(eventsPath, [
+      JSON.stringify({ type: 'stop', timestamp: daysAgo(2), sessionId: 'recent', tool: 'claude' }), recent, outcome('old', 31),
+      ...Array.from({ length: 5_000 }, () => filler),
+    ].join('\n') + '\n');
+
+    await compactEvents(eventsPath);
+
+    expect(fs.readFileSync(eventsPath, 'utf-8').split('\n').filter(Boolean)).toEqual([recent]);
+  });
+
+  it('keeps session outcomes out of what every other reader of the log reads (#1387)', async () => {
+    const eventsPath = path.join(tmpDir, '.teamai', 'dashboard', 'events.jsonl');
+    fs.mkdirSync(path.dirname(eventsPath), { recursive: true });
+    const now = new Date().toISOString();
+    fs.writeFileSync(eventsPath, [
+      JSON.stringify({ type: 'stop', timestamp: now, sessionId: 's1', tool: 'claude' }),
+      JSON.stringify({ type: 'session_outcome', timestamp: now, sessionId: 's1', tool: 'claude', outcomes: [{ kind: 'learning', id: 'notes' }] }),
+    ].join('\n') + '\n');
+
+    expect((await readEvents(eventsPath)).map((event) => event.type)).toEqual(['stop']);
+    expect((await readSessionOutcomes(eventsPath)).map((event) => event.sessionId)).toEqual(['s1']);
+  });
+
   it('does not compact when below threshold', async () => {
     const eventsPath = path.join(tmpDir, '.teamai', 'dashboard', 'events.jsonl');
     fs.mkdirSync(path.dirname(eventsPath), { recursive: true });
@@ -2224,6 +2464,47 @@ describe('compactEvents', () => {
 
     const kept = fs.readFileSync(eventsPath, 'utf-8').split('\n').filter(Boolean).map((line) => JSON.parse(line).sessionId);
     expect(kept).toEqual(['pid-live', 'pid-live']);
+  });
+
+  it('keeps only the first launched event of a session teamai launched, so a member resume of it stays cut off however often the log compacts (#1384)', async () => {
+    const eventsPath = path.join(tmpDir, '.teamai', 'dashboard', 'events.jsonl');
+    fs.mkdirSync(path.dirname(eventsPath), { recursive: true });
+    const old = Date.now() - 3_600_000;
+    const at = (sessionId: string, type: string, second: number, extra: Record<string, unknown> = {}) =>
+      JSON.stringify({ type, timestamp: new Date(old + second * 1_000).toISOString(), sessionId, tool: 'claude', runMode: 'attended', ...extra });
+    const fillers = Array.from({ length: 5_000 }, (_, i) => at(`filler-${i}`, 'session_end', 0));
+    fs.writeFileSync(eventsPath, [
+      at('continued', 'stop', 1), at('continued', 'stop', 2, { launchedBy: 'workflow' }), at('continued', 'session_end', 3, { launchedBy: 'workflow' }),
+      at('member', 'stop', 1), at('member', 'session_end', 2),
+      at('step', 'stop', 1, { launchedBy: 'workflow' }), at('step', 'session_end', 2, { launchedBy: 'workflow' }),
+      at('month-old step', 'stop', -31 * 24 * 3_600, { launchedBy: 'workflow' }),
+      ...fillers,
+    ].join('\n') + '\n');
+
+    await compactEvents(eventsPath);
+    fs.appendFileSync(eventsPath, fillers.join('\n') + '\n');
+    await compactEvents(eventsPath);
+
+    const kept = fs.readFileSync(eventsPath, 'utf-8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as DashboardEvent);
+    expect(kept.map((event) => [event.sessionId, event.timestamp])).toEqual([
+      ['continued', new Date(old + 2_000).toISOString()], ['step', new Date(old + 1_000).toISOString()],
+    ]);
+    const resumed = (sessionId: string): DashboardEvent => ({ type: 'stop', timestamp: new Date().toISOString(), sessionId, tool: 'claude', runMode: 'attended' });
+    expect(memberEvents([...kept, resumed('continued'), resumed('step')])).toEqual([]);
+  });
+
+  it('keeps every event of a launched session that stopped a moment ago, so the dashboard does not list it again (#1384)', async () => {
+    const eventsPath = path.join(tmpDir, '.teamai', 'dashboard', 'events.jsonl');
+    fs.mkdirSync(path.dirname(eventsPath), { recursive: true });
+    const at = (type: string, minutesAgo: number) =>
+      JSON.stringify({ type, timestamp: new Date(Date.now() - minutesAgo * 60_000).toISOString(), sessionId: 'step', tool: 'claude', launchedBy: 'workflow' });
+    const filler = JSON.stringify({ type: 'session_end', timestamp: new Date(Date.now() - 3_600_000).toISOString(), sessionId: 'filler', tool: 'claude' });
+    fs.writeFileSync(eventsPath, [at('session_start', 10), at('session_end', 1), ...Array.from({ length: 5_000 }, () => filler)].join('\n') + '\n');
+
+    await compactEvents(eventsPath);
+
+    const kept = fs.readFileSync(eventsPath, 'utf-8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as DashboardEvent);
+    expect(rebuildSessions(kept)).toEqual([]);
   });
 });
 
@@ -2547,6 +2828,12 @@ describe('countInterventions (CodeBuddy index.json)', () => {
     expect(iv.interrupt).toBe(0);
   });
 
+  it('still counts friction from the blobs while index.json is mid-write', async () => {
+    const p = writeCodebuddySession('mid-write', INDEX_WITH_USAGE, [rejectedAssistantBlob('call_reject_1'), errorToolBlob('call_err_1')]);
+    fs.writeFileSync(p, '{"messages":[{"id":"m1","role":"us');
+    expect(await countInterventions(p)).toEqual({ interrupt: 0, toolReject: 1, toolError: 1 });
+  });
+
   it('counts a genuine tool error as toolError', async () => {
     const p = writeCodebuddySession('error', INDEX_WITH_USAGE, [errorToolBlob('call_err_1')]);
     const iv = await countInterventions(p);
@@ -2770,6 +3057,57 @@ describe('dashboard-report records the git state a session started on', () => {
     configureUserScope();
   });
 
+  it('records on a Stop the commit the checkout is at then, so the session\'s commits are known without git (#1387)', async () => {
+    const { repo } = committedRepo();
+    fs.writeFileSync(path.join(repo, 'tracked.txt'), 'two\n');
+    git(repo, 'commit', '-q', '-am', 'during the session');
+    const head = git(repo, 'rev-parse', 'HEAD');
+
+    await runHook({ hook_event_name: 'Stop', session_id: 'git-stop', cwd: repo });
+
+    const [stop] = await readEvents();
+    expect(stop.type).toBe('stop');
+    expect(stop.gitHead).toBe(head);
+  });
+
+  it('records on a Stop the branch the checkout is on, for the pull request lookup once the session is finished (#1387)', async () => {
+    const { repo } = committedRepo();
+    git(repo, 'checkout', '-q', '-b', 'fix-retry');
+
+    await runHook({ hook_event_name: 'Stop', session_id: 'git-branch', cwd: repo });
+
+    const [stop] = await readEvents();
+    expect(stop.gitBranch).toBe('fix-retry');
+  });
+
+  it('writes a Stop without its head, in time, when git outlives its time cap with a child holding the pipe (#1387)', async () => {
+    const { repo } = committedRepo();
+    const realGit = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf-8' }).stdout.trim();
+    const wrapperDir = path.join(tmpDir, 'git-wrapper');
+    fs.mkdirSync(wrapperDir);
+    // Hangs on the two reads a Stop makes, and leaves a child that holds the pipe once it is killed.
+    fs.writeFileSync(path.join(wrapperDir, 'git'), [
+      '#!/bin/sh',
+      'case "$*" in *"rev-parse --verify"*|*"symbolic-ref --quiet"*) (sleep 12) & sleep 12 ;; esac',
+      `exec ${realGit} "$@"`,
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${wrapperDir}${path.delimiter}${originalPath ?? ''}`;
+    const started = Date.now();
+    try {
+      await runHook({ hook_event_name: 'Stop', session_id: 'git-hangs', cwd: repo });
+    } finally {
+      process.env.PATH = originalPath;
+    }
+
+    // The Stop handler is stopped after 4.5 seconds, its event unwritten.
+    expect(Date.now() - started).toBeLessThan(4_500);
+    const [stop] = await readEvents();
+    expect(stop).toMatchObject({ type: 'stop', sessionId: 'git-hangs' });
+    expect(stop).not.toHaveProperty('gitHead');
+  }, 20_000);
+
   it('records the commit and a clean tree', async () => {
     const { repo, head } = committedRepo();
 
@@ -2847,6 +3185,19 @@ describe('dashboard-report records the git state a session started on', () => {
     for (const e of events) {
       expect(e).not.toHaveProperty('gitAtStart');
     }
+  });
+
+  it('takes the git state the session start already read, and reads none itself', async () => {
+    const plain = path.join(tmpDir, 'plain');
+    fs.mkdirSync(plain, { recursive: true });
+    const read = { head: 'c'.repeat(40), dirty: true };
+
+    await runHook({ hook_event_name: 'SessionStart', session_id: 'git-read', cwd: plain, [GIT_AT_START_PAYLOAD_KEY]: read });
+    await runHook({ hook_event_name: 'SessionStart', session_id: 'git-none', cwd: plain, [GIT_AT_START_PAYLOAD_KEY]: null });
+
+    expect((await readEvents()).map((e) => e.gitAtStart)).toEqual([read, undefined]);
+    expect(fs.existsSync(path.join(tmpDir, '.teamai', 'debug.log')) ? fs.readFileSync(path.join(tmpDir, '.teamai', 'debug.log'), 'utf-8') : '')
+      .not.toContain('could not read the git state');
   });
 
   it('records each start on its own, and collectSession reports the earliest', async () => {

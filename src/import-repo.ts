@@ -16,7 +16,8 @@ import {
 import { touchCacheEntry } from './utils/cache-index.js';
 import { log } from './utils/logger.js';
 import { hasFrontmatter, stripFrontmatter } from './utils/frontmatter.js';
-import { lockTeamwiki, resolveTeamwiki } from './utils/teamwiki-root.js';
+import { assertTeamwikiWritable, lockTeamwiki, resolveTeamwiki } from './utils/teamwiki-root.js';
+import { isOverrideInvalid } from './tool-launch/call.js';
 
 // ─── Types ──────────────────────────────────────────────
 
@@ -239,9 +240,11 @@ export function repoSlugForUrl(url: string): string {
  * A dry run stops after step 1: it reads the target remote commit with `git ls-remote`
  * and reports whether the cache is current.
  *
+ * @returns false when deep enrich ran and did not finish; the caller decides
+ *   whether that fails the command
  * @throws Error on clone failure, scan failure, or IO failure
  */
-export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void> {
+export async function importFromRepo(opts: ImportFromRepoOptions): Promise<boolean> {
     const {
         url, depth = 1, forceSsh = false, forceAnonymous = false,
         explicitDomain, dryRun = false, output,
@@ -275,6 +278,7 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
         if (!dryRun) throw error;
         return undefined;
     });
+    if (!dryRun) await assertTeamwikiWritable(target);
     const evidenceDest = target ? path.join(target.wikiRoot, 'evidence', 'code', slug) : undefined;
     // LAST_SYNC belongs to the shared clone cache: an unchanged cache is skipped
     // only when this teamwiki already holds that commit, not when another
@@ -305,7 +309,7 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
                 ? `cache is current at ${head.slice(0, 8)}${skips ? ', so an incremental run would skip it' : ''}`
                 : `cache would be refreshed from ${lastSync ? lastSync.sha.slice(0, 8) : 'an unrecorded commit'} to ${head.slice(0, 8)}`;
         log.info(`[dry-run] Would import ${owner}/${repoName} at ${head.slice(0, 8)} into ${evidenceDest ?? path.join('teamwiki', 'evidence', 'code', slug)}; ${cache}`);
-        return;
+        return true;
     }
     if (!target || !evidenceDest) throw new Error('unreachable: the teamwiki resolves outside a dry run');
     const { wikiRoot: teamwikiRoot, team } = target;
@@ -337,7 +341,7 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
                 cloneBranch = cloneResult.branch;
                 oldSha = null; // treat as full clone on fallback, skip drift detection
             } catch (err) {
-                throw new Error(`Clone failed (${url}): ${err instanceof Error ? err.message : String(err)}`);
+                throw new Error(`Clone failed (${url}): ${err instanceof Error ? err.message : String(err)}`, { cause: err });
             }
         }
     } else {
@@ -350,7 +354,7 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
             cloneBranch = cloneResult.branch;
         } catch (err) {
             // shallowClone cleans up the directory internally
-            throw new Error(`Clone failed (${url}): ${err instanceof Error ? err.message : String(err)}`);
+            throw new Error(`Clone failed (${url}): ${err instanceof Error ? err.message : String(err)}`, { cause: err });
         }
     }
 
@@ -365,7 +369,7 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
             await touchCacheEntry({ provider: providerName, owner, repo: repoName, lastSyncedSha: cloneSha });
         } catch {}
         log.info(chalk.green(`✓ repo ${owner}/${repoName} unchanged, skipped`));
-        return;
+        return true;
     }
 
     // 3. Scan and generate codebase.md (AI scan failure does not block graph extraction)
@@ -377,6 +381,7 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
         try {
             codebaseMd = await generateCodebaseMd({ repoPath: cacheDir });
         } catch (err) {
+            if (isOverrideInvalid(err)) throw err;
             log.warn(`AI codebase scan failed (non-blocking): ${err instanceof Error ? err.message : String(err)}`);
         }
     }
@@ -427,12 +432,13 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
             ? `✓ teamwiki/ knowledge graph updated: ${slug}`
             : `✓ ${slug}: no source changes since the last import, teamwiki unchanged`));
     } catch (err) {
-        throw new Error(`Knowledge extraction failed: ${err instanceof Error ? err.message : String(err)}`);
+        throw new Error(`Knowledge extraction failed: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
     }
 
+    let deepEnrichComplete = true;
     if (updated) {
         // 5. Reconcile + deep enrich (synchronous, before push — so all content goes into one MR)
-        await reconcileAndDeepEnrich({ slug, wikiRoot: teamwikiRoot, sourceDir: cacheDir, skipEnrich });
+        deepEnrichComplete = await reconcileAndDeepEnrich({ slug, wikiRoot: teamwikiRoot, sourceDir: cacheDir, skipEnrich });
 
         // 6. Aggregate global graph + create MR (single-repo mode; batch mode handled by import-repo-list)
         if (!skipAutoPush) {
@@ -450,6 +456,7 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
     } catch (touchErr) {
         log.debug(`[cache-index] touchCacheEntry failed: ${String(touchErr)}`);
     }
+    return deepEnrichComplete;
     } finally {
         await releaseImportLock();
     }

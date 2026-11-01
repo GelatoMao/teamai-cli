@@ -37,7 +37,7 @@ vi.mock('node:child_process', async (importOriginal) => ({
     return child;
   }),
 }));
-vi.mock('../pull.js', () => ({ pull: vi.fn(async () => undefined) }));
+vi.mock('../pull.js', () => ({ pull: vi.fn(async () => undefined), settleLateUsageReport: vi.fn(async () => undefined) }));
 vi.mock('../update.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../update.js')>()),
   doUpdate: vi.fn(async () => undefined),
@@ -416,6 +416,8 @@ class Harness {
   async ticking<T>(step: Promise<T>): Promise<T> {
     let settled = false;
     const result = step.finally(() => { settled = true; });
+    // `settled` flips inside the `.finally()` callback registered above, which the linter can't see.
+    // oxlint-disable-next-line no-unmodified-loop-condition
     for (let now = Date.now(); !settled; now += 1000) {
       await new Promise((r) => setTimeout(r, 25));
       vi.setSystemTime(now + 1000);
@@ -461,13 +463,13 @@ class Harness {
    * The main session's Stop with TEAMAI_UPVOTE_JUDGE=1, as its detached pass
    * runs the judge: Claude's transcript holds `entries`, then a final reply.
    */
-  async judgeStop(entries: object[]): Promise<void> {
+  async judgeStop(entries: object[], payload: Record<string, unknown> = {}): Promise<void> {
     const transcript = path.join(this.tmp, 'transcript.jsonl');
     const reply = { type: 'assistant', message: { id: 'msg-final', content: [{ type: 'text', text: 'Raised the pool size.' }] } };
     fs.writeFileSync(transcript, [...entries, reply].map((e) => `${JSON.stringify(e)}\n`).join(''));
     this.env({ TEAMAI_UPVOTE_JUDGE: '1' });
     try {
-      await this.dispatch('stop', { hook_event_name: 'Stop', stop_hook_active: false, transcript_path: transcript },
+      await this.dispatch('stop', { hook_event_name: 'Stop', stop_hook_active: false, transcript_path: transcript, ...payload },
         this.root, 'claude', { background: true });
     } finally {
       this.env({ TEAMAI_UPVOTE_JUDGE: undefined });
@@ -496,6 +498,17 @@ class Harness {
     }) as never);
     try {
       await hookDispatchCli(event, tool, '*', { stdinFile, bgOnly: options.background });
+      // The real dispatcher runs background handlers in a detached child
+      // process; the mocked spawn above does nothing, so simulate that pass
+      // here. post-tool-use needs it since recall-attribution and
+      // dashboard-report moved to the background (#1216) — without this the
+      // attribution these tests assert never runs.
+      if (!options.background && event === 'post-tool-use') {
+        // readStdinFile removes the file; the real parent hands the child a
+        // fresh serialization of the same payload, so rewrite it here.
+        fs.writeFileSync(stdinFile, JSON.stringify({ session_id: SESSION, ...(cwd ? { cwd } : {}), ...payload }));
+        await hookDispatchCli(event, tool, '*', { stdinFile, bgOnly: true });
+      }
     } finally {
       write.mockRestore();
     }
@@ -516,7 +529,7 @@ class Harness {
     for (const { args: argv, payload } of dispatches.splice(0)) {
       // The Skill / TodoWrite matcher pass repeats the wildcard pass's payload.
       if (argv.includes('--matcher')) continue;
-      await this.dispatch(argv[1], { session_id: undefined, ...payload }, null, 'opencode');
+      await this.dispatch(argv[2], { session_id: undefined, ...payload }, null, 'opencode');
     }
   }
 
@@ -1097,6 +1110,15 @@ const ROWS: Row[] = [
     project: {},
   },
   {
+    name: '05: Claude recall; pwd; cat <doc> (a read that ends a command list, status success) → +1',
+    trace: async (h) => {
+      const { files } = await h.recall('redis timeout');
+      await h.shell(`pwd; cat '${files[0]}'`, '/w\n---');
+      await h.stop();
+    },
+    project: { 'redis-timeout': 1 },
+  },
+  {
     name: '05: Claude recall; sed -i \'s/pool/POOL/\' <doc> → 0',
     trace: async (h) => {
       const { files } = await h.recall('redis timeout');
@@ -1218,15 +1240,15 @@ const ROWS: Row[] = [
     trace: async (h) => {
       const { files } = await h.recall('redis timeout');
       const dir = h.rel(path.dirname(files[0]));
-      const doc = h.rel(files[0]);
-      await h.shell(`grep -l timeout '${dir}'`, `${doc}\n`);
-      await h.shell(`grep -rl timeout '${doc}'`, `${doc}\n`);
-      await h.shell(`grep -L pool '${doc}'`, `${doc}\n`);
-      await h.shell(`rg --files '${doc}'`, `${doc}\n`);
+      const docPath = h.rel(files[0]);
+      await h.shell(`grep -l timeout '${dir}'`, `${docPath}\n`);
+      await h.shell(`grep -rl timeout '${docPath}'`, `${docPath}\n`);
+      await h.shell(`grep -L pool '${docPath}'`, `${docPath}\n`);
+      await h.shell(`rg --files '${docPath}'`, `${docPath}\n`);
       await h.shell(`ls '${dir}'`, 'redis-timeout.md\nsetup.md\n');
-      await h.shell(`ls -l '${doc}'`, `-rw-r--r-- 1 me staff 120 Sep  1 09:00 ${doc}\n`);
-      await h.shell(`find '${dir}' -name '*.md'`, `${doc}\n`);
-      await h.shell(`git ls-files '${doc}'`, `${doc}\n`);
+      await h.shell(`ls -l '${docPath}'`, `-rw-r--r-- 1 me staff 120 Sep  1 09:00 ${docPath}\n`);
+      await h.shell(`find '${dir}' -name '*.md'`, `${docPath}\n`);
+      await h.shell(`git ls-files '${docPath}'`, `${docPath}\n`);
       await h.stop();
     },
     project: {},
@@ -2119,6 +2141,57 @@ describe('recall attribution acceptance (#884)', () => {
     expect(updateReports).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['codex', 'muse', 'zcode'])('12: %s Stop judges its final reply using settled recall-log candidates without a Claude transcript', async tool => {
+    await h.setUp();
+    await h.recall('redis timeout');
+    h.env({ TEAMAI_UPVOTE_JUDGE: '1' });
+    const stop = () => h.dispatch('stop', { hook_event_name: 'Stop', last_assistant_message: 'Raised the pool size.' }, h.root, tool, { background: true });
+    await stop();
+    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['redis-timeout'], { 'redis-timeout': h.docs['redis-timeout'] }, expect.any(Array), expect.anything());
+    expect(await h.upvotes(h.project)).toEqual({ 'redis-timeout': 1 });
+    judgeAdoption.mockClear();
+    await stop();
+    expect(judgeAdoption).not.toHaveBeenCalled();
+    expect(await h.upvotes(h.project)).toEqual({ 'redis-timeout': 1 });
+  });
+
+  it('12: a Claude Stop that also carries the final reply is still judged from its transcript', async () => {
+    await h.setUp();
+    // The recall log has no run of this session; only the transcript shows the recall.
+    const { output, files } = await h.recall('redis timeout', { env: { CLAUDE_CODE_SESSION_ID: '00000000-0000-4000-8000-000000000001' }, claim: false });
+    await h.judgeStop(Harness.bashEntries('toolu_recall', 'teamai recall "redis timeout"', output), { last_assistant_message: 'Raised the pool size.' });
+    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['redis-timeout'], { 'redis-timeout': files[0] }, expect.any(Array), expect.anything());
+    expect(await h.upvotes(h.project)).toEqual({ 'redis-timeout': 1 });
+  });
+
+  it('12: a Codex Stop whose transcript_path is its own rollout is judged from the recall log', async () => {
+    await h.setUp();
+    await h.recall('redis timeout');
+    const rollout = path.join(h.tmp, 'rollout.jsonl');
+    fs.writeFileSync(rollout, `${JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', message: 'Raised the pool size.' } })}\n`);
+    h.env({ TEAMAI_UPVOTE_JUDGE: '1' });
+    await h.dispatch('stop', { hook_event_name: 'Stop', transcript_path: rollout, last_assistant_message: 'Raised the pool size.' }, h.root, 'codex', { background: true });
+    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['redis-timeout'], { 'redis-timeout': h.docs['redis-timeout'] }, expect.any(Array), expect.anything());
+    expect(await h.upvotes(h.project)).toEqual({ 'redis-timeout': 1 });
+  });
+
+  it('12: native Stop keeps inherited user-scope recall read-only in a project', async () => {
+    await h.setUp({ inheritUserScope: true });
+    await h.recall('cache warmup');
+    h.env({ TEAMAI_UPVOTE_JUDGE: '1' });
+    await h.dispatch('stop', { last_assistant_message: 'Applied the cache warmup.' }, h.root, 'codex', { background: true });
+    expect(judgeAdoption.mock.calls.flatMap(call => call[1])).not.toContain('cache-warmup');
+    expect((await h.upvotes(h.project))['cache-warmup']).toBeUndefined();
+  });
+
+  it('12: a final reply alone cannot invent recall candidates', async () => {
+    await h.setUp();
+    h.env({ TEAMAI_UPVOTE_JUDGE: '1' });
+    await h.dispatch('stop', { last_assistant_message: '<!-- teamai:recalled-doc-ids: [setup] -->' }, h.root, 'codex', { background: true });
+    expect(judgeAdoption).not.toHaveBeenCalled();
+    expect(await h.upvotes(h.project)).toEqual({});
+  });
+
   it('12: judge on: a doc the hook path credited is not sent to the judge again', async () => {
     await h.setUp();
     const { output, files } = await h.recall('redis timeout');
@@ -2150,7 +2223,7 @@ describe('recall attribution acceptance (#884)', () => {
     await h.stop();
     expect(await h.upvotes(h.project)).toEqual({});
     await h.judgeStop(Harness.bashEntries('toolu_recall', 'teamai recall "redis timeout"', output));
-    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['redis-timeout'], { 'redis-timeout': files[0] }, expect.any(Array));
+    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['redis-timeout'], { 'redis-timeout': files[0] }, expect.any(Array), expect.anything());
     expect(await h.upvotes(h.project)).toEqual({ 'redis-timeout': 1 });
   });
 
@@ -2170,7 +2243,7 @@ describe('recall attribution acceptance (#884)', () => {
       { type: 'assistant', message: { id: 'msg-recall', content: [{ type: 'text', text: '<!-- teamai:recalled-doc-ids: [redis-timeout] -->' }] } },
     ]);
     // The path arg is backfilled from the recall log, not the (pathless) transcript.
-    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['redis-timeout'], { 'redis-timeout': h.docs['redis-timeout'] }, expect.any(Array));
+    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['redis-timeout'], { 'redis-timeout': h.docs['redis-timeout'] }, expect.any(Array), expect.anything());
     expect(await h.upvotes(h.project)).toEqual({ 'redis-timeout': 1 });
   });
 
@@ -2195,7 +2268,7 @@ describe('recall attribution acceptance (#884)', () => {
     // ungrounded (votes-judge drops a candidate with no readable excerpt — see
     // votes-judge.test.ts); the mock here echoes ids regardless, so this asserts
     // the handler's contribution (no path handed over), which is the fix.
-    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['setup'], {}, expect.any(Array));
+    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['setup'], {}, expect.any(Array), expect.anything());
   });
 
   it('12: judge on: a doc the transcript shows only in a Glob listing, which the hook path does not credit, is judged → +1', async () => {
@@ -2210,7 +2283,7 @@ describe('recall attribution acceptance (#884)', () => {
       { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_glob', name: 'Glob', input: glob }] } },
       { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_glob', content: files[0] }] } },
     ]);
-    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['redis-timeout'], expect.any(Object), expect.any(Array));
+    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['redis-timeout'], expect.any(Object), expect.any(Array), expect.anything());
     expect(await h.upvotes(h.project)).toEqual({ 'redis-timeout': 1 });
   });
 
@@ -2237,7 +2310,7 @@ describe('recall attribution acceptance (#884)', () => {
     expect(files[0]).toBe(path.join(h.teamRepo, 'docs', 'learnings', 'setup.md'));
     await h.stop();
     await h.judgeStop(Harness.bashEntries('toolu_recall', 'teamai recall "setup installer flags"', output));
-    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['setup'], expect.any(Object), expect.any(Array));
+    expect(judgeAdoption).toHaveBeenCalledWith('Raised the pool size.', ['setup'], expect.any(Object), expect.any(Array), expect.anything());
     expect(await h.upvotes(h.project)).toEqual({ 'learnings/setup': 1 });
   });
 

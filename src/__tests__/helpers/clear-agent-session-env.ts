@@ -1,7 +1,9 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterAll } from 'vitest';
+import { afterAll, vi } from 'vitest';
+import { ATTEMPT_ENV, LAUNCHED_BY_ENV, RUN_MODE_ENV } from '../../launch-context.js';
+import { homeVariables, isToolId, TOOLS } from '../../tools.js';
 import { GIT_REPOSITORY_ENV } from '../../utils/git-env.js';
 import { AGENT_SESSION_ENV } from '../../utils/session-id.js';
 
@@ -10,16 +12,22 @@ import { AGENT_SESSION_ENV } from '../../utils/session-id.js';
 // agentSessionIdFromEnv; a test that does not isolate HOME would also write
 // that live session's state into the real ~/.teamai. Start every test file,
 // and the CLIs it spawns, with none set (an OpenCode shell's
-// TEAMAI_AGENT_SESSION_ID and a Pi shell's PI_SESSION_ID included).
-for (const name of AGENT_SESSION_ENV) {
+// TEAMAI_AGENT_SESSION_ID and a Pi shell's PI_SESSION_ID included). A workflow
+// step that runs the tests carries its runner's TEAMAI_WORKFLOW_ATTEMPT, which
+// would make a spawned `workflow report --driver skill` that runner, and a
+// launched step's TEAMAI_LAUNCHED_BY keeps its sessions out of the totals. CI
+// runners set CI, and a shell may set TEAMAI_MODE, either of which makes every
+// workflow run here unattended; a test that needs that mode sets it. Both
+// vitest configs seed these in `test.env`, so the scrub always has one to remove.
+for (const name of [...AGENT_SESSION_ENV, ATTEMPT_ENV, LAUNCHED_BY_ENV, RUN_MODE_ENV, 'CI']) {
   delete process.env[name];
 }
 
-// The same shell may relocate an agent's root (CLAUDE_CONFIG_DIR, COPILOT_HOME,
-// OPENCLAW_STATE_DIR), which teamai honors, so a test that stubs only HOME
-// would still read, write or remove the developer's real Claude Code, Copilot
-// or OpenClaw files. A test that needs one sets it.
-for (const name of ['CLAUDE_CONFIG_DIR', 'COPILOT_HOME', 'OPENCLAW_STATE_DIR']) {
+// The same shell may relocate an agent's root (CLAUDE_CONFIG_DIR, and every
+// home `TOOLS[tool].home.moves` names), which teamai honors, so a test that
+// stubs only HOME would still read, write or remove the developer's real tool
+// files. A test that needs one sets it.
+for (const name of ['CLAUDE_CONFIG_DIR', ...Object.keys(TOOLS).filter(isToolId).flatMap(homeVariables)]) {
   delete process.env[name];
 }
 
@@ -44,3 +52,10 @@ process.env.PATH = `${shadow}${path.delimiter}${process.env.PATH ?? ''}`;
 afterAll(() => {
   fs.rmSync(shadow, { recursive: true, force: true });
 });
+
+// The lists above load product modules (session-id.js reaches types.ts and,
+// through it, utils/fs.js and utils/logger.js), and a module a setup file
+// loaded is cached before a test file's vi.mock applies: the test would mock
+// utils/fs.js and still reach the real one through them. Drop them, so each
+// test file loads its own, mocked as it asks.
+vi.resetModules();

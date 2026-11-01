@@ -195,12 +195,35 @@ describe('doctor — MCP servers delivered on disk', () => {
     expect(check.fix).toContain("not the team's definition: docs");
   });
 
-  it('reports a tool config that cannot be parsed', async () => {
+  it.each([
+    ['claude', '.claude.json', '{ not json', 'JSON'],
+    ['codex', '.codex/config.toml', 'model = [', 'TOML'],
+  ])('reports a %s config that cannot be parsed, with its repair format', async (tool, relativePath, broken, format) => {
+    teamConfig.toolPaths!.codex = { skills: '.codex/skills', mcp: '.codex/config.toml' };
+    const file = path.join(homeDir, relativePath);
+    await fse.outputFile(file, broken);
+
+    const check = await mcpCheck(tool);
+    expect(await check.check()).toBe(false);
+    expect(check.fix).toContain('could not be parsed');
+    expect(check.fix!.split(file).length - 1).toBe(1);
+    expect(check.fix).toContain(`Fix the ${format}, or move the file aside, then run \`teamai pull\``);
+    expect(check.fix).not.toContain('env/env.yaml');
+  });
+
+  it('keeps env advice when a config parse failure and unresolved variable coexist', async () => {
+    await writeTeamMcp(
+      'servers:\n  - name: jira\n    transport: stdio\n    command: jira-server\n'
+        + '    env:\n      TOKEN: "${MISSING_TOKEN}"\n',
+    );
     await fse.writeFile(path.join(homeDir, '.claude.json'), '{ not json');
 
     const check = await mcpCheck();
     expect(await check.check()).toBe(false);
     expect(check.fix).toContain('could not be parsed');
+    expect(check.fix).toContain('MISSING_TOKEN');
+    expect(check.fix).toContain('env/env.yaml');
+    expect(check.fix).toContain('teamai env add MISSING_TOKEN --secret');
   });
 
   it('fails when mcp.yaml is present but does not parse', async () => {
@@ -948,6 +971,12 @@ describe('doctor — MCP servers delivered on disk', () => {
 
     it('passes once Codex trusts the project by its real path', async () => {
       await writeCodexConfig(trusted(await fse.realpath(projectRoot)));
+
+      expect(await (await trustCheck())?.check()).toBe(true);
+    });
+
+    it('accepts a BOM-prefixed config that trusts the project', async () => {
+      await writeCodexConfig('\uFEFF' + trusted(await fse.realpath(projectRoot)));
 
       expect(await (await trustCheck())?.check()).toBe(true);
     });

@@ -110,7 +110,9 @@ beforeAll(() => {
   fs.mkdirSync(path.join(project, '.claude'), { recursive: true });
   env = {
     ...process.env,
-    HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'),
+    HOME: home, USERPROFILE: home,
+    LOCALAPPDATA: path.join(home, 'AppData', 'Local'), APPDATA: path.join(home, 'AppData', 'Roaming'),
+    HERMES_HOME: path.join(home, '.hermes'), XDG_CONFIG_HOME: path.join(home, '.config'),
     GIT_CONFIG_GLOBAL: path.join(home, '.gitconfig'), GIT_CONFIG_NOSYSTEM: '1',
     GIT_AUTHOR_NAME: 'member', GIT_AUTHOR_EMAIL: 'member@example.invalid',
     GIT_COMMITTER_NAME: 'member', GIT_COMMITTER_EMAIL: 'member@example.invalid',
@@ -143,6 +145,10 @@ beforeAll(() => {
   }));
   const pulled = run(['pull']);
   expect(pulled.code, pulled.output).toBe(0);
+  // The first pull may materialise tracked text through its own writer. Reset
+  // the team checkout to the filtered HEAD before the edit scenarios so the
+  // fixture tests origin routing, not unrelated checkout dirtiness.
+  git(['reset', '--hard', 'HEAD'], clone);
   fs.renameSync(sandbox, template);
 });
 
@@ -150,11 +156,137 @@ beforeEach(() => {
   fs.cpSync(template, sandbox, { recursive: true, preserveTimestamps: true, verbatimSymlinks: true });
 });
 
+/** Rebuild only the current test's team checkout as a real CRLF clone. */
+function useCrlfTeamCheckout(): void {
+  const clone = path.join(project, '.teamai', 'team-repo');
+  fs.rmSync(clone, { recursive: true, force: true });
+  git(['-c', 'core.autocrlf=true', 'clone', '-q', origin, clone]);
+  // Keep the same setting for the Git reads teamai performs after clone.
+  git(['config', 'core.autocrlf', 'true'], clone);
+  fs.rmSync(path.join(project, '.claude', 'skills', 'a-skill'), { recursive: true, force: true });
+  const pulled = run(['pull', '--force']);
+  expect(pulled.code, pulled.output).toBe(0);
+  expect(fs.readFileSync(path.join(project, '.claude', 'skills', 'a-skill', 'SKILL.md'), 'utf8'))
+    .toContain('\r\n');
+}
+
 afterEach(() => fs.rmSync(sandbox, { recursive: true, force: true }));
 
 afterAll(() => fs.rmSync(fixtureRoot, { recursive: true, force: true }));
 
+describe('explicit shared-root pushes (#1314)', () => {
+  it('publishes a new document scanned from the clone without colliding with itself', () => {
+    const clone = path.join(project, '.teamai/team-repo');
+    writeFile(path.join(clone, 'docs/new.md'), '# Shared document\n');
+    const pushed = run(['push', '--all', '--shared']);
+    const branches = git(['for-each-ref', '--format=%(refname:short)', 'refs/heads/teamai/push/'], origin).split('\n').filter(Boolean);
+    expect(branches.length, pushed.output).toBe(1);
+    expect(git(['show', `${branches[0]}:docs/new.md`], origin)).toContain('Shared document');
+  }, 120000);
+
+  it('refuses an explicit shared push when the clone cannot refresh collision evidence', () => {
+    commitOnTeam('agents/race.md', '---\nname: race\ndescription: teammate\n---\nTeammate instructions.\n');
+    writeFile(path.join(project, '.claude/agents/race.md'), '---\nname: race\ndescription: member\n---\nMember instructions.\n');
+    const clone = path.join(project, '.teamai/team-repo');
+    git(['remote', 'set-url', '--push', 'origin', origin], clone);
+    git(['remote', 'set-url', 'origin', 'https://127.0.0.1:9/unreachable.git'], clone);
+    const pushed = run(['push', '--all', '--shared']);
+    expect(pushed.code, pushed.output).not.toBe(0);
+    expect(pushed.output).toContain('could not be refreshed');
+    expect(pushed.output).not.toContain('--role <ns>');
+    expect(pushedFiles()).toEqual([]);
+  }, 120000);
+
+  it('keeps a namespaced rule review intact when a separate explicit root review is requested', () => {
+    writeFile(path.join(project, '.claude', 'rules', 'root-review.md'), '# A new rule\n');
+    const first = run(['push', '--all', '--project', 'svc-a']);
+    const oldBranch = git(['for-each-ref', '--format=%(refname)', 'refs/heads/teamai/push/'], origin);
+    expect(oldBranch, first.output).not.toBe('');
+    const oldHead = git(['rev-parse', oldBranch], origin);
+    const branch = 'teamai/push/member/shared-review';
+    const shared = run(['push', '--all', '--shared', '--branch', branch]);
+    expect(git(['show', `${branch}:rules/root-review.md`], origin), shared.output).toContain('A new rule');
+    expect(git(['rev-parse', oldBranch], origin)).toBe(oldHead);
+    expect(git(['show', `${oldBranch}:rules/svc-a/root-review.md`], origin)).toContain('A new rule');
+  }, 120000);
+
+  it('pushes new shared resources and reuses the root review destination on the next edit', () => {
+    commitOnTeam('manifest/roles.yaml', YAML.stringify({ version: 1, roles: [{ id: 'dev', description: 'Developer', resources: { skills: ['svc-a'], knowledge: ['svc-a'], agents: [] } }] }));
+    setConfig({ primaryRole: 'dev' });
+    const skill = path.join(project, '.claude', 'skills', 'shared-new', 'SKILL.md');
+    writeFile(skill, skillMd('shared-new'));
+    writeFile(path.join(project, '.claude', 'rules', 'shared-rule.md'), '# Shared rule\n');
+    writeFile(path.join(project, '.claude', 'agents', 'shared-agent.md'), '---\nname: shared-agent\ndescription: shared agent\n---\nShared instructions.\n');
+    const first = run(['push', '--all', '--shared']);
+    const expected = ['skills/shared-new/SKILL.md', 'rules/shared-rule.md', 'agents/shared-agent.yaml'];
+    expect(pushedFiles(), first.output).toEqual(expect.arrayContaining(expected));
+    expect(pushedFiles().some(file => file.includes('svc-a/shared'))).toBe(false);
+    const branches = git(['for-each-ref', '--format=%(refname)', 'refs/heads/teamai/push/'], origin);
+    fs.appendFileSync(skill, '\nSecond shared edit.\n');
+    const again = run(['push', '--all', '--shared']);
+    expect(pushedFiles(), again.output).toEqual(expect.arrayContaining(expected));
+    expect(git(['for-each-ref', '--format=%(refname)', 'refs/heads/teamai/push/'], origin)).toBe(branches);
+    const branch = branches.split('\n')[0];
+    const review = run(['review', '--branch', branch.replace('refs/heads/', ''), '--json']);
+    const findings = JSON.parse(review.output) as { findings: { check: string; message: string }[] };
+    expect(findings.findings.filter(finding => finding.check === 'structure' && /undeclared|not declared/.test(finding.message)), review.output).toEqual([]);
+    expect(git(['show', `${branch}:skills/shared-new/SKILL.md`], origin)).toContain('Second shared edit.');
+    git(['update-ref', 'refs/heads/main', git(['rev-parse', branch], origin)], origin);
+    commitOnTeam('tags.yaml', YAML.stringify({ skills: { 'shared-new': ['shared'] } }));
+    setConfig({ subscribedTags: ['shared'] });
+    const pulled = run(['pull']);
+    expect(pulled.code, pulled.output).toBe(0);
+    fs.appendFileSync(skill, '\nEdit after merge.\n');
+    const mergedEdit = run(['push', '--all']);
+    const nextBranches = git(['for-each-ref', '--format=%(refname)', 'refs/heads/teamai/push/'], origin).split('\n');
+    const next = nextBranches.find(name => !branches.split('\n').includes(name));
+    expect(next, mergedEdit.output).toBeDefined();
+    expect(git(['show', `${next}:skills/shared-new/SKILL.md`], origin)).toContain('Edit after merge.');
+  }, 120000);
+});
+
 describe('push an edit of a skill pull kept after a project switch (#1020)', () => {
+  it('pushes an LF-recorded edit when another namespace stores the same skill with CRLF', () => {
+    commitOnTeam('skills/svc-b/a-skill/SKILL.md', skillMd('a-skill').replace(/\n/g, '\r\n'));
+    git(['pull', '-q', 'origin', 'main'], path.join(project, '.teamai', 'team-repo'));
+    const localSkill = path.join(project, '.claude', 'skills', 'a-skill', 'SKILL.md');
+    expect(fs.readFileSync(localSkill, 'utf8')).not.toContain('\r\n');
+    expect(fs.readFileSync(path.join(project, '.teamai', 'team-repo', 'skills', 'svc-b', 'a-skill', 'SKILL.md'), 'utf8')).toContain('\r\n');
+    fs.appendFileSync(localSkill, '\nEdited after the CRLF namespace was added.\n');
+
+    const pushed = run(['push', '--all']);
+
+    expect(pushed.output).toContain('to:   skills/svc-a/a-skill');
+    expect(pushed.output).not.toContain('matches no single one of');
+    expect(pushedFiles()).toContain('skills/svc-a/a-skill/SKILL.md');
+  });
+
+  it('pushes an edit after core.autocrlf delivered the LF team skill as CRLF', () => {
+    useCrlfTeamCheckout();
+    const skillFile = path.join(project, '.claude', 'skills', 'a-skill', 'SKILL.md');
+    expect(fs.readFileSync(skillFile, 'utf8')).toContain('\r\n');
+    fs.appendFileSync(skillFile, '\r\nEdited after a CRLF delivery.\r\n');
+
+    const pushed = run(['push', '--skill', path.dirname(skillFile)]);
+
+    expect(pushed.output).toContain('to:   skills/svc-a/a-skill');
+    expect(pushedFiles()).toContain('skills/svc-a/a-skill/SKILL.md');
+  });
+
+  it('does not route a CRLF-delivered edit to a same-named CRLF candidate from another namespace', () => {
+    commitOnTeam('skills/svc-b/a-skill/SKILL.md', skillMd('a-skill').replace(/\n/g, '\r\n'));
+    useCrlfTeamCheckout();
+    const skillFile = path.join(project, '.claude', 'skills', 'a-skill', 'SKILL.md');
+    expect(fs.readFileSync(skillFile, 'utf8')).toContain('\r\n');
+    fs.appendFileSync(skillFile, '\r\nEdited with duplicate CRLF candidate.\r\n');
+
+    const pushed = run(['push', '--skill', path.dirname(skillFile)]);
+
+    expect(pushed.output).toContain('matches no single one of');
+    expect(pushed.output).not.toContain('to:   skills/svc-b/a-skill');
+    expect(pushedFiles()).toEqual([]);
+  });
+
   it('pushes two tool edits to their distinct delivered destinations', () => {
     const svcB = `${skillMd('a-skill')}\nThe svc-b version.\n`;
     commitOnTeam('skills/svc-b/a-skill/SKILL.md', svcB);
@@ -225,14 +357,19 @@ describe('push an edit of a skill pull kept after a project switch (#1020)', () 
   });
 
   it('resolves a legacy delivered duplicate against every namespace, not only the first', () => {
-    commitOnTeam('skills/z-archive/a-skill/SKILL.md', `${skillMd('a-skill')}\nDelivered from z-archive.\n`);
+    const legacy = `${skillMd('a-skill')}\nDelivered from z-archive.\n`;
+    commitOnTeam('skills/z-archive/a-skill/SKILL.md', legacy);
     commitOnTeam('manifest/projects.yaml', null);
     setConfig({ projects: [], primaryRole: undefined });
 
     const pulled = run(['pull']);
     expect(pulled.code, pulled.output).toBe(0);
+    // An older CLI delivered whichever copy the filesystem listed first; pull
+    // now delivers the same one on every machine (#1577), so the copy that
+    // CLI could leave is written here with its record entry.
     const localSkill = path.join(project, '.claude', 'skills', 'a-skill', 'SKILL.md');
-    expect(fs.readFileSync(localSkill, 'utf8')).toContain('Delivered from z-archive.');
+    writeFile(localSkill, legacy);
+    recordDeliveredCopies({ [fs.realpathSync(localSkill)]: contentHash(legacy) });
     fs.appendFileSync(localSkill, '\nEdited after the legacy pull.\n');
 
     const pushed = run(['push', '--all']);
@@ -1092,6 +1229,40 @@ describe('push places a new resource by the active projects (#1021)', () => {
 
     expect(pushed.output).toContain('[rules] new-rule → rules/new-rule.md (shared with everyone: no namespace resolved)');
     expect(pushedFiles()).toEqual(['rules/new-rule.md']);
+  });
+});
+
+describe('push --role places only where a role or project declares the namespace for that type (#1101)', () => {
+  it('pushes nothing for a namespace no role or project declares', () => {
+    writeFile(path.join(project, '.claude', 'rules', 'new-rule.md'), '# new rule\n');
+
+    const pushed = run(['push', '--all', '--role', 'rogue']);
+
+    expect(pushed.code, pushed.output).toBe(2);
+    expect(pushed.output).toContain('--role rogue');
+    expect(pushedFiles()).toEqual([]);
+  });
+
+  it('pushes nothing for a new skill under a namespace no role or project declares', () => {
+    writeFile(path.join(project, '.claude', 'skills', 'new-skill', 'SKILL.md'), skillMd('new-skill'));
+
+    const pushed = run(['push', '--all', '--role', 'rogue']);
+
+    expect(pushed.code, pushed.output).toBe(2);
+    expect(pushed.output).toContain('--role rogue');
+    expect(pushedFiles()).toEqual([]);
+  });
+
+  it('pushes nothing for a namespace declared for other types only', () => {
+    // platform declares skills, knowledge and learnings, not docs.
+    writeFile(path.join(project, '.teamai', 'team-repo', 'docs', 'guide.md'), '# guide\n');
+
+    const pushed = run(['push', '--all', '--role', 'platform']);
+
+    expect(pushed.code, pushed.output).toBe(2);
+    expect(pushed.output).toContain('--role platform');
+    expect(pushed.output).toContain('docs');
+    expect(pushedFiles()).toEqual([]);
   });
 });
 

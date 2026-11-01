@@ -188,6 +188,8 @@ function runGit(args: string[], cwd: string): Promise<ExecResult> {
  */
 async function locateExclude(dir: string): Promise<{ excludeFile: string; root: string; prefix: string } | { error: string }> {
   if (await gitFindsNoRepository(dir)) return { error: `${dir} is not in a git repository` };
+  // git cannot start there: an agent's config directory not created yet.
+  if (!await pathExists(dir)) return { error: `${dir} does not exist` };
   const located = await checkoutLocation(dir);
   if (located) return { excludeFile: located.excludeFile, root: located.toplevel, prefix: located.prefix };
   const result = await runGit(['rev-parse', '--show-toplevel', '--show-prefix', '--git-path', 'info/exclude'], dir);
@@ -452,6 +454,13 @@ async function readExisting(file: string): Promise<string | null> {
   }
 }
 
+let lockRetryMs = 100;
+
+/** Shorten the wait between lock attempts in {@link updateFileLocked} (for testing only). */
+export function _setExcludeLockRetryMs(ms: number): void {
+  lockRetryMs = ms;
+}
+
 /**
  * Rewrite `file` with `edit` (null: leave it as it is), holding a lock
  * across the read and an atomic write: the worktrees of a repository share
@@ -478,7 +487,7 @@ export async function updateFileLocked(
   let held = false;
   for (let attempt = 0; attempt < 25 && !held; attempt++) {
     held = await acquireLock(lockPath);
-    if (!held) await new Promise((resolve) => setTimeout(resolve, 100));
+    if (!held) await new Promise((resolve) => setTimeout(resolve, lockRetryMs));
   }
   if (!held) return 'locked';
   try {
@@ -706,10 +715,10 @@ export async function sync(
     const wanted = placed.filter((p) => !tracked.some((t) => t.path === p.path)).map((p) => p.line);
     const next = (current: string[]): string[] => [...new Set([...addOnly ? current : [], ...wanted])].sort();
     const { lines, ...outcome } = await writeOwnerLines(excludeFile, owner.name, next, options.dryRun);
-    const reincluded = options.dryRun || outcome.write.kind !== 'written' && outcome.write.kind !== 'unchanged'
+    const reincludedLines = options.dryRun || outcome.write.kind !== 'written' && outcome.write.kind !== 'unchanged'
       ? []
       : await reincludedPaths(placed.filter((p) => lines.includes(p.line)), checkFailed);
-    result.files.push({ excludeFile, ...outcome, lines, tracked, reincluded, checkFailed });
+    result.files.push({ excludeFile, ...outcome, lines, tracked, reincluded: reincludedLines, checkFailed });
     if (outcome.write.kind === 'written' || outcome.write.kind === 'unchanged') (lines.length > 0 ? add : drop).push(excludeFile);
   }
   if (!options.dryRun && owner.record && (add.length > 0 || drop.length > 0)) await owner.record.update({ add, drop });
@@ -1232,7 +1241,7 @@ export function stateHomeRecord(stateHome: string, owner: string): GitExcludeFil
     try {
       parsed = JSON.parse(content);
     } catch (e) {
-      throw new Error(`${file} is not valid JSON (${e instanceof Error ? e.message : String(e)}): fix or delete it, then run the command again.`);
+      throw new Error(`${file} is not valid JSON (${e instanceof Error ? e.message : String(e)}): fix or delete it, then run the command again.`, { cause: e });
     }
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
       throw new Error(`${file} does not hold an object: fix or delete it, then run the command again.`);

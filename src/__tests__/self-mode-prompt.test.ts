@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
 
 vi.mock('../utils/logger.js', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(), dim: vi.fn() },
@@ -26,7 +26,7 @@ import { askSelection } from '../utils/prompt.js';
 import { detectHomeInstalledAgents } from '../known-agents.js';
 
 describe('promptForSelfModeAgents — interactive Auto option', () => {
-  let logSpy: ReturnType<typeof vi.spyOn>;
+  let logSpy: MockInstance<typeof console.log>;
   let originalIsTTY: boolean | undefined;
 
   beforeEach(() => {
@@ -71,11 +71,11 @@ describe('promptForSelfModeAgents — interactive Auto option', () => {
     expect(result).toEqual(['cursor']);
   });
 
-  it('offers exactly 10 options (Auto + 9 tools)', async () => {
+  it('offers exactly 11 options (Auto + 10 tools)', async () => {
     vi.mocked(askSelection).mockResolvedValueOnce([0]);
     await promptForSelfModeAgents({});
     const [, itemCount] = vi.mocked(askSelection).mock.calls[0];
-    expect(itemCount).toBe(10);
+    expect(itemCount).toBe(11);
   });
 
   it('offers Muse Code with its ~/.config/muse root', async () => {
@@ -83,6 +83,13 @@ describe('promptForSelfModeAgents — interactive Auto option', () => {
     await promptForSelfModeAgents({});
     const printed = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
     expect(printed).toContain('10. Muse Code  (.config/muse)');
+  });
+
+  it('offers Antigravity with its ~/.gemini/config root', async () => {
+    vi.mocked(askSelection).mockResolvedValueOnce([0]);
+    await promptForSelfModeAgents({});
+    const printed = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(printed).toContain('11. Antigravity  (.gemini/config)');
   });
 
   it('renders "none detected" when HOME has no known tools, and Auto → claude', async () => {

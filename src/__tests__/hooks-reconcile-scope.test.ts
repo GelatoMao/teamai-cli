@@ -17,7 +17,7 @@ vi.mock('../utils/logger.js', () => ({
 import { resolveAnchors, listWorktrees } from '../utils/git.js';
 import { resetBundledRuntimeCache } from '../bundled-runtime.js';
 import { findOnPath } from '../utils/lookpath.js';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { claudeHookOtherHostSkip, reconcileHooks, reconcileHooksToAllTools, reconcileTeamHooksForConfig } from '../hooks.js';
 import * as gitHook from '../git-hook.js';
 import { readWorkspaceChildren } from '../workspace-children.js';
@@ -232,7 +232,7 @@ hooks:
       },
     });
 
-    const [command] = (await cursorSettings()).hooks.stop.map((entry) => entry.command).filter((c) => c.includes('ws-hook-ran'));
+    const command = (await cursorSettings()).hooks.stop.map((entry) => entry.command).find((c) => c.includes('ws-hook-ran'));
     const runIn = (cwd: string): string => execFileSync('sh', ['-c', command!], { cwd, encoding: 'utf8' });
     expect(runIn(root)).toBe('ws-hook-ran\n');
     expect(runIn(path.join(root, 'notes'))).toBe('ws-hook-ran\n');
@@ -301,13 +301,13 @@ hooks:
     await setUp(child, 'x');
     execFileSync('git', ['worktree', 'add', '-q', worktree], { cwd: child, env: gitEnv });
     await setUp(other, 'https://git.example.com/other/team.git');
-    const { readWorkspaceChildren } = await import('../workspace-children.js');
-    const configured = await readWorkspaceChildren({ ...localConfig(), dataHome: path.join(project, '.teamai') });
+    const { readWorkspaceChildren: freshReadWorkspaceChildren } = await import('../workspace-children.js');
+    const configured = await freshReadWorkspaceChildren({ ...localConfig(), dataHome: path.join(project, '.teamai') });
     expect(configured.children?.children.map((found) => found.path)).toEqual(['svc-a']);
 
     await reconcileTeamHooksForConfig(teamConfig, configured);
 
-    const [command] = (await cursorSettings()).hooks.stop.map((entry) => entry.command).filter((c) => c.includes('ws-hook-ran'));
+    const command = (await cursorSettings()).hooks.stop.map((entry) => entry.command).find((c) => c.includes('ws-hook-ran'));
     const runIn = (cwd: string): string => execFileSync('sh', ['-c', command!], { cwd, encoding: 'utf8' });
     expect(runIn(root)).toBe('ws-hook-ran\n');
     expect(runIn(child)).toBe('');
@@ -561,8 +561,8 @@ builtin:
     await reconcileTeamHooksForConfig(teamConfig, localConfig());
 
     const cursor = await cursorSettings();
-    // TodoWrite dropped → 2 built-in postToolUse entries instead of 3.
-    expect(cursor.hooks.postToolUse).toHaveLength(2);
+    // TodoWrite dropped → 1 built-in postToolUse entry instead of 2.
+    expect(cursor.hooks.postToolUse).toHaveLength(1);
     expect(cursor.hooks.postToolUse.some((h) => h.command.includes('TodoWrite'))).toBe(false);
     // Stop timeout overridden.
     expect((cursor.hooks.stop[0] as { timeout?: number }).timeout).toBe(99);
@@ -594,6 +594,44 @@ builtin:
     const projectClaude = await fse.readJson(path.join(project, '.claude', 'settings.json'));
     expect(projectClaude.hooks.SessionStart).toHaveLength(1);
     expect(await fse.pathExists(path.join(home, '.claude', 'settings.json'))).toBe(false);
+  });
+
+  it('runs self-mode team hooks on OpenCode and OMP in the project, not outside it (#1492)', async () => {
+    await fse.ensureDir(path.join(home, '.config', 'opencode'));
+    await fse.ensureDir(path.join(home, '.omp', 'agent'));
+    const selfConfig = {
+      repo: { localPath: repo, remote: 'x', kind: 'self', businessRepoRoot: project },
+      username: 'u',
+      scope: 'project',
+      projectRoot: project,
+      additionalRoles: [],
+    } as unknown as LocalConfig;
+    await writeYaml(`
+hooks:
+  - id: self-bridge
+    description: self-mode bridge hook
+    event: SessionStart
+    command: printf SELF_BRIDGE
+    tools: [opencode, omp]
+`);
+
+    const bridgeConfig = {
+      ...teamConfig,
+      toolPaths: {
+        ...teamConfig.toolPaths,
+        opencode: { settings: '.config/opencode/opencode.json' },
+        omp: { settings: '.omp/agent/settings.json' },
+      },
+    } as unknown as TeamaiConfig;
+    await reconcileTeamHooksForConfig(bridgeConfig, selfConfig);
+
+    const { runBridgedTeamHooks } = await import('../bridged-team-hooks.js');
+    const elsewhere = path.join(home, 'elsewhere');
+    await fse.ensureDir(elsewhere);
+    for (const tool of ['opencode', 'omp']) {
+      expect(JSON.parse((await runBridgedTeamHooks(tool, 'SessionStart', JSON.stringify({ cwd: project }))).stdout), tool).toEqual({ context: 'SELF_BRIDGE' });
+      expect((await runBridgedTeamHooks(tool, 'SessionStart', JSON.stringify({ cwd: elsewhere }))).stdout, tool).toBe('');
+    }
   });
 
   it('keeps the Claude hook a self-mode workspace installed when a child defines it differently (#913)', async () => {
@@ -640,7 +678,7 @@ builtin:
       async (found, entry) => [...await found, ...entry.isDirectory() ? await manifests(path.join(dir, entry.name))
         : entry.name === 'managed-hooks.json' ? [path.join(dir, entry.name)] : []], Promise.resolve([]));
     const heldRecords = async (): Promise<string[]> => (await Promise.all([...await manifests(project), ...await manifests(home)]
-      .map(async (manifest) => ((await fse.readJson(manifest)).claude ?? []) as Array<{ id: string; command: string }>)))
+      .map(async (manifestFile) => ((await fse.readJson(manifestFile)).claude ?? []) as Array<{ id: string; command: string }>)))
       .flat().filter((record) => record.id === 'held').map((record) => record.command);
     expect(await heldRecords()).toEqual(['echo member-held']);
   });
@@ -1286,7 +1324,7 @@ hooks:
     tools: [${tool}]
 `;
 
-  it('renders the POSIX gate for codebuddy, which runs hooks through Git Bash', async () => {
+  it('renders the explicit CodeBuddy dispatcher on Windows so cmd.exe and Git Bash share one gate', async () => {
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
     try {
       await writeYaml(telemetryYaml('codebuddy'));
@@ -1294,28 +1332,20 @@ hooks:
       await reconcileTeamHooksForConfig(codebuddyOnly, localConfig());
 
       const [command] = await teamStopCommands('.codebuddy/settings.json');
-      expect(command.startsWith('if [ "$PWD" = ')).toBe(true);
-      expect(command.endsWith('); fi')).toBe(true);
-      // The runner names its cwd the MSYS way: on Windows that is `/c/...`,
-      // never the `C:\...` this root resolves to, so the gate must carry both
-      // spellings or it silently never fires. A root without a drive letter is
-      // already the shell's spelling and the gate carries a single test, which
-      // is what the suite's Linux and macOS jobs exercise.
-      if (/^[A-Za-z]:[\\/]/.test(project)) {
-        expect(command, 'a Windows root is tested in both spellings').toMatch(/\] \|\| \[ "\$PWD" = '\/[a-z]\//);
-      } else {
-        expect(command, 'a POSIX root needs one spelling').not.toContain(' || [ "$PWD" = ');
-      }
-      // 0.26.0 rendered a cmd.exe gate here. Git Bash cannot run it: `findstr`
-      // errors out, the gate never matches, and the `>nul` redirect leaves a
-      // file literally named `nul` in the project.
+      expect(command).toContain('teamai-codebuddy-hook');
+      expect(command).toContain('hook-dispatch Stop --tool codebuddy --team-hooks');
+      expect(command).toContain('--team-hook-id telemetry');
+      expect(command).toContain('--team-hook-gate ');
+      expect(command).toContain('--team-hook-command ');
+      // Both old forms put the project path in host-parsed shell source. The
+      // new form carries only base64url arguments through cmd.exe and Bash.
+      expect(command).not.toContain('if [ "$PWD" = ');
       expect(command).not.toContain('findstr');
       expect(command).not.toContain('exit /b 0');
     } finally {
       platformSpy.mockRestore();
     }
   });
-
   it('keeps the POSIX gate for a tool whose runner is not cmd.exe', async () => {
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
     try {
@@ -1357,6 +1387,15 @@ hooks:
     // A fresh file per call: entries for another root are kept by design, and
     // this reads back exactly the gate just rendered.
     await fse.remove(path.join(home, '.codebuddy', 'settings.json'));
+    // The root is deliberately under node_modules so Git Bash sees its native
+    // drive spelling. Make it a repository before reconcile so Git never walks
+    // up into the contributor checkout and installs hooks there.
+    await fse.ensureDir(root);
+    execFileSync('git', ['init', '-q'], { cwd: root });
+    const hookEntriesBefore = spawnSync('git', ['config', '--local', '--get-regexp', '^hook\\.teamai-'], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+    }).stdout;
     await writeYaml(`
 hooks:
   - id: gate
@@ -1368,6 +1407,11 @@ hooks:
 `);
     await fse.ensureDir(path.join(home, '.codebuddy'));
     await reconcileTeamHooksForConfig(codebuddyOnly, { ...localConfig(), projectRoot: root } as LocalConfig);
+    expect(await gitHook.gitHookStatus(root)).toEqual({ installed: true });
+    expect(spawnSync('git', ['config', '--local', '--get-regexp', '^hook\\.teamai-'], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+    }).stdout).toBe(hookEntriesBefore);
     const [command] = await teamStopCommands('.codebuddy/settings.json');
     expect(command).toBeDefined();
     return command;
@@ -1389,7 +1433,9 @@ hooks:
     });
   }
 
-  it.skipIf(!executor)(
+  // CodeBuddy renders this POSIX gate on macOS/Linux. Windows uses the
+  // dispatcher gate above, so there is no POSIX command to execute here.
+  it.skipIf(process.platform === 'win32' || !executor)(
     'fires inside the project and stays an exit-0 no-op outside it, under a real shell',
     async () => {
       const execRoot = await fse.mkdtemp(path.join(execBase, '.teamai-gate-'));
@@ -1433,8 +1479,33 @@ hooks:
     // than the cmd.exe the gate used to be tested with.
     60_000,
   );
-});
 
+  it('keeps the encoded project root and payload out of the cmd.exe command text', async () => {
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    try {
+      const root = path.join(project, 'sp&x');
+      await fse.ensureDir(root);
+      await writeYaml(`
+hooks:
+  - id: gate
+    description: gate probe
+    event: Stop
+    matcher: "*"
+    command: echo TEAMAI_GATE_PAYLOAD
+    tools: [codebuddy]
+`);
+      await fse.ensureDir(path.join(home, '.codebuddy'));
+      await reconcileTeamHooksForConfig(codebuddyOnly, { ...localConfig(), projectRoot: root } as LocalConfig);
+      const [command] = await teamStopCommands('.codebuddy/settings.json');
+      expect(command).not.toContain(root);
+      expect(command).not.toContain('TEAMAI_GATE_PAYLOAD');
+      expect(command).toMatch(/--team-hook-gate [A-Za-z0-9_-]+/);
+      expect(command).toMatch(/--team-hook-command [A-Za-z0-9_-]+/);
+    } finally {
+      platformSpy.mockRestore();
+    }
+  });
+});
 describe('reconcileHooks — a hook a workspace holds back (#913)', () => {
   // Every format a HOME-installed tool's gated team hook is written in.
   it.each(['cursor', 'copilot', 'zcode', 'codebuddy', 'codex-internal'])(

@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
+import type { LocalConfig } from '../types.js';
 
 const { mockSpawn, mockDispatcher } = vi.hoisted(() => ({
   mockSpawn: vi.fn(),
@@ -26,6 +27,7 @@ const { parseStdin, readStdin, trySpawnDetachedViaWmi, deriveDispatchSessionId, 
 const { claudeHookOtherHostSkip } = await import('../claude-hook-host.js');
 const { reconcileHooks } = await import('../hooks.js');
 const { log } = await import('../utils/logger.js');
+const { commitFile, initRepo, recordDelivery } = await import('./helpers/delivered-checkout.js');
 
 describe('readStdin', () => {
   it('closes a pipe after the EOF timeout so the hook process can exit', async () => {
@@ -58,6 +60,17 @@ describe('deriveDispatchSessionId', () => {
 });
 
 describe('hookDispatchCli', () => {
+  it.each(['scorer', 'recall-promote', 'codebase'])('skips the hooks of a session teamai launched for %s before reading stdin or resolving config, including background children', async (launchedBy) => {
+    const resolveScope = vi.spyOn(await import('../dashboard-collector.js'), 'resolveHookScopeFor');
+    const readFile = vi.spyOn(fs, 'readFileSync');
+    vi.stubEnv('TEAMAI_LAUNCHED_BY', launchedBy);
+    try {
+      for (const bgOnly of [false, true]) await hookDispatchCli('SessionStart', 'claude', '*', { bgOnly, stdinFile: '/missing-judge-payload' });
+      expect(resolveScope).not.toHaveBeenCalled();
+      expect(readFile).not.toHaveBeenCalledWith('/missing-judge-payload', expect.anything());
+    } finally { resolveScope.mockRestore(); readFile.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
   it('records why a Git hook cannot sync an unreadable project config, without dispatching', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'git-hook-broken-config-'));
     const previousCwd = process.cwd();
@@ -110,7 +123,7 @@ describe('hookDispatchCli', () => {
 
     const runPrefix = (extra: NodeJS.ProcessEnv, event?: string, matcher?: string): string => execFileSync(
       'sh',
-      ['-c', `${claudeHookOtherHostSkip(event, matcher, 'echo RAN')}echo RAN`],
+      ['-c', `${claudeHookOtherHostSkip(event, matcher, 'echo RAN', 'linux')}echo RAN`],
       { env: { PATH: process.env.PATH ?? '', HOME: bare, ...extra }, encoding: 'utf8' },
     );
     expect(runPrefix({ CURSOR_VERSION: '1.2.3' }, 'Stop')).toBe('RAN\n');
@@ -226,7 +239,7 @@ describe('hookDispatchCli', () => {
       ['entry not a command', file({ ...builtin, type: 'prompt' }), file({ ...team, type: 'prompt' }), false],
     ];
     const env = { COPILOT_PROJECT_DIR: project, COPILOT_HOME: copilotHome, HOME: root };
-    const guard = (): string => execFileSync('sh', ['-c', `${claudeHookOtherHostSkip('Stop', undefined, 'echo RAN')}echo RAN`],
+    const guard = (): string => execFileSync('sh', ['-c', `${claudeHookOtherHostSkip('Stop', undefined, 'echo RAN', 'linux')}echo RAN`],
       { env: { PATH: process.env.PATH ?? '', ...env }, encoding: 'utf8' });
     try {
       for (const [name, builtinFile, teamFile, runs] of rows) {
@@ -302,6 +315,73 @@ describe('hookDispatchCli', () => {
         else process.env[key] = saved[key];
       }
       fs.rmSync(stdinFile, { force: true });
+    }
+  });
+
+  it.each([
+    [{ CI: 'true', TEAMAI_WORKFLOW_ATTEMPT: 'r0123456789abcdef/a0000000a' }, { runMode: 'unattended', launchedBy: 'workflow' }],
+    [{}, { runMode: 'attended' }],
+  ])('forwards the run mode and launcher of %o to the detached pass, never the ones the host payload names (#1384)', async (env, forwarded) => {
+    const stdinFile = path.join(os.tmpdir(), `run-hook-${process.pid}-${Date.now()}.json`);
+    fs.writeFileSync(stdinFile, JSON.stringify({ hook_event_name: 'Stop', session_id: 's', cwd: process.cwd(), teamai_run: { runMode: 'unattended', launchedBy: 'host' } }));
+    let detachedPayload = '';
+    mockSpawn.mockReturnValue({
+      on: vi.fn(),
+      stdin: { on: vi.fn(), end: vi.fn((raw: string, done: () => void) => {
+        detachedPayload = raw;
+        done();
+      }) },
+      unref: vi.fn(),
+    });
+    for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+
+    try {
+      await hookDispatchCli('stop', 'claude', '*', { stdinFile });
+      expect(JSON.parse(detachedPayload).teamai_run).toEqual(forwarded);
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(stdinFile, { force: true });
+    }
+  });
+
+  it('captures the session before the detached pull starts, and hands it the capture and the one git state it read (#1178)', async () => {
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'capture-hook-')));
+    const team = path.join(root, 'team');
+    const project = path.join(root, 'project');
+    initRepo(team);
+    initRepo(project);
+    commitFile(project, 'README.md');
+    const rev = commitFile(team, 'skills/review/SKILL.md');
+    const config: LocalConfig = {
+      repo: { localPath: team, remote: 'local', kind: 'git' },
+      username: 'tester', scope: 'project', additionalRoles: [], projectRoot: project, dataHome: path.join(root, 'data'),
+    };
+    await recordDelivery(config, { rev, targets: ['claude'] });
+    const stdinFile = path.join(root, 'payload.json');
+    fs.writeFileSync(stdinFile, JSON.stringify({ hook_event_name: 'SessionStart', session_id: 'c1', cwd: project, source: 'startup', teamai_capture: 'from-host' }));
+    const resolveConfig = vi.spyOn(await import('../dashboard-collector.js'), 'resolveHookScopeFor').mockResolvedValue({ config, dir: project });
+    const capturesDir = path.join(root, 'data', 'sessions', 'captures', 'claude-code', 'c1');
+    let detachedPayload = '';
+    let capturedFirst: string[] = [];
+    mockSpawn.mockImplementation(() => {
+      capturedFirst = fs.existsSync(capturesDir) ? fs.readdirSync(capturesDir) : [];
+      return { on: vi.fn(), stdin: { on: vi.fn(), end: vi.fn((raw: string, done: () => void) => { detachedPayload = raw; done(); }) }, unref: vi.fn() };
+    });
+    const originalCwd = process.cwd();
+    vi.stubEnv('HOME', path.join(root, 'home'));
+
+    try {
+      await hookDispatchCli('session-start', 'claude', '*', { stdinFile });
+      expect(capturedFirst).toEqual([`${JSON.parse(detachedPayload).teamai_capture}.json`]);
+      expect(JSON.parse(fs.readFileSync(path.join(capturesDir, capturedFirst[0] ?? ''), 'utf8')).agent.team).toMatchObject({ revision: rev, localChanges: false });
+      const { agent } = JSON.parse(fs.readFileSync(path.join(capturesDir, capturedFirst[0] ?? ''), 'utf8'));
+      expect(JSON.parse(detachedPayload).teamai_git_at_start).toEqual({ head: agent.project.commit, dirty: agent.project.dirty });
+    } finally {
+      process.chdir(originalCwd);
+      vi.unstubAllEnvs();
+      resolveConfig.mockRestore();
+      mockSpawn.mockReset();
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 

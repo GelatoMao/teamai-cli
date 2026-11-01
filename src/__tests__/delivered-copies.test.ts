@@ -5,7 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import fc from 'fast-check';
 import { execFileSync } from 'node:child_process';
-import { classifyCopy, describeKeptDir, judgeRemoval, keepsTrackedCopy, type DeliveredFile } from '../resources/delivered-copies.js';
+import { classifyCopy, contentHash, openLedger, removeDelivered, describeKeptDir, isRecordedFromTeamSkill, judgeRemoval, keepsTrackedCopy, type DeliveredFile } from '../resources/delivered-copies.js';
 import { commitTeamRepo } from './helpers/team-repo-history.js';
 
 // #822 item 5: pull keeps a copy only when the record proves teamai wrote
@@ -54,6 +54,56 @@ describe('classifyCopy', () => {
         && copy.some((f) => f.disk !== null);
       expect(classifyCopy(copy).kind).toBe(proven ? 'keep' : 'write');
     }));
+  });
+});
+
+describe('isRecordedFromTeamSkill', () => {
+  it('accepts a CRLF delivery record for the LF blob in the team repo', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'delivered-crlf-'));
+    const repo = path.join(root, 'team');
+    const dest = path.join(root, 'home', 'skill');
+    const destFile = path.join(dest, 'SKILL.md');
+    const content = '---\nname: skill\ndescription: fixture\n---\n\n# Skill\n';
+    try {
+      fs.mkdirSync(path.join(repo, 'skills', 'team', 'skill'), { recursive: true });
+      fs.writeFileSync(path.join(repo, 'skills', 'team', 'skill', 'SKILL.md'), content);
+      commitTeamRepo(repo);
+      fs.mkdirSync(dest, { recursive: true });
+      const crlf = content.replace(/\n/g, '\r\n');
+      fs.writeFileSync(destFile, crlf);
+
+      expect(await isRecordedFromTeamSkill(
+        { [destFile]: contentHash(crlf) }, dest, repo, 'skills/team/skill',
+      )).toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps an exact LF record distinct from a CRLF version unless normalization is needed', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'delivered-line-ending-order-'));
+    const repo = path.join(root, 'team');
+    const dest = path.join(root, 'home', 'skill');
+    const destFile = path.join(dest, 'SKILL.md');
+    const lf = '---\nname: skill\ndescription: fixture\n---\n\n# Skill\n';
+    const crlf = lf.replace(/\n/g, '\r\n');
+    try {
+      fs.mkdirSync(path.join(repo, 'skills', 'lf', 'skill'), { recursive: true });
+      fs.mkdirSync(path.join(repo, 'skills', 'crlf', 'skill'), { recursive: true });
+      fs.writeFileSync(path.join(repo, 'skills', 'lf', 'skill', 'SKILL.md'), lf);
+      fs.writeFileSync(path.join(repo, 'skills', 'crlf', 'skill', 'SKILL.md'), crlf);
+      commitTeamRepo(repo);
+      execFileSync('git', ['config', 'core.autocrlf', 'false'], { cwd: repo });
+      fs.mkdirSync(dest, { recursive: true });
+      fs.writeFileSync(destFile, lf);
+      const record = { [destFile]: contentHash(lf) };
+
+      expect(await isRecordedFromTeamSkill(record, dest, repo, 'skills/lf/skill', { normalizeLineEndings: false })).toBe(true);
+      expect(await isRecordedFromTeamSkill(record, dest, repo, 'skills/crlf/skill', { normalizeLineEndings: false })).toBe(false);
+      expect(await isRecordedFromTeamSkill(record, dest, repo, 'skills/crlf/skill')).toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -174,5 +224,42 @@ describe('keepsTrackedCopy (#915)', () => {
 
     expect(await keepsTrackedCopy(copy)).toBe(true);
     expect(await keepsTrackedCopy(plain)).toBe(false);
+  });
+});
+
+describe('removeDelivered', () => {
+  let root: string;
+  beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'remove-delivered-')); });
+  afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
+
+  it('removes a copy and its descendant records while preserving neighboring copies', async () => {
+    const dest = path.join(root, 'release');
+    const child = path.join(dest, 'SKILL.md');
+    const sibling = path.join(root, 'release-notes', 'SKILL.md');
+    fs.mkdirSync(dest, { recursive: true });
+    fs.mkdirSync(path.dirname(sibling), { recursive: true });
+    fs.writeFileSync(child, 'release');
+    fs.writeFileSync(sibling, 'notes');
+    const ledger = openLedger({ [dest]: 'directory-record', [child]: 'release-hash', [sibling]: 'notes-hash' });
+
+    await removeDelivered(ledger, dest);
+
+    expect(fs.existsSync(dest)).toBe(false);
+    expect(fs.readFileSync(sibling, 'utf8')).toBe('notes');
+    expect(ledger.hashes).toEqual({ [sibling]: 'notes-hash' });
+  });
+
+  it('removes a file without a ledger', async () => {
+    const dest = path.join(root, 'rule.md');
+    fs.writeFileSync(dest, 'rule');
+    await removeDelivered(undefined, dest);
+    expect(fs.existsSync(dest)).toBe(false);
+  });
+
+  it('forgets a recorded copy that is already absent', async () => {
+    const dest = path.join(root, 'gone.md');
+    const ledger = openLedger({ [dest]: 'old-hash' });
+    await removeDelivered(ledger, dest);
+    expect(ledger.hashes).toEqual({});
   });
 });

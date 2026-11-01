@@ -36,6 +36,12 @@ teamai init --repo https://github.com/your-org/your-repo --scope user --role <ro
 
 ## FAQ
 
+**Q: `init` warns that member registration failed or the reports branch is busy?**
+
+Local setup still completes. A failed registration names the cause; fix it and
+re-run the same `teamai init` command to retry. If another write holds the
+`teamai-reports` branch, wait for it to finish, then re-run that command.
+
 **Q: A command says `Cannot acquire lock <path>: <reason>`?**
 
 The lock could not be inspected, created or reclaimed, including during a
@@ -75,11 +81,56 @@ In interactive mode, you'll be asked whether to overwrite — type `y` to confir
 teamai init --repo https://github.com/your-org/your-repo --force
 ```
 
+**Q: How do I move a workspace to another team, and what happens to the old team's files?**
+
+Run `init` with the new team repo and `--force`, then `pull`:
+
+```bash
+teamai init https://github.com/your-org/platform-team --agent claude,codex --force
+teamai pull
+```
+
+The pull removes the old team's skills and rules that teamai delivered and you did not change, from every tool. A copy you edited stays, and the pull names it:
+
+```text
+✔ [workspace] Synced 1 skills (1 new, 0 updated)
+    new: terraform-plan
+⚠ [workspace] Kept /work/app/.claude/skills/storybook: teamai no longer delivers storybook here, but you changed this copy. Delete it when you no longer need it.
+ℹ [workspace] Removed 2 skill(s) no longer delivered here: react-review, storybook.
+```
+
+| Before (frontend team) | After (platform team) |
+| --- | --- |
+| `.claude/skills/react-review` | removed |
+| `.claude/skills/storybook` (you edited it) | kept |
+| `.codex/skills/storybook` | removed |
+| `.claude/rules/frontend-style.md` | removed |
+| — | `.claude/skills/terraform-plan`, `.codex/skills/terraform-plan`, `.claude/rules/platform-style.md` |
+
+Hermes and OpenClaw are the exception. Your user scope and every project share their one skills directory (`~/.hermes/skills`), so the old team's skills stay there. Delete one yourself once no other install delivers it.
+
+**Q: Why are my team's Codex skills in `.agents/skills` instead of `.codex/skills`?**
+
+Codex reads both directories. teamai puts all of one team's skills in the same one, so a skill that links to another (`../lint/SKILL.md`) finds it. While `.agents/skills` holds teamai's copy of any team skill, for example one an older release wrote there, every team skill goes there:
+
+```text
+before pull                          after pull
+~/.agents/skills/lint     (teamai)   ~/.agents/skills/lint
+~/.codex/skills/review    (teamai)   ~/.agents/skills/review   <- moved, ../lint/SKILL.md resolves
+~/.agents/skills/my-notes (yours)    ~/.agents/skills/my-notes <- never touched
+```
+
+A skill of yours with a team skill's name is left alone: the team copy goes to `.codex/skills`, and every full pull prints `Codex skill conflict for <name>`. A copy of teamai's you edited in the other directory stays where it is, with a conflict line too. Without a teamai copy in `.agents/skills`, everything goes to `.codex/skills`.
+
 **Q: After `teamai init` in a project, there is no `.claude/` (or `.cursor/`, `.codebuddy/`) directory?**
 
 For a built-in tool, `init` without `--agent` and a non-interactive terminal does not create a tool root because you have not selected an agent. `teamai init` does not copy team skills, rules or MCP. Run `teamai init <repo> --agent claude` (or another agent ID) to create that tool's root and install its hooks. The team's resources arrive when that tool starts a session, or when you run `teamai pull`. You can also open the tool in the project. Its SessionStart hook creates the root and pulls resources.
 
 `teamai pull` does not create missing agent roots. The exception is the first pull in an inherited submodule clone, which seeds roots from the original submodule's configuration ([project checkouts](./distribution.md#project-checkouts)). For a custom agent defined only in `teamai.yaml`'s `toolPaths`, `init --agent <id>` creates its root during git-backed init. HTTP init cannot read local `teamai.yaml` paths, so it creates roots only for installed built-in agents.
+
+**Q: A `toolPaths` entry in `teamai.yaml` — what happens to the keys it does not name?**
+
+The entry replaces that tool's default whole: keys you omit are *gone*, not inherited. An entry that customizes `skills` but omits `settings` leaves the tool with no settings file, so hook reconciliation silently skips it; omitting `skills` or `rules` disables that delivery on purpose. `teamai doctor` names every key a custom entry dropped that the default table provides, with the value to add back.
 
 **Q: Hooks aren't firing automatically?**
 

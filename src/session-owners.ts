@@ -37,8 +37,8 @@ export function sharedSnapshotPath(name: ReportedSnapshotName): string {
   return path.join(getTeamaiHomeDir(), 'dashboard', `reported-${name}.json`);
 }
 
-/** The snapshot of the scope whose data home is `dataHome`. */
-export function snapshotPathIn(dataHome: string, name: ReportedSnapshotName): string {
+/** The snapshot of the scope whose data home is `dataHome`; `outcomes` is the one only a scope's own report keeps (#1387). */
+export function snapshotPathIn(dataHome: string, name: ReportedSnapshotName | 'outcomes'): string {
   const file = `reported-${name}.json`;
   if (path.resolve(dataHome) !== path.resolve(getTeamaiHomeDir())) return path.join(dataHome, 'dashboard', file);
   return path.join(dataHome, 'dashboard', `user-${file}`);
@@ -389,7 +389,7 @@ export async function creditedPrompts(credit: OwnerCredit, transcripts: string[]
     }
     return key;
   };
-  for (const transcript of [...transcripts].reverse()) {
+  for (const transcript of transcripts.toReversed()) {
     const content = await readFileSafe(transcript);
     if (content === null) continue;
     const prompts: string[] = [];

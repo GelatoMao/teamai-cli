@@ -3,17 +3,15 @@ import path from 'node:path';
 import fse from 'fs-extra';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { detectHomeInstalledAgents, KNOWN_AGENTS } from '../known-agents.js';
-import { resolveMcpTargets } from '../mcp-reconcile.js';
 import {
   agentFileExtensionForTool,
-  ALL_SUPPORTED_TOOLS,
   renderForTool,
 } from '../resources/agent-format.js';
-import { detectMcpFormat } from '../resources/mcp-format.js';
 import { ruleFileExtensionForTool, usesMdcRules } from '../resources/rule-format.js';
 import { TeamaiConfigSchema, scopedToolPaths } from '../types.js';
-import { isToolInstalledForConfig } from '../resources/base.js';
+import { isInstalled } from './helpers/install-gate.js';
 import type { LocalConfig } from '../types.js';
+import { AGENT_TOOLS } from '../tools.js';
 
 describe('Qoder CN support', () => {
   afterEach(() => vi.unstubAllEnvs());
@@ -49,7 +47,7 @@ describe('Qoder CN support', () => {
     const cnUser = userScoped['qoder-cn'] as Record<string, string>;
     const qoderUser = userScoped.qoder as Record<string, string>;
 
-    for (const key of ['skills', 'rules', 'settings', 'agents'] as const) {
+    for (const key of ['skills', 'rules', 'settings'] as const) {
       expect(cnUser[key]).toBe(`.qoder-cn/${key === 'settings' ? 'settings.json' : key}`);
       expect(cnUser[key]).not.toEqual(qoderUser[key]);
     }
@@ -63,7 +61,7 @@ describe('Qoder CN support', () => {
     const cnProject = projectScoped['qoder-cn'] as Record<string, string>;
     const qoderProject = projectScoped.qoder as Record<string, string>;
 
-    for (const key of ['skills', 'rules', 'settings', 'agents', 'mcpProject'] as const) {
+    for (const key of ['skills', 'rules', 'settings', 'mcpProject'] as const) {
       expect(cnProject[key]).toBe(qoderProject[key]);
       expect(cnProject[key].startsWith('.qoder/')).toBe(true);
     }
@@ -74,7 +72,7 @@ describe('Qoder CN support', () => {
       displayName: 'Qoder CN',
       skillsPath: '.qoder-cn/skills',
     });
-    expect(ALL_SUPPORTED_TOOLS).toContain('qoder-cn');
+    expect(AGENT_TOOLS).toContain('qoder-cn');
     expect(agentFileExtensionForTool('qoder-cn')).toBe('.md');
     expect(ruleFileExtensionForTool('qoder-cn')).toBe('.md');
     expect(usesMdcRules('qoder-cn')).toBe(false);
@@ -90,33 +88,7 @@ describe('Qoder CN support', () => {
     expect(renderForTool(spec, 'qoder-cn')).toEqual(renderForTool(spec, 'qoder'));
   });
 
-  it('uses the mcpServers JSON format in Qoder CN settings', () => {
-    expect(detectMcpFormat('qoder-cn')).toBe('claude');
-  });
 
-  it('resolves the installed Qoder CN settings file as an MCP target', async () => {
-    const home = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-qoder-cn-test-'));
-    try {
-      await fse.ensureDir(path.join(home, '.qoder-cn', 'skills'));
-      vi.stubEnv('HOME', home);
-      const config = TeamaiConfigSchema.parse({ team: 'test', repo: 'test/repo' });
-      const localConfig = {
-        repo: { localPath: path.join(home, 'team-repo'), remote: 'test/repo' },
-        username: 'test',
-        scope: 'user',
-        additionalRoles: [],
-      } as unknown as LocalConfig;
-
-      expect(await resolveMcpTargets(config, localConfig)).toContainEqual({
-        tool: 'qoder-cn',
-        format: 'claude',
-        file: path.join(home, '.qoder-cn', 'settings.json'),
-        projectScope: false,
-      });
-    } finally {
-      await fse.remove(home);
-    }
-  });
 
   it('counts each edition installed by its own HOME root or an explicit --agent entry, never the shared .qoder/', async () => {
     const home = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-qoder-editions-'));
@@ -134,16 +106,16 @@ describe('Qoder CN support', () => {
       }) as unknown as LocalConfig;
 
       // The shared project root installs neither edition by itself.
-      expect(await isToolInstalledForConfig('qoder', '.qoder/skills', localConfig())).toBe(false);
-      expect(await isToolInstalledForConfig('qoder-cn', '.qoder/skills', localConfig())).toBe(false);
+      expect(await isInstalled('qoder', 'skills', localConfig())).toBe(false);
+      expect(await isInstalled('qoder-cn', 'skills', localConfig())).toBe(false);
 
       // An explicit --agent entry bootstraps the edition before its app runs.
-      expect(await isToolInstalledForConfig('qoder-cn', '.qoder/skills', localConfig(['qoder-cn']))).toBe(true);
+      expect(await isInstalled('qoder-cn', 'skills', localConfig(['qoder-cn']))).toBe(true);
 
       // And each edition's own HOME root installs it.
       await fse.ensureDir(path.join(home, '.qoder', 'skills'));
-      expect(await isToolInstalledForConfig('qoder', '.qoder/skills', localConfig())).toBe(true);
-      expect(await isToolInstalledForConfig('qoder-cn', '.qoder/skills', localConfig())).toBe(false);
+      expect(await isInstalled('qoder', 'skills', localConfig())).toBe(true);
+      expect(await isInstalled('qoder-cn', 'skills', localConfig())).toBe(false);
     } finally {
       await fse.remove(home);
     }

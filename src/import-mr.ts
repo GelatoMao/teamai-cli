@@ -8,12 +8,13 @@ import { fetchGitHubPR } from './providers/github/mr-fetch.js';
 import { fetchGitLabMR } from './providers/gitlab/mr-fetch.js';
 import { fetchTGitMR } from './providers/tgit/mr-fetch.js';
 import type { MRData, MRFetchOptions, MRThread, LearningDraft } from './types.js';
-import { callClaude } from './utils/ai-client.js';
+import { callTool } from './tool-launch/call.js';
 import { extractKeywords, findOverlappingLearnings } from './utils/dedup.js';
 import { log, spinner } from './utils/logger.js';
 import { getUserHome } from './utils/home.js';
 
 /** Default directory for storing learnings. */
+// oxlint-disable-next-line teamai/learnings-root -- standalone import default has no LocalConfig and writes to the user mirror
 const DEFAULT_LEARNINGS_DIR = path.join(getUserHome(), '.teamai', 'learnings');
 
 /**
@@ -105,7 +106,7 @@ export function formatMrThreads(threads: MRThread[], mrAuthor: string | undefine
  *
  * @param mr        MR data object
  * @param language  The team's `language` from teamai.yaml
- * @returns         Full prompt string for callClaude
+ * @returns         Full prompt string for callTool
  */
 export function extractMRLearningPrompt(mr: MRData, language?: 'en' | 'zh'): string {
   const commitsFormatted = mr.commits
@@ -304,7 +305,7 @@ export async function importFromMR(opts: {
   const learningsDirs = opts.learningsDirs ?? [DEFAULT_LEARNINGS_DIR];
 
   // ── 步骤 1：获取 MR 数据 ────────────────────────────────
-  const fetchSpinner = spinner('Fetching MR data...');
+  const fetchSpinner = await spinner('Fetching MR data...');
   fetchSpinner.start();
 
   let mr: MRData;
@@ -319,12 +320,12 @@ export async function importFromMR(opts: {
   }
 
   // ── 步骤 2：AI 分析 ────────────────────────────────────
-  const aiSpinner = spinner('AI analysis in progress...');
+  const aiSpinner = await spinner('AI analysis in progress...');
   aiSpinner.start();
 
   let learningContent: string;
   try {
-    learningContent = await callClaude(extractMRLearningPrompt(mr, opts.language));
+    learningContent = (await callTool(extractMRLearningPrompt(mr, opts.language), { launchedBy: 'import-mr' })).text;
     aiSpinner.succeed('AI analysis complete');
   } catch (err: unknown) {
     aiSpinner.fail('AI analysis failed');
@@ -334,7 +335,7 @@ export async function importFromMR(opts: {
   // ── 步骤 3：解析 learning 草稿 + dedup ─────────────────
   const { content: normalizedContent, data: frontmatter } = parseLearningDraft(learningContent);
   learningContent = normalizedContent;
-  const learningTitle = (frontmatter['title'] as string | undefined) ?? mr.title;
+  const learningTitle = typeof frontmatter['title'] === 'string' ? frontmatter['title'] : mr.title;
 
   const draftKeywords = extractKeywords(learningContent);
   const possibleDuplicates = (await findOverlappingLearnings(draftKeywords, learningsDirs, { namespaces: opts.learningsNamespaces }))
@@ -348,8 +349,10 @@ export async function importFromMR(opts: {
   // ── 步骤 4：打印摘要 ────────────────────────────────────
   log.info(`✅ Learning draft generated: ${learningTitle}`);
 
-  const tags = frontmatter['tags'] as string[] | undefined;
-  if (tags && tags.length > 0) {
+  const tags = Array.isArray(frontmatter['tags'])
+    ? frontmatter['tags'].filter((tag): tag is string => typeof tag === 'string')
+    : [];
+  if (tags.length > 0) {
     log.info(`   Tags: ${tags.join(', ')}`);
   }
 

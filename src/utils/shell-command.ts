@@ -3,11 +3,13 @@
  * simple commands, and what the call did with files.
  *
  * Only a call that surely ran its reader or search is one: one simple command,
- * or a pipeline that starts with it. Any `;`, `&&`, `||` or `&` means it may
- * never have run, so the call is neither. The files are the command's file
- * operands only: never a flag's value, a sed script, a search pattern or a
- * redirect target.
+ * a pipeline that starts with it, or a command list in the small grammar
+ * classifyList reads. Whether an item of any other list ran cannot be known
+ * without running the shell, so such a call is neither. The files are the
+ * command's file operands only: never a flag's value, a sed script, a search
+ * pattern or a redirect target.
  */
+import { isAbsolutePath } from './agent-path.js';
 
 /** An operator that ends a simple command. A newline is a `;`. */
 export type ShellOperator = ';' | '&&' | '||' | '|' | '&';
@@ -38,9 +40,9 @@ export interface ShellClassification {
   paths: string[];
   /** A search's only file or directory operand, when it has one with nothing to expand. */
   target?: string;
-  /** True when the reader or search is the call's only command, not the head of a pipeline. */
+  /** True when the reader or search is the call's only command, not the head of a pipeline or an item of a list. */
   simple: boolean;
-  /** A read's or search's command word, as written: `cat`, `/bin/cat`. */
+  /** A read's or search's command word, as written: `cat`, `/bin/cat`. A list's is the first one it counts. */
   verb?: string;
 }
 
@@ -48,6 +50,13 @@ const REDIRECT = /^(?:&>>?|<<<|<<-?|<>|<&|>>|>&|>\||<|>)/;
 
 /** The characters an unquoted backslash escapes: whitespace and those the shell gives a meaning. */
 const ESCAPABLE = /[\s'"\\$`()&;|<>*?#!]/;
+
+const HOME_REF = /(?:~|\$HOME|\$\{HOME\})(?=[\\/])/y;
+
+function homeRefLength(line: string, at: number): number {
+  HOME_REF.lastIndex = at;
+  return HOME_REF.exec(line)?.[0].length ?? 0;
+}
 
 /**
  * The simple commands of a shell command line, split on `;`, `&&`, `||`, `|`,
@@ -57,10 +66,11 @@ const ESCAPABLE = /[\s'"\\$`()&;|<>*?#!]/;
  * of the line. Outside quotes a backslash escapes whitespace or a character
  * the shell gives a meaning (`my\ doc.md`), and joins a line to the next;
  * before any other character it is kept, so an unquoted Windows path
- * (`C:\kb\x.md`) stays whole. Inside double quotes it escapes only `"` or
- * `\`, and inside single quotes nothing.
+ * (`C:\kb\x.md`) stays whole. Inside double quotes it escapes only `"`,
+ * `\` or `$`, and inside single quotes nothing. Given `home`, `$HOME/` and
+ * `${HOME}/` expand outside single quotes; `~/` expands only unquoted.
  */
-export function simpleCommands(command: string): SimpleCommand[] {
+export function simpleCommands(command: string, home?: string): SimpleCommand[] {
   const commands: SimpleCommand[] = [];
   let current: SimpleCommand = { words: [], redirects: [], op: null };
   let word: string | null = null;
@@ -89,8 +99,11 @@ export function simpleCommands(command: string): SimpleCommand[] {
     const next = line[i + 1];
     if (quote) {
       if (c === quote) quote = null;
-      else if (c === '\\' && quote === '"' && (next === '"' || next === '\\')) word += line[++i];
-      else word += c;
+      else if (c === '\\' && quote === '"' && (next === '"' || next === '\\' || next === '$')) word += line[++i];
+      else if (quote === '"' && c === '$' && home !== undefined && homeRefLength(line, i) > 0) {
+        i += homeRefLength(line, i) - 1;
+        word += home;
+      } else word += c;
     } else if (c === '"' || c === "'") {
       quote = c;
       word ??= '';
@@ -120,6 +133,9 @@ export function simpleCommands(command: string): SimpleCommand[] {
       endCommand(';');
     } else if (/\s/.test(c)) {
       endWord();
+    } else if (word === null && home !== undefined && homeRefLength(line, i) > 0) {
+      i += homeRefLength(line, i) - 1;
+      word = home;
     } else {
       word = (word ?? '') + c;
     }
@@ -267,6 +283,8 @@ const WINDOWS_PATH = /^[A-Za-z]:[\\/]|\\/;
 export interface ShellFlavor {
   /** The agent's PowerShell tool ran it. */
   powershell?: boolean;
+  /** The home directory the shell expands a leading `~`, `$HOME` or `${HOME}` before `/` or `\` to (`simpleCommands`). */
+  home?: string;
 }
 
 /**
@@ -424,11 +442,156 @@ function classifySimple(command: SimpleCommand, simple: boolean, flavor: ShellFl
 
 /**
  * What a shell command line did with files: a read, a search or a listing
- * when it is one such command, or a pipeline that starts with one; otherwise
- * just a shell call.
+ * when it is one such command, or a pipeline that starts with one; a read
+ * when it is a list classifyList reads; otherwise just a shell call.
+ * `succeeded`: the call exited 0.
  */
-export function classifyShellCommand(command: string, flavor: ShellFlavor = {}): ShellClassification {
-  const commands = simpleCommands(command);
+export function classifyShellCommand(command: string, flavor: ShellFlavor = {}, succeeded = false): ShellClassification {
+  const commands = simpleCommands(command, flavor.home);
   const pipeline = commands.every((c, i) => c.op === (i === commands.length - 1 ? null : '|'));
-  return pipeline && commands.length > 0 ? classifySimple(commands[0], commands.length === 1, flavor) : SHELL;
+  if (commands.length === 0) return SHELL;
+  return pipeline ? classifySimple(commands[0], commands.length === 1, flavor) : classifyList(command, commands, flavor, succeeded);
+}
+
+/**
+ * The files each reader among a command line's simple commands names (`sed -n 1,200p a/SKILL.md` on one line of many),
+ * whether or not it ran (`false && cat a/SKILL.md; true`), for a caller that confirms each from the call's output.
+ * None when a heredoc feeds a command, since its body is no command, and none relative after a `cd`.
+ */
+export function namedReads(command: string, flavor: ShellFlavor = {}): string[] {
+  const commands = simpleCommands(command, flavor.home);
+  if (commands.some((c) => c.redirects.some((r) => r.op.startsWith('<<') && r.op !== '<<<'))) return [];
+  const files: string[] = [];
+  let moved = false;
+  for (const c of commands) {
+    moved ||= c.words[0] === 'cd';
+    const read = classifySimple(c, false, flavor);
+    if (read.category === 'read') files.push(...read.paths.filter((file) => !moved || isAbsolutePath(file)));
+  }
+  return files;
+}
+
+/** A character a plain list has nowhere, quoted or not. */
+const NOT_PLAIN = /[|$`(){}<#]|[^\S \t\n]/;
+
+/**
+ * Whether the shell reads `command` as plain words and the operators `;`,
+ * `&&` and newline: every quote closed, no command left empty before an
+ * operator or after a final `&&`, and none of `|`, a lone `&`, `$` (but a
+ * `$HOME` or `${HOME}` path prefix), a backtick, `(`, `)`, `{`, `}`, `<`, `#`,
+ * a line continuation, or whitespace other than a space, a tab or a newline,
+ * quoted or not.
+ */
+function isPlainList(command: string): boolean {
+  let quote: string | null = null;
+  // No word since the start or the last operator, and an `&&` still waiting for its command.
+  let empty = true;
+  let pending = false;
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i];
+    if (c === '$' && homeRefLength(command, i) > 0) {
+      i += homeRefLength(command, i) - 1;
+    } else if (NOT_PLAIN.test(c)) {
+      return false;
+    } else if (quote) {
+      if (c === quote) quote = null;
+      else if (c === '\\' && quote === '"') i++;
+      continue;
+    } else if (c === "'" || c === '"') {
+      quote = c;
+    } else if (c === '\\') {
+      if (command[i + 1] === '\n') return false;
+      i++;
+    } else if (c === ';' || (c === '&' && command[i + 1] === '&')) {
+      if (empty) return false;
+      if (c === '&') i++;
+      pending = c === '&';
+      empty = true;
+      continue;
+    } else if (c === '&' && command[i - 1] !== '>' && command[i + 1] !== '>') {
+      return false;
+    } else if (/\s/.test(c)) {
+      if (c === '\n') empty = true;
+      continue;
+    }
+    empty = false;
+    pending = false;
+  }
+  return quote === null && !pending;
+}
+
+/** A `test` or `[` check of one file: it exists, is a file, a directory, readable, or not empty. */
+const FILE_TESTS = new Set(['-e', '-f', '-d', '-r', '-s']);
+
+/**
+ * One command of a list: a read classifySimple accepts, by its bare name, or
+ * a guard that cannot end, replace or reconfigure the shell. `fails`: whether
+ * the guard can exit non-zero.
+ */
+type ListItem =
+  | { kind: 'read'; read: ShellClassification }
+  | { kind: 'cd'; dir: string }
+  | { kind: 'guard'; fails: boolean };
+
+/** A list's command, when it is a read or a guard with no redirect but one that cannot fail: `2>/dev/null`, `2>&1`. */
+function listItem(command: SimpleCommand, flavor: ShellFlavor): ListItem | undefined {
+  const [name, ...args] = command.words;
+  const redirects = command.redirects.every((r) => (r.op === '2>' && r.target === '/dev/null') || (r.op === '2>&' && r.target === '1'));
+  if (name === undefined || !redirects) return undefined;
+  if (['pwd', 'true', ':'].includes(name) && args.length === 0) return { kind: 'guard', fails: false };
+  if (name === 'echo') return { kind: 'guard', fails: false };
+  if (name === 'ls') return { kind: 'guard', fails: true };
+  if (name === 'test' && args.length === 2 && FILE_TESTS.has(args[0])) return { kind: 'guard', fails: true };
+  if (name === '[' && args.length === 3 && FILE_TESTS.has(args[0]) && args[2] === ']') return { kind: 'guard', fails: true };
+  if (name === 'cd') return args.length === 1 && /^[^-+~]/.test(args[0]) && !EXPANDS.test(args[0]) ? { kind: 'cd', dir: args[0] } : undefined;
+  // A name with a path, an extension or an assignment may be no reader at all.
+  if (/[\\/.=]/.test(name)) return undefined;
+  const read = classifySimple(command, false, flavor);
+  return read.category === 'read' ? { kind: 'read', read } : undefined;
+}
+
+/** `file` under the relative or absolute directory `dir` (`''`: the call's cwd). */
+function under(dir: string, file: string): string {
+  return isAbsolutePath(file) || dir === '' ? file : `${dir}/${file}`;
+}
+
+/**
+ * A list of reads and guards (listItem) joined by `;`, `&&` or newlines in a
+ * plain command line (isPlainList): a read, never a simple one, of the files
+ * the reads of its last `&&` chain read. A read earlier in the list may have
+ * failed with the call still exiting 0, so it counts for nothing. Without
+ * `succeeded` only the chain's first read counts, and only when no command
+ * before it in the chain can fail. A `cd` in the chain moves its later
+ * relative paths; after one in an earlier chain, which may have failed, only
+ * absolute paths count.
+ */
+function classifyList(command: string, commands: SimpleCommand[], flavor: ShellFlavor, succeeded: boolean): ShellClassification {
+  if (!isPlainList(command)) return SHELL;
+  let paths = new Set<string>();
+  let verb: string | undefined;
+  // The chain's directory from the call's cwd, null when unknown; whether it moved; whether nothing before can fail.
+  let dir: string | null = '';
+  let moved = false;
+  let sure = true;
+  for (const [i, c] of commands.entries()) {
+    const item = listItem(c, flavor);
+    if (item === undefined) return SHELL;
+    if (item.kind === 'read' && (succeeded || sure)) {
+      for (const file of item.read.paths) if (dir !== null || isAbsolutePath(file)) paths.add(under(dir ?? '', file));
+      verb ??= item.read.verb;
+    }
+    if (item.kind === 'cd') {
+      dir = dir === null && !isAbsolutePath(item.dir) ? null : under(dir ?? '', item.dir);
+      moved = true;
+    }
+    if (item.kind !== 'guard' || item.fails) sure = false;
+    if (c.op === ';' && i < commands.length - 1) {
+      paths = new Set();
+      verb = undefined;
+      if (moved) dir = null;
+      moved = false;
+      sure = true;
+    }
+  }
+  return paths.size > 0 ? { category: 'read', paths: [...paths], simple: false, verb } : SHELL;
 }

@@ -1,5 +1,5 @@
 import { requireInit, detectProjectConfig, describeUnreadableConfig, loadTeamConfig, NotInitializedError } from './config.js';
-import { pullRepo } from './utils/git.js';
+import { DetachedTeamRepoError, pullRepo } from './utils/git.js';
 import { pathExists } from './utils/fs.js';
 import { log, spinner } from './utils/logger.js';
 import { EnvHandler, envEntryReader, unknownEnvVariableKeys, type EnvYaml } from './resources/env.js';
@@ -432,8 +432,8 @@ export async function envAdd(
       // everyone — the outcome the per-entry key was scoping against.
       const targets = new TargetFiles(repoPath, entryLayout('env'));
       const files: string[] = [];
-      for (const key of removed) {
-        files.push(...await targets.forIds(key as 'roles' | 'projects', updated[key as 'roles' | 'projects'] ?? []));
+      for (const removedKey of removed) {
+        files.push(...await targets.forIds(removedKey as 'roles' | 'projects', updated[removedKey as 'roles' | 'projects'] ?? []));
       }
       log.warn(
         `${relativePath}: variable "${key}" is scoped with per-entry `
@@ -629,12 +629,17 @@ function declarationCount(duplicates: number): string {
  */
 async function refreshTeamRepo(localConfig: LocalConfig, project: string | undefined): Promise<boolean> {
   if (isSelfMode(localConfig)) return true;
-  const pullSpin = spinner('Pulling latest...').start();
+  const pullSpin = (await spinner('Pulling latest...')).start();
   try {
     await pullRepo(localConfig.repo.localPath);
     pullSpin.succeed('Up to date');
     return true;
   } catch (e) {
+    if (e instanceof DetachedTeamRepoError) {
+      pullSpin.fail(e.message);
+      process.exitCode = 1;
+      return false;
+    }
     if (project === undefined) {
       pullSpin.warn(`Pull failed: ${(e as Error).message}`);
       return true;

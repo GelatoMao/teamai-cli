@@ -7,7 +7,8 @@ import {
   type ResourceNamespaces,
   type RolesManifest,
 } from './roles.js';
-import { loadProjectsManifest, resolveProjectResourceNamespaces, mergeNamespaces, projectNamespaceEntries } from './projects.js';
+import { loadProjectsManifest, resolveProjectResourceNamespaces, mergeNamespaces, projectNamespaceEntries, type AllProjectResourceType } from './projects.js';
+import { isNestedPlaceableType, NAMESPACE_AXIS, type PlaceableType } from './push-namespaces.js';
 import { assertNoCaseAliasedNamespaces } from './manifest-schema.js';
 import { warnOnce } from './utils/warn-once.js';
 import { deliveredMembers } from './workspace-children.js';
@@ -40,6 +41,8 @@ export async function resolveResourceNamespaces(localConfig: LocalConfig): Promi
     allSkillNamespaces: first.allSkillNamespaces,
     inactiveDocsNamespaces: inAll(resolved.map((one) => one.inactiveDocsNamespaces)),
     inactiveWikiNamespaces: inAll(resolved.map((one) => one.inactiveWikiNamespaces)),
+    inactivePromptsNamespaces: inAll(resolved.map((one) => one.inactivePromptsNamespaces)),
+    inactiveScorersNamespaces: inAll(resolved.map((one) => one.inactiveScorersNamespaces)),
   };
 }
 
@@ -48,6 +51,12 @@ async function resolveOwnResourceNamespaces(localConfig: LocalConfig) {
   const primaryRole = localConfig.primaryRole;
   const hasRole = !!primaryRole;
   const hasProjects = activeProjects.length > 0;
+  // The team assigns this member's roles (#1186). Every unfiltered fallback
+  // below is then closed: a member the team assigned no roles — or whose
+  // assignment names a role the manifest dropped — receives the shared root
+  // only. Falling through to "sync everything" would hand back exactly what
+  // assigning roles was meant to take away.
+  const rolesAssigned = !!localConfig.roleAssignment;
 
   // Load the projects manifest up front: its mere existence means this team uses
   // project partitioning, which changes the "no active filter" semantics below.
@@ -83,7 +92,7 @@ async function resolveOwnResourceNamespaces(localConfig: LocalConfig) {
   // through to an unfiltered sync that reinstalls every project's skills/rules.
   // So we return a real (possibly empty-active) context and let the cleanup path
   // below prune the now-inactive project namespaces.
-  if (!hasRole && !hasProjects && !teamHasProjects) return null;
+  if (!rolesAssigned && !hasRole && !hasProjects && !teamHasProjects) return null;
 
   // ── Role namespaces (optional) ──
   let roleNamespaces: ResourceNamespaces = { knowledge: [], skills: [], learnings: [], agents: [] };
@@ -107,12 +116,13 @@ async function resolveOwnResourceNamespaces(localConfig: LocalConfig) {
         });
         allRoleSkillNamespaces = new Set(rolesManifest.roles.flatMap((role) => role.resources.skills));
       } catch {
-        warnOnce(`Role "${localConfig.primaryRole}" not found in manifest. Falling back to unfiltered sync.`);
-        warnOnce('Run `teamai roles set <role>` to pick a valid role.');
+        warnOnce(`Role "${localConfig.primaryRole}" not found in manifest.`
+          + (rolesAssigned ? ' Delivering shared resources only.' : ' Falling back to unfiltered sync.'));
+        if (!rolesAssigned) warnOnce('Run `teamai roles set <role>` to pick a valid role.');
         // A misconfigured role, with nothing else to scope by, can't filter safely.
-        if (!hasProjects && !teamHasProjects) return null;
+        if (!rolesAssigned && !hasProjects && !teamHasProjects) return null;
       }
-    } else if (!hasProjects && !teamHasProjects) {
+    } else if (!rolesAssigned && !hasProjects && !teamHasProjects) {
       return null;
     }
   }
@@ -166,7 +176,53 @@ async function resolveOwnResourceNamespaces(localConfig: LocalConfig) {
   const activeWiki = new Set(activeNamespaces.wiki ?? []);
   const inactiveWikiNamespaces = [...declaredWikiNamespaces].filter((namespace) => !activeWiki.has(namespace));
 
-  return { activeNamespaces, allSkillNamespaces, inactiveDocsNamespaces, inactiveWikiNamespaces };
+  // Prompts follow the same declared-vs-active rule as docs and wiki: a
+  // prompts/<dir>/ anyone lists under `resources.prompts` is a namespace, and a
+  // workflow resolves a nested prompt below it; every other directory is shared
+  // content, which a placement may still move into a namespace.
+  const declaredPromptsNamespaces = new Set<string>([
+    ...(rolesManifest?.roles ?? []).flatMap((role) => role.resources.prompts ?? []),
+    ...(projectsManifest?.projects ?? []).flatMap((project) => project.resources.prompts ?? []),
+  ]);
+  const activePrompts = new Set(activeNamespaces.prompts ?? []);
+  const inactivePromptsNamespaces = [...declaredPromptsNamespaces].filter((namespace) => !activePrompts.has(namespace));
+
+  // Which scorers/<dir>/ is a namespace is `isNamespaceDir`'s rule; the scorer
+  // cache withholds this set.
+  const declaredScorersNamespaces = new Set<string>([
+    ...(rolesManifest?.roles ?? []).flatMap((role) => role.resources.scorers ?? []),
+    ...(projectsManifest?.projects ?? []).flatMap((project) => project.resources.scorers ?? []),
+  ]);
+  const activeScorers = new Set(activeNamespaces.scorers ?? []);
+  const inactiveScorersNamespaces = [...declaredScorersNamespaces].filter((namespace) => !activeScorers.has(namespace));
+
+  return {
+    activeNamespaces,
+    allSkillNamespaces,
+    inactiveDocsNamespaces,
+    inactiveWikiNamespaces,
+    inactivePromptsNamespaces,
+    inactiveScorersNamespaces,
+  };
+}
+
+/** What the roles and projects manifests declare, as far as `isNamespaceDir` needs it. */
+export interface NamespaceDeclarations {
+  /** True when any role or project declares `namespace` on `axis`. */
+  declares(axis: AllProjectResourceType, namespace: string): boolean;
+  /** True when there is neither a roles nor a projects manifest. */
+  readonly manifestFree: boolean;
+}
+
+/**
+ * Whether `<type>/<dir>/` is a namespace rather than shared content. Most types namespace their first directory by
+ * construction. docs, wiki and prompts nest freely, so a directory is a namespace only where a role or project declares
+ * it. Scorers are flat files and follow prompts, except that with no manifest at all every directory is a namespace.
+ */
+export function isNamespaceDir(type: PlaceableType, dir: string, declarations: NamespaceDeclarations): boolean {
+  if (type === 'scorers') return declarations.manifestFree || declarations.declares(NAMESPACE_AXIS.scorers, dir);
+  if (isNestedPlaceableType(type)) return declarations.declares(NAMESPACE_AXIS[type], dir);
+  return true;
 }
 
 /**

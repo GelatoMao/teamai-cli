@@ -12,10 +12,14 @@ import { queryCodeKnowledge } from './code-knowledge-recall.js';
 import type { SourceAnchor } from './code-knowledge-recall.js';
 import { annotateCodebaseSourceFreshness } from './codebase-freshness.js';
 import { resolveResourceNamespaces } from './resource-namespaces.js';
-import { deliveredLearningsNamespaces, readWorkspaceChildren } from './workspace-children.js';
+import { deliveredLearningsNamespaces, formatProjectsManifestWarning, readWorkspaceChildren } from './workspace-children.js';
 import { recordRecallQuality } from './recall-quality.js';
 import { agentSessionFromEnv, deriveSessionId } from './utils/session-id.js';
 import type { EnvAgentSession } from './utils/session-id.js';
+import { classifyTreePath, teamwikiCodebaseSlug } from './asset-relations.js';
+import type { AssetRelationType, RelationVia } from './asset-relations.js';
+import { caseFoldKey } from './manifest-schema.js';
+import type { SearchIndexEntry } from './types.js';
 
 /** Relevance threshold for codebase graph hits.
  *  These are log-compressed to a bounded [0,10] range (see `queryCodeKnowledge`
@@ -23,6 +27,32 @@ import type { EnvAgentSession } from './utils/session-id.js';
  *  drift with corpus size, and it is unaffected by the query-length
  *  normalization that applies to learnings scores. */
 const CODEBASE_RELEVANCE_THRESHOLD = 4.0;
+
+/**
+ * Ranking penalty applied to codebase-graph hits when they compete with
+ * learnings/docs hits on the shared 0-10 scale.
+ *
+ * Codebase scores are log-compressed and saturate that scale easily (any graph
+ * score >= 31 maps to the cap), so a code hit usually outranks a docs hit
+ * that matched the query terms explicitly — the hand-written deep page that
+ * answers the question loses to a generated module overview.
+ *
+ * Applied when ordering the merged list only (see `rankingScoreOf`); the
+ * stored score keeps its raw value so the relevance check, quality tracking
+ * and printed output are unaffected.
+ *
+ * A hit that clears its own relevance bar is ordered above one that does not,
+ * whatever their penalized scores: `--check` reads the first result only, so an
+ * irrelevant hit at the top of the list would make it report "nothing
+ * relevant" while a relevant hit sits below it.
+ *
+ * Measured on a 363-entry team knowledge base (58-question blind set, plus a
+ * 305-question tuning set):
+ *   penalty 1.00 → blind fact@3 45/58, tuning fact@3 300/305
+ *   penalty 0.80 → blind fact@3 49/58, tuning fact@3 299/305
+ *   penalty 0.75 → blind fact@3 51/58, tuning fact@3 282/305 (too aggressive)
+ */
+const CODE_HIT_RANKING_PENALTY = 0.8;
 
 /** Relevance threshold for learnings/docs hits, expressed as a fraction of the
  *  theoretical single-token-match baseline rather than an absolute score.
@@ -40,13 +70,17 @@ const CODEBASE_RELEVANCE_THRESHOLD = 4.0;
  *  cutoff, while unrelated queries scored 0 — they are excluded by the
  *  title/tag gate in `search` rather than by this threshold.
  *
- *  IMPORTANT: this ratio is only "stricter" for N ≳ 20 (where baseline×1.35 >
- *  4.0). For small corpora (N=1–5) the ratio gives a cutoff of 1.35–3.57, which
- *  is significantly looser than 4.0. That is why LEARNINGS_ABSOLUTE_FLOOR exists:
- *  isRelevantScore uses max(baseline*ratio, floor) so cold-start corpora are
- *  held to the same strict bar as historical code, and the relative threshold
- *  only takes effect once N is large enough (~20+) to push it above the floor. */
-const LEARNINGS_RELEVANCE_RATIO = 1.35;
+ *  IMPORTANT: this ratio is only "stricter" for N ≳ 20 (where baseline×ratio >
+ *  floor). For small corpora (N=1–5) the ratio gives a cutoff below the floor,
+ *  which is why LEARNINGS_ABSOLUTE_FLOOR exists: isRelevantScore uses
+ *  max(baseline*ratio, floor) so cold-start corpora are held to the same strict
+ *  bar as historical code, and the relative threshold only takes effect once N
+ *  is large enough (~20+) to push it above the floor.
+ *
+ *  The ratio is exported so tests can assert against the shipped value instead
+ *  of hardcoding it — changing a constant must not require rewriting the
+ *  expectations that encode the invariant below. */
+export const LEARNINGS_RELEVANCE_RATIO = 1.35;
 
 /** Absolute floor for learnings relevance, applied when the corpus is too small
  *  for the relative threshold to be meaningful.
@@ -57,8 +91,10 @@ const LEARNINGS_RELEVANCE_RATIO = 1.35;
  *  keeps the stricter pre-existing behavior until the corpus is large enough
  *  (N >= ~20) for the relative threshold to exceed the floor on its own.
  *
- *  Like the ratio above, this compares against query-length-normalized scores. */
-const LEARNINGS_ABSOLUTE_FLOOR = 4.0;
+ *  Like the ratio above, this compares against query-length-normalized scores.
+ *
+ *  Exported for the same reason as the ratio above. */
+export const LEARNINGS_ABSOLUTE_FLOOR = 4.0;
 
 /**
  * Decide whether a top-1 recall result clears the relevance bar.
@@ -142,6 +178,49 @@ export function normalizeLearningsScoreForRanking(score: number, idfBaseline: nu
   return Math.min(10, Math.max(0, 4 + 2 * Math.log2(score / threshold)));
 }
 
+/**
+ * True when `identifier` names a whole path segment, slug or file stem of the
+ * page, or a whole word of its title — not merely a substring of one. A
+ * wiki codebase page is `evidence/code/gitlab__znkf__<slug>/<path>`, so the
+ * module name is one of the `__`-separated parts of that segment.
+ */
+function namesIdentifier(page: string, title: string, identifier: string): boolean {
+  if (!identifier) return false;
+  for (const segment of page.toLowerCase().split('/')) {
+    const stem = segment.replace(/\.[a-z0-9]+$/, '');
+    if (stem === identifier || stem.split('__').includes(identifier)) return true;
+  }
+  // Hyphens and underscores belong to the identifier, matching the character
+  // class identifiers are extracted with: `smart-sale-service` must not match
+  // a page titled `smart-sale-service-api overview`.
+  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^a-z0-9_-])${escaped}([^a-z0-9_-]|$)`).test(title.toLowerCase());
+}
+
+/** The subset of a merged result that decides its position in the output. */
+export interface RankableResult {
+  score: number;
+  /** Ordering score from `search` (title length-normalized); absent means
+   *  order by `score`. */
+  rankScore?: number;
+  fromCodebase?: boolean;
+  idfBaseline?: number;
+}
+
+/**
+ * Score used to order the merged codebase + learnings result list.
+ *
+ * Deliberately separate from `result.score`: the stored score is what
+ * `--check`, quality tracking and the printed output report, and those must
+ * keep seeing the raw codebase score (its relevance threshold is 4.0 on that
+ * scale). Only the ordering gets the cross-source penalty.
+ */
+export function rankingScoreOf(result: RankableResult, idfBaseline: number): number {
+  return result.fromCodebase
+    ? result.score * CODE_HIT_RANKING_PENALTY
+    : normalizeLearningsScoreForRanking(result.rankScore ?? result.score, result.idfBaseline ?? idfBaseline);
+}
+
 /** Search result with scope label for merged output. */
 interface ScopedSearchResult extends SearchResult {
   scope?: 'user' | 'project';
@@ -155,6 +234,9 @@ interface ScopedSearchResult extends SearchResult {
   relatedFiles?: string[];
   /** True when this result came from the codebase knowledge graph (bounded score scale). */
   fromCodebase?: boolean;
+  /** A code hit whose page or title carries an identifier the query named
+   *  verbatim; ordered above other code hits (see the merged sort). */
+  namedModule?: boolean;
 }
 
 // ─── Recall data flow ────────────────────────────────────
@@ -170,8 +252,8 @@ interface ScopedSearchResult extends SearchResult {
 //      ├─ formatResults(results)
 //      │   └─ STDOUT (AI-consumable format)
 //      │
-//      ├─ recordRecallQuality(sessionId, results)
-//      │   └─ ~/.teamai/sessions/<sid>-recall-cache.json
+//      ├─ recordRecallQuality(sessionId, results, query)
+//      │   └─ ~/.teamai/sessions/<sid>-recall-cache.json (0600)
 //      │      (read by contribute-check's knowledge-gap detection)
 //      │
 //      ├─ recordRun(activeConfig, results, session, caller)
@@ -207,7 +289,7 @@ function resolveReadablePath(
   if (indexedPath && existsSync(indexedPath)) return indexedPath;
   const underBase = learningsBase ? path.join(learningsBase, filename) : null;
   if (underBase && existsSync(underBase)) return underBase;
-  // learnings-root ok: a display-only hint when nothing on disk matches
+  // oxlint-disable-next-line teamai/learnings-root -- a display-only hint when nothing on disk matches
   return indexedPath ?? underBase ?? path.join('~', '.teamai', 'learnings', filename);
 }
 
@@ -221,14 +303,166 @@ function voteKey(result: SearchResult): string {
   return result.entry.filename.replace(/\.md$/i, '');
 }
 
+// ── Asset relations (#1552) ──────────────────────────────
+//
+// A relation stays inside its owner: each scope resolves relations against its
+// own search index and its own teamwiki, and incoming relations are derived at
+// query time from the outgoing ones stored on entries — never cached, so
+// removing a relation on A removes the `←` line on B after the next index
+// build. A relation whose other end this recall cannot see prints nothing.
+
+/** The maximum number of `Related:` lines printed for one hit. */
+const RELATION_LINES_CAP = 5;
+
+/** A relation another entry of the same scope declares or links to a tree path. */
+interface IncomingRelation {
+  /** The declaring entry's team-tree path. */
+  from: string;
+  relation: AssetRelationType;
+  via: RelationVia;
+}
+
+/** Per-scope resolution state for `Related:` lines. */
+export interface RelationContext {
+  /** Canonical team-tree path → entry, for rule/doc/learning/skill targets. */
+  readonly byTreePath: ReadonlyMap<string, SearchIndexEntry>;
+  /** team-tree path → relations other entries of this scope point at it, sorted by source path. */
+  readonly incoming: ReadonlyMap<string, readonly IncomingRelation[]>;
+  /** `<repo.localPath>/teamwiki`; a `teamwiki/…` target resolves under it. */
+  readonly teamwikiRoot: string;
+  /** Case-folded withheld codebase slugs. `null` when the list cannot be read:
+   *  then no teamwiki target resolves — never "everything allowed". */
+  readonly withheld: ReadonlySet<string> | null;
+  readonly learningsBase?: string;
+}
+
+/**
+ * One relation context per scope that has an index. A user-scope entry the
+ * project shadows contributes nothing: it is not visible in this recall, so
+ * neither its outgoing relations nor relations pointing at it resolve.
+ */
+async function buildRelationContexts(
+  scopeIndexes: Array<{ index: SearchIndex; scope: 'user' | 'project'; config: LocalConfig; learningsBase: string }>,
+  projectEntryKeys: ReadonlySet<string>,
+): Promise<Map<string, RelationContext>> {
+  const contexts = new Map<string, RelationContext>();
+  await Promise.all(scopeIndexes.map(async ({ index, scope, config, learningsBase }) => {
+    try {
+      contexts.set(scope, await buildRelationContext({
+        index,
+        config,
+        learningsBase,
+        hidden: scope === 'user' ? projectEntryKeys : undefined,
+      }));
+    } catch (e) {
+      log.debug(`recall: relations unavailable for ${installScopeName(scope)}: ${(e as Error).message}`);
+    }
+  }));
+  return contexts;
+}
+
+/**
+ * The relation state of one scope: the assets its index holds (minus the
+ * entries another scope shadows) and the relations they declare or link.
+ */
+export async function buildRelationContext(args: {
+  index: SearchIndex;
+  config: LocalConfig;
+  learningsBase?: string;
+  /** `${type}:${filename}` keys this scope cannot see: another scope shadows them. */
+  hidden?: ReadonlySet<string>;
+}): Promise<RelationContext> {
+  const { index, config, learningsBase, hidden } = args;
+  const byTreePath = new Map<string, SearchIndexEntry>();
+  const incoming = new Map<string, IncomingRelation[]>();
+  for (const entry of index.entries) {
+    if (!entry.treePath || hidden?.has(`${entry.type}:${entry.filename}`)) continue;
+    byTreePath.set(entry.treePath, entry);
+    for (const r of entry.related ?? []) {
+      const list = incoming.get(r.target) ?? [];
+      list.push({ from: entry.treePath, relation: r.relation, via: r.via });
+      incoming.set(r.target, list);
+    }
+  }
+  for (const list of incoming.values()) list.sort((a, b) => a.from.localeCompare(b.from));
+  // Withheld codebases: a resolved context contributes its inactive wiki
+  // namespaces; a null context means the team filters nothing, so nothing is
+  // withheld — the unfiltered "sync everything" state, matching recall's own
+  // `?? []` above. Only a read that THROWS is "cannot be read": then no
+  // teamwiki target resolves, never "everything allowed".
+  let withheld: ReadonlySet<string> | null;
+  try {
+    const ns = await resolveResourceNamespaces(config);
+    withheld = new Set((ns?.inactiveWikiNamespaces ?? []).map((namespace) => caseFoldKey(namespace)));
+  } catch {
+    withheld = null;
+  }
+  return {
+    byTreePath,
+    incoming,
+    teamwikiRoot: path.join(config.repo.localPath, 'teamwiki'),
+    withheld,
+    learningsBase,
+  };
+}
+
+/** The printed path of a relation's other end, or null when this scope cannot see it. */
+function resolveRelationTarget(ctx: RelationContext, target: string): string | null {
+  if (classifyTreePath(target) === 'teamwiki') {
+    if (ctx.withheld === null) return null;
+    const slug = teamwikiCodebaseSlug(target);
+    if (slug !== null && ctx.withheld.has(caseFoldKey(slug))) return null;
+    const abs = path.join(ctx.teamwikiRoot, target.slice('teamwiki/'.length));
+    return existsSync(abs) ? abs : null;
+  }
+  const entry = ctx.byTreePath.get(target);
+  if (!entry) return null;
+  return resolveReadablePath(entry.path, entry.filename, ctx.learningsBase);
+}
+
+/**
+ * The `Related:` lines for one hit: declared outgoing first, then declared
+ * incoming, then link outgoing, then link incoming; within each group
+ * outgoing keeps the file's order and incoming sorts by the source's tree
+ * path. A declared relation beats a link between the same two assets in the
+ * same direction. Capped at {@link RELATION_LINES_CAP}.
+ */
+export function relationLines(ctx: RelationContext, entry: SearchIndexEntry): string[] {
+  if (!entry.treePath) return [];
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  const push = (arrow: '→' | '←', relation: AssetRelationType, otherEnd: string): void => {
+    const printed = resolveRelationTarget(ctx, otherEnd);
+    if (printed === null) return;
+    const key = `${arrow}${relation}${otherEnd}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    lines.push(`Related: ${arrow} ${relation} ${printed}`);
+  };
+  const own = entry.related ?? [];
+  const incoming = [...(ctx.incoming.get(entry.treePath) ?? [])].sort((a, b) => a.from.localeCompare(b.from));
+  for (const r of own) if (r.via === 'declared') push('→', r.relation, r.target);
+  for (const r of incoming) if (r.via === 'declared') push('←', r.relation, r.from);
+  const declaredOut = new Set(own.filter((r) => r.via === 'declared').map((r) => r.target));
+  const declaredIn = new Set(incoming.filter((r) => r.via === 'declared').map((r) => r.from));
+  for (const r of own) if (r.via === 'link' && !declaredOut.has(r.target)) push('→', r.relation, r.target);
+  for (const r of incoming) if (r.via === 'link' && !declaredIn.has(r.from)) push('←', r.relation, r.from);
+  return lines.slice(0, RELATION_LINES_CAP);
+}
+
 /**
  * `runId`, when the run was recorded, follows the result count on the start
  * line. Older CLIs find the region by the prefix before it (#884).
  */
-export function formatResults(results: ScopedSearchResult[], runId?: string): string {
+export function formatResults(
+  results: ScopedSearchResult[],
+  runId?: string,
+  relationContexts?: ReadonlyMap<string, RelationContext>,
+): string {
   const lines: string[] = [];
   lines.push(`--- [teamai:recall:start] --- (${results.length} result${results.length !== 1 ? 's' : ''})${runId ? ` run=${runId}` : ''}`);
   lines.push('');
+  const fallbackCtx = relationContexts?.values().next().value as RelationContext | undefined;
 
   for (let i = 0; i < results.length; i++) {
     const { entry, score, scope, sources, matchedTerms, missingTerms } = results[i];
@@ -251,6 +485,14 @@ export function formatResults(results: ScopedSearchResult[], runId?: string): st
       lines.push(`Matched: ${matchedStr} | Missing: ${missingTerms.join(', ')}`);
     }
     lines.push(`File: ${printedPath(results[i])}`);
+    if (relationContexts) {
+      // Relations resolve inside the scope the hit came from. A hit with an
+      // explicit scope never borrows another scope's context: when that
+      // scope has no index there is nothing it can see, and falling back
+      // would attach a user relation to a workspace page.
+      const ctx = scope !== undefined ? relationContexts.get(scope) : fallbackCtx;
+      if (ctx) lines.push(...relationLines(ctx, entry));
+    }
     if (sources && sources.length > 0) {
       lines.push(`Sources: ${sources.map((s) => s.desc ? `${s.path} (${s.desc})` : s.path).join(', ')}`);
       const freshnessSources = sources.filter((source) => source.freshness);
@@ -422,15 +664,6 @@ async function loadOrBuildScopeIndex(
   const needsRebuild = !index || isLegacyIndex(index) || index.children !== localConfig.children?.fingerprint;
   // A legacy index is rebuilt even when no source can be seen, or it would serve what it holds whole (#1006).
   if (needsRebuild && (index || effectiveLearningsDir || await pathExists(path.join(localConfig.repo.localPath, 'docs')) || await pathExists(path.join(localConfig.repo.localPath, 'rules')) || await pathExists(path.join(localConfig.repo.localPath, 'skills')))) {
-    // Votes live on the teamai-reports orphan branch for non-HTTP repos;
-    // getReportsDir points at the worktree (sibling of the clone in git-kind).
-    // If it isn't materialized yet, votesExist is false and vote-weighted
-    // ranking is simply skipped (graceful degradation — leftover default-branch
-    // votes/ are not used).
-    // Not another repository's reports checkout (#808).
-    const { indexableVotesDir } = await import('./utils/reports-branch.js');
-    const votesDir = await indexableVotesDir(localConfig);
-    const votesExist = votesDir !== undefined && await pathExists(votesDir);
     const docsDir = path.join(localConfig.repo.localPath, 'docs');
     const rulesDir = path.join(localConfig.repo.localPath, 'rules');
     const repoCodebaseDir = path.join(localConfig.repo.localPath, 'docs', 'team-codebase');
@@ -447,11 +680,6 @@ async function loadOrBuildScopeIndex(
     const nothingDelivered: Pick<BuildIndexOptions, 'docFiles' | 'ruleFiles' | 'skills'> = {
       docFiles: [], ruleFiles: [], skills: { kind: 'dirs', dirs: [] },
     };
-    // A workspace's children's too (#913), for the warning below.
-    const projects = [...new Set([
-      ...localConfig.projects ?? [],
-      ...localConfig.children?.children.flatMap((child) => child.selection.projects ?? []) ?? [],
-    ])];
     let learningsNamespaces: string[] = [];
     let delivered: Pick<BuildIndexOptions, 'docFiles' | 'ruleFiles' | 'skills'> | undefined;
     try {
@@ -459,9 +687,12 @@ async function loadOrBuildScopeIndex(
     } catch (e) {
       // The shared root only: every namespace would expose other projects' learnings.
       // What pull delivers reads the same file, so it is left out in the same warning.
-      log.warn(`Recall indexed the shared learnings only: ${e instanceof Error ? e.message : String(e)}. `
-        + `The learnings of ${projects.length === 1 ? 'project' : 'projects'} ${projects.join(', ')}, and docs, rules and skills, `
-        + 'stay out of recall until manifest/projects.yaml is fixed and `teamai pull` rebuilds the index; `teamai doctor` shows the problem.');
+      log.warn(formatProjectsManifestWarning('Recall', e, localConfig, {
+        verb: 'indexed',
+        extraHeldBack: 'docs, rules and skills',
+        targetName: 'recall',
+        rebuildAction: '`teamai pull` rebuilds the index',
+      }));
       delivered = nothingDelivered;
     }
     try {
@@ -494,7 +725,7 @@ async function loadOrBuildScopeIndex(
         // The docs and skills pull delivers here, not the whole trees (#707).
         ...delivered,
         codebaseDir: undefined, // codebase now served by teamwiki/ graph engine
-        votesDir: votesExist ? votesDir : undefined,
+        voteScope: localConfig,
         indexPath,
         unreadable,
         children: localConfig.children?.fingerprint,
@@ -719,6 +950,19 @@ export async function recall(
 
   // ── Codebase knowledge graph recall ──────────────────────
   try {
+    // Identifiers the query names verbatim — "smart-sale-service",
+    // "UpdateOrderSalesRetryJob", "eventSignals", "task_type_config". Taken
+    // from the raw query rather than from word segments, which split a
+    // hyphenated slug into "smart"/"sale"/"service": those generic pieces
+    // match every codebase whose slug shares one word, while the full
+    // identifier names one module. Only identifier-shaped tokens count — a
+    // hyphen, underscore, digit or inner capital — so ordinary words
+    // ("service", "payment", "retry") never name a module.
+    const queryIdentifiers = [...query.matchAll(/[A-Za-z][A-Za-z0-9_-]{3,}/g)]
+      .map((match) => match[0])
+      .filter((token) => token.length >= 5
+        && (/[-_\d]/.test(token) || /[a-z][A-Z]/.test(token)))
+      .map((token) => token.toLowerCase());
     // A wiki codebase slug declared under `resources.wiki` but not active for
     // this directory stays out of recall, the same way docs are scoped
     // (#912). Resolved inside this try: an unreadable or malformed manifest
@@ -732,6 +976,9 @@ export async function recall(
     // B11 fix: log-dampening instead of min-max normalization
     // Codebase BM25 scores (0-50+) mapped to learnings scale (0-10) via log curve
     for (const cr of codeResults) {
+      const namedModule = queryIdentifiers.some(
+        (identifier) => namesIdentifier(String(cr.page || ''), String(cr.title || ''), identifier),
+      );
       allResults.push({
         entry: {
           filename: cr.page,
@@ -745,6 +992,9 @@ export async function recall(
           domain: 'technical' as const,
           path: path.join(wikiRoot, cr.page),
           snippet: cr.snippet,
+          // A code hit is a teamwiki page; its team-tree path is what asset
+          // relations point at, so incoming relations can render on it.
+          treePath: `teamwiki/${cr.page}`,
         },
         score: Math.min(10, Math.log2(cr.score + 1) * 2),
         scope: projectConfig ? 'project' : 'user',
@@ -752,31 +1002,116 @@ export async function recall(
         sources: cr.sources,
         relatedFiles: cr.relatedFiles,
         fromCodebase: true,
+        namedModule,
       });
     }
   } catch {
     log.warn('recall: code graph retrieval unavailable, run teamai codebase --lint to diagnose');
   }
 
-  // Re-sort merged results by normalized score descending, then date descending.
-  // Keep each result's original score for --check, quality tracking, and output.
-  const rankingScore = (result: ScopedSearchResult): number => result.fromCodebase
-    ? result.score
-    : normalizeLearningsScoreForRanking(result.score, result.idfBaseline ?? idfBaseline);
+  // Re-sort merged results: the relevant ones first, then by normalized score
+  // descending, then by date descending. Keep each result's original score for
+  // --check, quality tracking, and output.
+  const rankingScore = (result: ScopedSearchResult): number => rankingScoreOf(result, idfBaseline);
+  const relevant = (result: ScopedSearchResult): boolean =>
+    isRelevantScore(result.score, result.fromCodebase ?? false, result.idfBaseline ?? idfBaseline);
+  // Among code hits, the page that names the module the query asked about wins:
+  // codebase scores saturate, so a weaker-scoring overview of a different
+  // codebase would otherwise tie and win on input order. Expressed as a small,
+  // bounded bonus on the ordering score rather than a comparator branch, so the
+  // comparison stays a total order: a learnings hit more than this much ahead
+  // keeps its place, and a code page can never jump a learnings hit it lost to
+  // by more than the tie-break band. The stored score and `--check` are
+  // unaffected — only the merged ordering sees the bonus.
+  const NAMED_MODULE_RANK_BONUS = 0.5;
+  const orderScore = (result: ScopedSearchResult): number =>
+    rankingScore(result)
+    + (result.fromCodebase && result.namedModule === true ? NAMED_MODULE_RANK_BONUS : 0);
   allResults.sort((a, b) => {
-    const scoreDelta = rankingScore(b) - rankingScore(a);
+    // A relevant hit outranks an irrelevant one whatever their scores. `--check`
+    // reads the first result only, so an irrelevant hit at the top makes it
+    // report "nothing relevant" while a relevant hit sits below it — the
+    // cross-source penalty must not buy that position (#1524).
+    const relevanceDelta = Number(relevant(b)) - Number(relevant(a));
+    if (relevanceDelta !== 0) return relevanceDelta;
+    const scoreDelta = orderScore(b) - orderScore(a);
     if (scoreDelta !== 0) return scoreDelta;
     return (b.entry.date || '').localeCompare(a.entry.date || '');
   });
 
+  // Diversify by codebase. A code hit's score saturates the 0-10 scale easily
+  // (any graph score >= 31 caps out), so three pages of ONE codebase — an
+  // overview, an architecture note, a module page — can fill the top 3 at the
+  // same 8.0 and push a runbook that matched the query terms to #4. Measured on
+  // the 90-question hard set: 26 of the 58 misses had exactly that shape (the
+  // expected docs page at #4/#5 behind three pages of one codebase). Capping a
+  // codebase at two entries and moving the extra below the relevant learnings
+  // hits lifted hard-set fact@3 32→38 while the 305-question tuning set and the
+  // 58-question blind set were unchanged (+0 / +1).
+  //
+  // The extra page only ever moves DOWN: it lands after the last relevant
+  // learnings hit below its own position, and stays where it is when no such
+  // hit exists. Moving it up, or past irrelevant hits, would lift it above a
+  // better page of its own codebase or drop a relevant code hit out of the
+  // five shown while irrelevant learnings take its place.
+  const CODEBASE_ENTRIES_IN_TOP = 2;
+  const codebaseOf = (result: ScopedSearchResult): string | undefined =>
+    result.fromCodebase
+      ? result.entry.filename.match(/^evidence\/code\/([^/]+)\//)?.[1]
+      : undefined;
+  const ranked: ScopedSearchResult[] = [];
+  const extras: Array<{ result: ScopedSearchResult; predecessor: ScopedSearchResult | undefined }> = [];
+  const codebaseCounts = new Map<string, number>();
+  for (const result of allResults) {
+    const codebase = codebaseOf(result);
+    if (codebase) {
+      const seen = codebaseCounts.get(codebase) ?? 0;
+      if (seen >= CODEBASE_ENTRIES_IN_TOP) {
+        extras.push({ result, predecessor: ranked[ranked.length - 1] });
+        continue;
+      }
+      codebaseCounts.set(codebase, seen + 1);
+    }
+    ranked.push(result);
+  }
+  for (const { result, predecessor } of extras) {
+    const predecessorIndex = predecessor ? ranked.indexOf(predecessor) : -1;
+    let insertAt = predecessorIndex + 1;
+    for (let index = predecessorIndex + 1; index < ranked.length; index += 1) {
+      const candidate = ranked[index];
+      if (!candidate.fromCodebase && relevant(candidate)) insertAt = index + 1;
+    }
+    ranked.splice(insertAt, 0, result);
+  }
+
+  // Source diversity at the head of the list: three codebase pages must not
+  // shut out a learnings page that matched the query. When the first three are
+  // all code hits and a relevant learnings hit sits below them, the third code
+  // hit moves to just below that hit (downward only). A named-module page is
+  // exempt — the query asked for that module by name, so it is the answer, not
+  // filler. Measured together with the codebase cap and the named-module order:
+  // hard-set fact@3 32→50 (18 won, none lost), blind set 50→52, tuning set
+  // 286→289 (no question lost).
+  if (ranked.length > 3
+    && ranked.slice(0, 3).every((result) => result.fromCodebase)
+    && ranked[2].namedModule !== true) {
+    const learningsIndex = ranked.findIndex(
+      (candidate, index) => index >= 3 && !candidate.fromCodebase && relevant(candidate),
+    );
+    if (learningsIndex >= 3) {
+      const [demotedThird] = ranked.splice(2, 1);
+      ranked.splice(learningsIndex, 0, demotedThird);
+    }
+  }
+
   if (options.check) {
-    const top = allResults.length > 0 ? allResults[0] : undefined;
+    const top = ranked.length > 0 ? ranked[0] : undefined;
     emitCheckVerdict(top?.score ?? 0, top?.fromCodebase ?? false, top?.idfBaseline ?? idfBaseline, top);
     return;
   }
 
   // Limit to top 5
-  const topResults = allResults.slice(0, 5);
+  const topResults = ranked.slice(0, 5);
   // Hash only codebase sources that will be shown. This stays after the
   // --check early return so the relevance precheck remains filesystem-cheap.
   await annotateCodebaseSourceFreshness(topResults, wikiRoot).catch(() => {
@@ -795,7 +1130,7 @@ export async function recall(
   let runId: string | undefined;
   if (process.env.TEAMAI_RECALL_DISABLED !== '1' && !options.dryRun) {
     const session = await agentSessionFromEnv();
-    recordRecallQuality(session.id ?? deriveSessionId({}), topResults);
+    recordRecallQuality(session.id ?? deriveSessionId({}), topResults, query);
     const activeConfig = projectConfig ?? scopeIndexes[0]?.config;
     if (activeConfig && !projectUnreadable) {
       runId = await recordRun(activeConfig, topResults, session, options.caller, projectConfig !== null);
@@ -809,7 +1144,8 @@ export async function recall(
   }
 
   // Output results (STDOUT — AI reads this)
-  const output = formatResults(topResults, runId);
+  const relationContexts = await buildRelationContexts(scopeIndexes, projectEntryKeys);
+  const output = formatResults(topResults, runId, relationContexts);
   process.stdout.write(output + '\n');
 
   // Auto-upvote (best-effort, non-blocking for dry-run). Each scope keeps its

@@ -1,0 +1,64 @@
+import { execFileSync, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import YAML from 'yaml';
+import { expect, it } from 'vitest';
+const CLI = fileURLToPath(new URL('../../../dist/index.js', import.meta.url));
+it.for(['node-22', 'nodejs'])('doctor accepts a live launcher installed through %s and inspected through another CLI entry', { timeout: 60000 }, (name, { skip }) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-readiness-cli-'));
+  try {
+    const home = path.join(root, 'home');
+    const project = path.join(root, 'project');
+    const team = path.join(root, 'team');
+    fs.mkdirSync(path.join(home, '.pi/agent'), { recursive: true });
+    fs.mkdirSync(path.join(project, '.teamai'), { recursive: true });
+    fs.mkdirSync(team);
+    fs.writeFileSync(path.join(team, 'culture.md'), '---\ncompany:\n  name: Fixture\n---\n\nReadiness culture.\n');
+    fs.writeFileSync(path.join(team, 'teamai.yaml'), 'team: Readiness fixture\nrepo: fixture/team\nprovider: git\n');
+    fs.writeFileSync(path.join(project, '.teamai/config.yaml'), YAML.stringify({ repo: { localPath: team, remote: 'fixture/team' }, username: 'fixture', scope: 'project', projectRoot: project, updatePolicy: 'skip', usageReportEnabled: false, enabledAgents: ['pi'], additionalRoles: [] }));
+    const first = path.join(root, "first member's CLI.mjs");
+    const second = path.join(root, 'second CLI.mjs');
+    for (const file of [first, second]) fs.writeFileSync(file, `import ${JSON.stringify(pathToFileURL(CLI).href)};\n`);
+    const env = { ...process.env, HOME: home, USERPROFILE: home, FORCE_COLOR: '0', PI_CODING_AGENT_DIR: '', GIT_CONFIG_GLOBAL: path.join(home, '.gitconfig'), GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.test', GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.test' };
+    execFileSync('git', ['init', '-q'], { cwd: project, env });
+    execFileSync('git', ['init', '-q'], { cwd: team, env });
+    execFileSync('git', ['add', '.'], { cwd: team, env });
+    execFileSync('git', ['commit', '-qm', 'fixture'], { cwd: team, env });
+    const cli = (entry: string, ...args: string[]) => spawnSync(process.execPath, [entry, ...args], { cwd: project, env, encoding: 'utf8', timeout: 30000 });
+    const runtime = path.join(root, process.platform === 'win32' ? `${name}.exe` : name);
+    fs.copyFileSync(process.execPath, runtime);
+    // A Homebrew-style runtime loads libnode beside its real path, so a copy may not start.
+    const probe = spawnSync(runtime, ['--version'], { env, encoding: 'utf8', timeout: 30000 });
+    if (probe.status !== 0) skip('Copied Node runtime cannot start on this host');
+    const installed = spawnSync(runtime, [first, 'hooks', 'inject'], { cwd: project, env, encoding: 'utf8', timeout: 30000 });
+    expect(installed.status, installed.stdout + installed.stderr).toBe(0);
+    const file = path.join(home, '.pi/agent/extensions/teamai-hooks.ts');
+    const before = fs.readFileSync(file, 'utf8');
+    expect(before).toContain(first);
+    const runtimeLine = `const NODE = ${JSON.stringify(fs.realpathSync(runtime))};`;
+    expect(before).toContain(runtimeLine);
+    const ready = () => {
+      const run = cli(second, 'doctor', '--json');
+      const report = JSON.parse(run.stdout) as { checks: Array<{ name: string; ok: boolean }> };
+      return report.checks.find(check => check.name.startsWith('pi adds the team instructions'))?.ok;
+    };
+    expect(ready()).toBe(true);
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+    const shell = path.join(root, 'sh');
+    fs.writeFileSync(shell, '#!/bin/sh\n');
+    fs.writeFileSync(file, before.replace(runtimeLine, `const NODE = ${JSON.stringify(shell)};`));
+    expect(ready()).toBe(false);
+    fs.writeFileSync(file, before.replace(runtimeLine, `const NODE = ${JSON.stringify(first)};`)
+      .replace(`const ENTRY = ${JSON.stringify(first)};`, `const ENTRY = ${JSON.stringify(runtime)};`));
+    expect(ready()).toBe(false);
+    fs.writeFileSync(file, before);
+    expect(ready()).toBe(true);
+    fs.unlinkSync(first);
+    fs.mkdirSync(first);
+    expect(ready()).toBe(false);
+    fs.rmdirSync(first);
+    expect(ready()).toBe(false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

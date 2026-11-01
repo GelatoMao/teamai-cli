@@ -17,9 +17,11 @@
  * responseOf. A name not listed here is `unknown` and never counts.
  */
 import { isAbsolutePath, isWithin, resolvePath, samePath, withoutReadSelector } from './agent-path.js';
+import { getUserHome } from './home.js';
 import { resolveHookCwd } from './hook-cwd.js';
 import { classifyShellCommand } from './shell-command.js';
 import { normalizeToolName } from './tool-names.js';
+import type { ToolId } from '../types.js';
 
 /** What a call did: `read`/`search`/`list` whether a tool or a shell command did it; `shell` for any other shell call. */
 export type ToolCategory = 'read' | 'shell' | 'search' | 'list' | 'unknown';
@@ -34,7 +36,7 @@ export interface ToolCall {
    */
   paths: string[];
   status: ToolStatus;
-  /** True when the read or search was the call's only command: a tool, or a shell command outside a pipeline. */
+  /** True when the read or search was the call's only command: a tool, or a shell command neither in a pipeline nor an item of a list. */
   simple: boolean;
   /** A shell call's command line. */
   command?: string;
@@ -86,7 +88,7 @@ const LISTS_BY_DEFAULT = new Set(['Grep', 'grep_code']);
  * a markdown tree, Cursor's Grep format is unverified. Their shell searches
  * still count.
  */
-const NO_SEARCH_EVIDENCE = new Set(['omp', 'cursor']);
+const NO_SEARCH_EVIDENCE = new Set<string>(['omp', 'cursor'] satisfies ToolId[]);
 
 /** Agents whose read path can carry a selector inline (OMP's `x.md:50-200`, `x.md:raw`). */
 const READ_SELECTORS = new Set(['omp']);
@@ -276,7 +278,7 @@ export function classifyToolCall(stdin: Record<string, unknown>, agent?: string)
 
   const command = input.command;
   if (typeof command !== 'string') return unknown;
-  const shell = classifyShellCommand(command, { powershell: name.toLowerCase() === 'powershell' });
+  const shell = classifyShellCommand(command, { powershell: name.toLowerCase() === 'powershell', home: getUserHome() }, status === 'success');
   const output = outputOf(response);
   const optional = output !== undefined ? { output } : {};
   // With no status, only the command's own error lines tell a failure apart.

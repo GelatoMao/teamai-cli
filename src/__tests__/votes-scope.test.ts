@@ -32,7 +32,7 @@ vi.mock('node:child_process', async (importOriginal) => ({
     return child;
   }),
 }));
-vi.mock('../pull.js', () => ({ pull: vi.fn(async () => undefined) }));
+vi.mock('../pull.js', () => ({ pull: vi.fn(async () => undefined), settleLateUsageReport: vi.fn(async () => undefined) }));
 vi.mock('../update.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../update.js')>()),
   doUpdate: vi.fn(async () => undefined),
@@ -75,7 +75,7 @@ vi.mock('../utils/reports-branch.js', async () => {
 
 const { hookDispatchCli } = await import('../hook-dispatch-cli.js');
 const { resolveProjectDataHome, saveLocalConfigForScope } = await import('../config.js');
-const { reportUsageToTeam } = await import('../team-push.js');
+const { reportUsage } = await import('../team-push.js');
 const { recallFeedback } = await import('../votes.js');
 const { resolveVizRoot } = await import('../viz.js');
 const { recall } = await import('../recall.js');
@@ -224,7 +224,7 @@ function teamFile(config: LocalConfig, upvotes: Record<string, number>): void {
 }
 
 async function report(config: LocalConfig): Promise<void> {
-  await reportUsageToTeam(config.repo.localPath, config.username, { skipTruncate: true, selfConfig: config });
+  await reportUsage(config.repo.localPath, config.username, { skipTruncate: true, selfConfig: config });
 }
 
 /** What an earlier release leaves in the shared directory: a delta no scope may push. */
