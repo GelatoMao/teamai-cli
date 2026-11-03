@@ -8,7 +8,8 @@ import { LabelStore } from '../scorers/label-store.js';
 import { encodeCwdClaude } from '../session-flow/fs.js';
 import type { RunMode } from '../launch-context.js';
 import { acquireLock, releaseLock } from '../update.js';
-import { getDataHome, type ToolId } from '../types.js';
+import { getDataHome } from '../types.js';
+import type { ToolId } from '../tools.js';
 import { skillContext } from '../workflow/drivers/skill/skill-driver.js';
 import { inProcessClient, type WorkflowClient } from '../workflow/protocol.js';
 import { takeJudgeLease, type JudgeRequest } from '../workflow/scoring.js';
@@ -297,7 +298,7 @@ describe('skill driver', () => {
       run, status: 'driving', actions: [],
       running: [{ attempt: expect.stringMatching(/^a[0-9a-f]{8}$/), step: 'lint', phase: 'running' }],
       events: [{ kind: 'started', step: 'lint', attempt: expect.stringMatching(/^a[0-9a-f]{8}$/) }],
-      // oxlint-disable-next-line unicorn/no-thenable
+      // oxlint-disable-next-line unicorn/no-thenable -- a workflow turn names its next step `then`; it is data, not a promise method
       then: { kind: 'poll', run: `teamai workflow next ${run} --driver skill --wait` },
     });
 
@@ -309,7 +310,7 @@ describe('skill driver', () => {
         { kind: 'settled', step: 'lint', outcome: 'success', exitCode: 0 },
         { kind: 'started', step: 'test', attempt: expect.stringMatching(/^a[0-9a-f]{8}$/) },
       ],
-      // oxlint-disable-next-line unicorn/no-thenable
+      // oxlint-disable-next-line unicorn/no-thenable -- a workflow turn names its next step `then`; it is data, not a promise method
       then: { kind: 'poll', run: `teamai workflow next ${run} --driver skill --wait` },
     } } });
     const ended = await harness.call({ kind: 'next', run, wait: true });
@@ -480,7 +481,7 @@ describe('skill driver', () => {
     const polled = await harness.call({ kind: 'next', run, wait: true });
     expect(polled).toEqual({ data: { turn: expect.objectContaining({
       actions: [],
-      // oxlint-disable-next-line unicorn/no-thenable
+      // oxlint-disable-next-line unicorn/no-thenable -- a workflow turn names its next step `then`; it is data, not a promise method
       then: { kind: 'wake', run: `teamai workflow next ${run} --driver skill` },
     }) } });
 
@@ -672,7 +673,7 @@ describe('skill driver', () => {
     expect(chosen.data.turn.running).toEqual([{ attempt: place.attempt, step: 'work.write', phase: 'placing' }]);
     expect(await harness.call({ kind: 'next', run, wait: true })).toEqual({ data: { turn: expect.objectContaining({
       actions: [],
-      // oxlint-disable-next-line unicorn/no-thenable
+      // oxlint-disable-next-line unicorn/no-thenable -- a workflow turn names its next step `then`; it is data, not a promise method
       then: { kind: 'wake', run: `teamai workflow next ${run} --driver skill` },
     }) } });
 
@@ -961,7 +962,7 @@ steps:
       status: 'done',
       events: [{ kind: 'settled', step: 'review', outcome: 'success' }, { kind: 'judging', step: 'review', scorers: ['review-quality'], ref: expect.stringMatching(/^s[0-9a-f]+\/a[0-9a-f]{8}$/) }],
       actions: [{ kind: 'done', outcome: 'succeeded', prs: [], judging: { step: 'review', scorers: ['review-quality'] } }],
-      // oxlint-disable-next-line unicorn/no-thenable
+      // oxlint-disable-next-line unicorn/no-thenable -- a workflow turn names its next step `then`; it is data, not a promise method
       then: { kind: 'poll', run: `teamai workflow next ${run} --driver skill --wait` },
     } } });
 
@@ -985,7 +986,7 @@ steps:
     expect(done).toMatchObject({ data: { turn: {
       status: 'done',
       actions: [{ kind: 'done', outcome: 'succeeded', judging: { step: 'review', scorers: ['review-quality'] } }],
-      // oxlint-disable-next-line unicorn/no-thenable
+      // oxlint-disable-next-line unicorn/no-thenable -- a workflow turn names its next step `then`; it is data, not a promise method
       then: { kind: 'poll', run: `teamai workflow next ${run} --driver skill --wait` },
     } } });
     const judged = await harness.call({ kind: 'next', run, wait: true }, { mode: 'unattended' });
@@ -1068,6 +1069,23 @@ steps:
     expect(await harness.call({ kind: 'choose', run, choice: 'h1' }, { session: undefined })).toMatchObject({ data: { turn: { events: expect.arrayContaining([{
       kind: 'settled', step: 'review', outcome: 'failed', failure: { code: 'model_unavailable', message: 'Step "review" needs model claude-opus-4-1, and this coding session names no tool to resolve it for: start or resume the workflow with --tools default=<tool>, the tool it works in.' },
     }]) } } });
+  });
+
+  it('starts a run whose step names an exact model in a session that names no tool, as none is needed to resolve it', async () => {
+    const harness = await skillHarness({ review: REVIEW.replace('    prompt: Review the change.', '    prompt: Review the change.\n    model: { name: claude-opus-4-1 }') }, { tool: null });
+    roots.push(harness.root);
+    expect(await harness.call({ kind: 'start', name: 'review', answers: { confirmed: false, judge: false }, inputs: undefined })).toMatchObject({ data: { turn: { status: 'driving' } } });
+  });
+
+  it('a step with an exact model dispatches it as written, even once a session whose host names no tool takes the run over', async () => {
+    const harness = await skillHarness({ review: REVIEW.replace('    prompt: Review the change.', '    prompt: Review the change.\n    model: { name: claude-opus-4-1, effort: high }') }, { tool: null });
+    roots.push(harness.root);
+    const started = await harness.call({ kind: 'start', name: 'review', answers: { confirmed: false }, inputs: undefined, tool: 'claude' });
+    if (!('data' in started) || !('turn' in started.data)) throw new Error(JSON.stringify(started));
+    const run = RunIdSchema.parse(started.data.turn.run);
+    expect(await harness.call({ kind: 'takeover', run, confirmed: false }, { session: undefined })).toMatchObject({ data: { turn: { run } } });
+    expect(await harness.call({ kind: 'choose', run, choice: 'h1' }, { session: undefined }))
+      .toMatchObject({ data: { turn: { actions: [{ kind: 'dispatch', model: { by: 'step', name: 'claude-opus-4-1', effort: 'high' } }] } } });
   });
 
   it('a resume that names the tool gives it back to a run a session with no tool took over, and its steps then resolve their model for it', async () => {
@@ -1248,7 +1266,7 @@ steps:
       expect(settled).toMatchObject({ data: { turn: {
         status: 'driving', actions: [], running: [], waiting: delivering,
         events: [{ kind: 'settled', step: 'implement', outcome: 'success', exitCode: 0 }],
-        // oxlint-disable-next-line unicorn/no-thenable
+        // oxlint-disable-next-line unicorn/no-thenable -- a workflow turn names its next step `then`; it is data, not a promise method
         then: { kind: 'poll', run: `teamai workflow next ${run} --driver skill --wait` },
       } } });
       expect(await harness.call({ kind: 'next', run, wait: false })).toMatchObject({ data: { turn: { status: 'driving', actions: [], waiting: delivering } } });

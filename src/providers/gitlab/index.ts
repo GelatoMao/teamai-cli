@@ -7,7 +7,9 @@ import {
   gitlabRepoClone,
   gitlabCreateRepo,
   gitlabMrCreate,
+  gitlabCommitPipelines,
   gitlabFindOpenMr,
+  gitlabMrHistory,
   GitLabRepoNotFoundError,
 } from './gitlab-api.js';
 import { gitlabListOrgRepos } from './org.js';
@@ -23,7 +25,7 @@ import type { MRData } from '../../types.js';
  */
 export class GitLabProvider implements GitProvider {
   readonly name = 'gitlab';
-  readonly pullRequests: PullRequestLookup = { findOpen: gitlabFindOpenMr };
+  readonly pullRequests: PullRequestLookup = { findOpen: gitlabFindOpenMr, history: gitlabMrHistory, checks: gitlabCommitPipelines };
 
   parseRepoInput(input: string): RepoInfo {
     return parseGitLabRepoInput(input);
@@ -36,13 +38,17 @@ export class GitLabProvider implements GitProvider {
   async authenticate(): Promise<string> {
     if (this.isAuthenticated()) {
       const username = await gitlabWhoami();
+
       if (username) return username;
     }
+
     await ensureGitLabAvailable();
     const username = await gitlabWhoami();
+
     if (!username) {
       throw new Error('GitLab authentication failed. Please run `teamai init` again.');
     }
+
     return username;
   }
 
@@ -57,6 +63,7 @@ export class GitLabProvider implements GitProvider {
       if (e instanceof GitLabRepoNotFoundError) {
         throw new RepoNotFoundError(repo);
       }
+
       throw e;
     }
   }

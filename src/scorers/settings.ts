@@ -4,6 +4,7 @@
  *   batch: true          # a step's scorers share one judge call unless the step or its workflow says
  *   isolation: verified  # the least isolation every judge of the team's scorers needs
  *   sessions: { attended: off, unattended: auto }  # per run mode, off, ask or auto; true or false sets both
+ *   skill_routing: true  # a session's judge also answers one routing question per delivered team skill (#1469)
  *   daily_limit: 10      # sessions one data home leases per local day, unless a member's config.yaml says
  *
  * `scorers/<ns>/scoring.yaml` is read where `<ns>` is an active scorers namespace, as model aliases are where theirs
@@ -18,7 +19,8 @@
  * this teamai does not know is dropped with a problem instead, so a newer CLI's additions never stop this one.
  */
 import path from 'node:path';
-import YAML from 'yaml';
+import { parseYaml } from '../utils/yaml.js';
+import { z } from 'zod';
 import { getKnowledgeDir, type LocalConfig } from '../types.js';
 import { readEntryFileText } from '../namespaced-entries.js';
 import { isSafeNamespaceSegment } from '../manifest-schema.js';
@@ -29,7 +31,13 @@ import { loadMemberSettings } from '../config.js';
 import { SessionPolicy, type PolicySource, type SessionPolicies } from '../session-flow/session-policy.js';
 
 /** Every key a `scoring.yaml` may set: the parser handles each one, and the problem for any other key lists them. */
-const SCORING_KEYS = ['batch', 'isolation', 'sessions', 'daily_limit'] as const;
+const SCORING_KEYS = ['batch', 'isolation', 'sessions', 'skill_routing', 'daily_limit'] as const;
+
+/** A scoring.yaml document: a mapping whose values each setting reads for itself. */
+const ScoringMappingSchema = z.record(z.string(), z.unknown());
+
+const WholeNumberSchema = z.number().nonnegative().refine(Number.isInteger);
+
 type ScoringKey = (typeof SCORING_KEYS)[number];
 
 function isScoringKey(key: string): key is ScoringKey {
@@ -38,34 +46,47 @@ function isScoringKey(key: string): key is ScoringKey {
 
 /** What one `scoring.yaml` sets, or why it cannot be read; every message names the file. */
 export type ScoringFileRead =
-  | { ok: true; batch?: boolean; isolation?: string; sessions?: Partial<SessionPolicies>; dailyLimit?: number; problems: string[] }
+  | { ok: true; batch?: boolean; isolation?: string; sessions?: Partial<SessionPolicies>; skillRouting?: boolean; dailyLimit?: number; problems: string[] }
   | { ok: false; reason: string };
 
 export function parseScoringFile(relativePath: string, text: string): ScoringFileRead {
   let document: unknown;
+
   try {
-    document = YAML.parse(text);
+    document = parseYaml(text);
   } catch (error) {
     const [message = ''] = (error instanceof Error ? error.message : String(error)).split('\n');
+
     return { ok: false, reason: `${relativePath} is not valid YAML: ${message.replace(/:\s*$/, '')}` };
   }
+
   if (document === null || document === undefined) return { ok: true, problems: [] };
-  if (typeof document !== 'object' || Array.isArray(document)) {
+
+  const mapping = ScoringMappingSchema.safeParse(document);
+
+  if (!mapping.success) {
     return { ok: false, reason: `${relativePath} must be a mapping, such as \`isolation: verified\`` };
   }
+
   const read: ScoringFileRead & { ok: true } = { ok: true, problems: [] };
-  for (const [key, value] of Object.entries(document)) {
+
+  for (const [key, value] of Object.entries(mapping.data)) {
     if (!isScoringKey(key)) {
       read.problems.push(`${relativePath}: "${key}" is not a scoring setting (${SCORING_KEYS.join(', ')}), so it is ignored`);
       continue;
     }
+
     switch (key) {
-      case 'batch':
-        if (typeof value === 'boolean') read.batch = value;
+      case 'batch': {
+        const batch = z.boolean().safeParse(value);
+
+        if (batch.success) read.batch = batch.data;
         else read.problems.push(`${relativePath}: batch is ${JSON.stringify(value)}, not true or false, so it is ignored`);
         break;
+      }
+
       case 'isolation':
-        read.isolation = typeof value === 'string' ? value : JSON.stringify(value);
+        read.isolation = z.string().safeParse(value).data ?? JSON.stringify(value);
         break;
       case 'sessions': {
         const policies = SessionPolicy.read(`${relativePath} sessions`, value, { booleans: true });
@@ -73,16 +94,30 @@ export function parseScoringFile(relativePath: string, text: string): ScoringFil
         read.problems.push(...policies.problems);
         break;
       }
-      case 'daily_limit':
-        if (typeof value === 'number' && Number.isInteger(value) && value >= 0) read.dailyLimit = value;
+
+      case 'skill_routing': {
+        const skillRouting = z.boolean().safeParse(value);
+
+        if (skillRouting.success) read.skillRouting = skillRouting.data;
+        else read.problems.push(`${relativePath}: skill_routing is ${JSON.stringify(value)}, not true or false, so it is ignored`);
+        break;
+      }
+
+      case 'daily_limit': {
+        const dailyLimit = WholeNumberSchema.safeParse(value);
+
+        if (dailyLimit.success) read.dailyLimit = dailyLimit.data;
         else read.problems.push(`${relativePath}: daily_limit is ${JSON.stringify(value)}, not a whole number of 0 or more, so it is ignored`);
         break;
+      }
+
       default: {
         const unhandled: never = key;
         void unhandled;
       }
     }
   }
+
   return read;
 }
 
@@ -100,7 +135,7 @@ export type SessionScoring = { policies: SessionPolicies; dailyLimit: number; da
  * finished sessions are judge work.
  */
 export type ScopeScoring =
-  | { ok: true; batch: boolean | undefined; isolation: IsolationSetting[]; sessions: SessionScoring; problems: string[] }
+  | { ok: true; batch: boolean | undefined; isolation: IsolationSetting[]; sessions: SessionScoring; skillRouting: boolean; problems: string[] }
   | { ok: false; reason: string };
 
 /** A `scoring.yaml` this member reads; `namespace` is null for the root file. */
@@ -108,6 +143,7 @@ interface TeamFile {
   namespace: string | null;
   relativePath: string;
   sessions?: Partial<SessionPolicies>;
+  skillRouting?: boolean;
   dailyLimit?: number;
 }
 
@@ -128,8 +164,13 @@ function sessionScoring({ config, machine, rootFile, inNamespaces, problems }: {
 }): SessionScoring {
   const member = config.scoring?.sessions;
   const limit = config.scoring?.daily_limit;
-  if (typeof limit === 'string') problems.push(`config.yaml scoring.daily_limit is ${limit}, not a whole number of 0 or more, so it is ignored`);
-  if (typeof machine?.daily_limit === 'string') problems.push(`~/.teamai/config.yaml scoring.daily_limit is ${machine.daily_limit}, not a whole number of 0 or more, so it is ignored`);
+  // The config schema keeps an invalid daily_limit as its text, so only a number is a limit.
+  const memberLimit = z.number().safeParse(limit).data;
+  const machineDailyLimit = z.number().safeParse(machine?.daily_limit).data;
+
+  if (limit !== undefined && memberLimit === undefined) problems.push(`config.yaml scoring.daily_limit is ${limit}, not a whole number of 0 or more, so it is ignored`);
+
+  if (machine?.daily_limit !== undefined && machineDailyLimit === undefined) problems.push(`~/.teamai/config.yaml scoring.daily_limit is ${machine.daily_limit}, not a whole number of 0 or more, so it is ignored`);
   const fromMember = SessionPolicy.read('config.yaml scoring.sessions', member ?? {}, { booleans: true });
   const fromMachine = SessionPolicy.read('~/.teamai/config.yaml scoring.sessions', machine?.sessions ?? {}, { booleans: true });
   problems.push(...fromMember.problems, ...fromMachine.problems);
@@ -137,17 +178,24 @@ function sessionScoring({ config, machine, rootFile, inNamespaces, problems }: {
   const ofTeam = SessionPolicy.resolve([inNamespaces.map((file) => file.sessions ?? {}), [rootFile?.sessions ?? {}]], defaults);
   // The team's comes first, so it keeps the credit where the machine says the same.
   const policies = SessionPolicy.resolve([[fromMember.set], [ofTeam, fromMachine.set]], defaults);
+
   const [lowest] = inNamespaces.flatMap((file) => (file.dailyLimit === undefined ? [] : [{ value: file.dailyLimit, source: `${file.relativePath} daily_limit` }]))
     .sort((left, right) => left.value - right.value);
+
   const ofTeamLimit = lowest ?? (rootFile?.dailyLimit === undefined ? undefined : { value: rootFile.dailyLimit, source: `${rootFile.relativePath} daily_limit` });
-  const machineLimit = typeof machine?.daily_limit === 'number' && machine.daily_limit < (ofTeamLimit?.value ?? SESSION_DAILY_LIMIT)
-    ? { value: machine.daily_limit, source: '~/.teamai/config.yaml scoring.daily_limit' }
+
+  const machineLimit = machineDailyLimit !== undefined && machineDailyLimit < (ofTeamLimit?.value ?? SESSION_DAILY_LIMIT)
+    ? { value: machineDailyLimit, source: '~/.teamai/config.yaml scoring.daily_limit' }
     : undefined;
-  const daily = typeof limit === 'number' ? { value: limit, source: 'config.yaml scoring.daily_limit' } : machineLimit ?? ofTeamLimit;
+
+  const daily = memberLimit !== undefined ? { value: memberLimit, source: 'config.yaml scoring.daily_limit' } : machineLimit ?? ofTeamLimit;
+
   if (!daily) return { policies, dailyLimit: SESSION_DAILY_LIMIT, dailyLimitSource: { kind: 'default' } };
   const dailyLimitSource = { kind: 'setting', key: daily.source } as const;
+
   if (daily.value > 0) return { policies, dailyLimit: daily.value, dailyLimitSource };
   const off = { policy: 'off', source: dailyLimitSource } as const;
+
   return { policies: { attended: off, unattended: off }, dailyLimit: 0, dailyLimitSource };
 }
 
@@ -159,37 +207,51 @@ function failed(cause: string): ScopeScoring {
 export async function scopeScoring(config: LocalConfig): Promise<ScopeScoring> {
   const root = path.join(getKnowledgeDir(config), 'scorers');
   const dirs: string[] = [];
+
   for (const dir of (await listDirs(root)).filter(isSafeNamespaceSegment).sort()) {
     if (await pathExists(path.join(root, dir, SCORING_FILE))) dirs.push(dir);
   }
+
   const { active } = await scorerNamespaces(config, dirs);
   const files: Array<TeamFile & { batch?: boolean; isolation?: string }> = [];
   const problems: string[] = [];
+
   for (const namespace of [null, ...active]) {
     const relativePath = namespace === null ? `scorers/${SCORING_FILE}` : `scorers/${namespace}/${SCORING_FILE}`;
     const text = await readEntryFileText(path.join(root, ...(namespace === null ? [] : [namespace]), SCORING_FILE), relativePath);
+
     if (!text.ok) return failed(text.reason);
+
     if (text.text === null) continue;
     const read = parseScoringFile(relativePath, text.text);
+
     if (!read.ok) return failed(read.reason);
     problems.push(...read.problems);
     files.push({ namespace, relativePath, ...read });
   }
+
   const rootFile = files.find((file) => file.namespace === null);
   const inNamespaces = files.filter((file) => file.namespace !== null);
 
   const batches = inNamespaces.filter((file) => file.batch !== undefined);
   const [first] = batches;
   const differing = batches.find((file) => file.batch !== first?.batch);
+
   if (first && differing) {
     return failed(`batch is ${String(first.batch)} in ${first.relativePath} and ${String(differing.batch)} in ${differing.relativePath}, and both `
       + 'namespaces are active here, so nothing says which one you should receive. Remove batch from one of the files, '
       + 'or stop declaring one of the namespaces for your roles and projects');
   }
+
   const isolations = inNamespaces.filter((file) => file.isolation !== undefined);
   const teamIsolation = isolations.length > 0 ? isolations : rootFile?.isolation !== undefined ? [rootFile] : [];
   // In user scope, ~/.teamai/config.yaml is this scope's own config.
   const machine = config.scope === 'user' ? undefined : (await loadMemberSettings()).scoring;
+  // skill_routing resolves as sessions' team files do, but simply: an active namespace's file overrides the root
+  // file's key, and one that sets false turns it off. Nothing sets it: off, for it costs judge launches.
+  const routingFiles = inNamespaces.filter((file) => file.skillRouting !== undefined);
+  const skillRouting = routingFiles.some((file) => file.skillRouting === false) ? false : routingFiles[0]?.skillRouting ?? rootFile?.skillRouting ?? false;
+
   return {
     ok: true,
     batch: first?.batch ?? rootFile?.batch,
@@ -199,6 +261,7 @@ export async function scopeScoring(config: LocalConfig): Promise<ScopeScoring> {
       ...(machine?.isolation === undefined ? [] : [{ source: '~/.teamai/config.yaml scoring.isolation', value: machine.isolation }]),
     ],
     sessions: sessionScoring({ config, machine, rootFile, inNamespaces, problems }),
+    skillRouting,
     problems,
   };
 }

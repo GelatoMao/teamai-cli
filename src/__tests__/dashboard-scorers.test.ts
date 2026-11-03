@@ -105,19 +105,19 @@ describe('dashboard scorer results', () => {
     expect(byDefinition.selected?.groups?.map((group) => [group.kind === 'value' ? group.value : group.kind, group.stats.n])).toEqual([['implementer', 2]]);
   });
 
-  it('leaves out the labels of a benchmark run', async () => {
+  it('leaves out the labels of an isolated run', async () => {
     const { config } = team();
     publishRecord(config, { run: 'r0000000000000001', steps: [{ step: 'implement', pass: 1, agent: observation('claude') }] });
-    publishRecord(config, { run: 'r0000000000000002', benchmark: { suite: { sourceHash: 'b'.repeat(64) }, trials: [] }, steps: [{ step: 'implement', pass: 1, agent: observation('codex') }] });
+    publishRecord(config, { run: 'r0000000000000002', isolated: true, steps: [{ step: 'implement', pass: 1, agent: observation('codex') }] });
     publishLabels(config, 'bob', [workflowLabel('r0000000000000001'), workflowLabel('r0000000000000002', { passed: false })]);
     const view = await scorerResults({ config, query: { windowDays: 30 }, now: NOW });
     expect(view.selected?.cohort.stats).toEqual({ n: 1, passed: 1, failed: 0, rate: 1 });
   });
 
-  it('leaves out the labels of a benchmark run whose run file is also on this machine', async () => {
+  it('leaves out the labels of an isolated run whose run file is also on this machine', async () => {
     const { config } = team();
     const runId = 'r0000000000000002';
-    publishRecord(config, { run: runId, benchmark: { suite: { sourceHash: 'b'.repeat(64) }, trials: [] }, steps: [{ step: 'implement', pass: 1, agent: observation('codex') }] });
+    publishRecord(config, { run: runId, isolated: true, steps: [{ step: 'implement', pass: 1, agent: observation('codex') }] });
     write(runFilePath(config, runId), JSON.stringify({
       schemaVersion: 'v1alpha1', id: runId, name: 'review', revision: 1, status: 'succeeded', startedAt: 1, steps: [], settledAttempts: [],
       definition: { schemaVersion: 'v1alpha1', name: 'review', description: 'Review.', steps: [{ id: 'implement', prompt: 'p' }] },
@@ -126,6 +126,72 @@ describe('dashboard scorer results', () => {
     publishLabels(config, 'bob', [workflowLabel(runId, { passed: false })]);
     const view = await scorerResults({ config, query: { windowDays: 30 }, now: NOW });
     expect(view.scorers).toEqual([]);
+  });
+
+  describe('the agent a workflow label carries', () => {
+    const byTool = async (config: LocalConfig) => (await scorerResults({ config, query: { windowDays: 30, groupBy: 'tool' }, now: NOW }))
+      .selected?.groups?.map((group) => [group.kind === 'value' ? group.value : group.kind, group.stats.n]);
+
+    it('counts a label under its own agent when the run it judged is gone, and under its own agent over the run\'s record', async () => {
+      const { config } = team();
+      publishRecord(config, { run: 'r0000000000000001', steps: [{ step: 'implement', pass: 1, agent: observation('codex') }] });
+      publishLabels(config, 'bob', [
+        workflowLabel('r0000000000000001', { agent: observation('claude') }),
+        workflowLabel('r0000000000000009', { agent: observation('opencode') }),
+      ]);
+
+      expect(await byTool(config)).toEqual([['claude', 1], ['opencode', 1]]);
+    });
+
+    it('still leaves out the labels of an isolated run, whatever agent they carry', async () => {
+      const { config } = team();
+      publishRecord(config, { run: 'r0000000000000002', isolated: true, steps: [{ step: 'implement', pass: 1, agent: observation('codex') }] });
+      publishLabels(config, 'bob', [workflowLabel('r0000000000000002', { agent: observation('claude') })]);
+
+      expect((await scorerResults({ config, query: { windowDays: 30 }, now: NOW })).scorers).toEqual([]);
+    });
+
+    it('groups a label by the role its pass ran with in a workflow copy, and a member pass by the member\'s role', async () => {
+      const { config } = team();
+      const ranAs = (selection: { primaryRole: string; stepRole?: string }): AgentObservation => ({
+        ...observation('claude'), team: { revision: 'a'.repeat(40), localChanges: false, selection: { scope: 'project', additionalRoles: [], ...selection } },
+      });
+      publishLabels(config, 'bob', [
+        workflowLabel('r0000000000000003', { agent: ranAs({ primaryRole: 'frontend', stepRole: 'review' }), subject: { runId: 'r0000000000000003', step: 'review', pass: 1 } }),
+        workflowLabel('r0000000000000003', { agent: ranAs({ primaryRole: 'frontend' }), passed: false, label: 'missed', score: 0 }),
+      ]);
+
+      const view = await scorerResults({ config, query: { windowDays: 30, groupBy: 'role' }, now: NOW });
+
+      expect(view.selected?.groups?.map((group) => [group.kind === 'value' ? group.value : group.kind, group.stats.passed, group.stats.failed])).toEqual([['frontend', 0, 1], ['review', 1, 0]]);
+    });
+
+    it('lists a failing label with the harness it judged, opens its run while the run is listed, and names no harness for a label that recorded none', async () => {
+      const { config } = team();
+      const revision = 'a'.repeat(40);
+      const reviewer: AgentObservation = {
+        ...observation('claude'), model: { reported: 'claude-review-1' }, effort: { requested: 'high' },
+        team: { revision, localChanges: false, selection: { scope: 'project', primaryRole: 'frontend', additionalRoles: [], stepRole: 'review' } },
+      };
+      publishRecord(config, { run: 'r0000000000000001', steps: [{ step: 'implement', pass: 1, agent: reviewer }] });
+      const failed = { passed: false, label: 'missed', score: 0 };
+      publishLabels(config, 'bob', [
+        workflowLabel('r0000000000000001', { ...failed, agent: reviewer, scoredAt: '2026-03-18T12:00:00.000Z' }),
+        workflowLabel('r0000000000000009', { ...failed, agent: observation('codex'), scoredAt: '2026-03-18T11:00:00.000Z' }),
+        workflowLabel('r0000000000000008', failed),
+      ]);
+
+      const view = await scorerResults({ config, query: { windowDays: 30 }, now: NOW });
+
+      expect(view.selected?.failing.labels).toEqual([
+        expect.objectContaining({
+          run: { id: 'r0000000000000001', step: 'implement', pass: 1, source: 'reported' },
+          harness: { tool: 'claude', model: 'claude-review-1', effort: 'high', role: { of: 'step', names: ['review'] }, teamRevision: revision },
+        }),
+        expect.objectContaining({ run: { id: 'r0000000000000009', step: 'implement', pass: 1 }, harness: { tool: 'codex' } }),
+        expect.not.objectContaining({ harness: expect.anything() }),
+      ]);
+    });
   });
 
   it('splits at a team commit with this clone\'s ancestry, and refuses a commit the clone does not have', async () => {
@@ -149,7 +215,7 @@ describe('dashboard scorer results', () => {
     write(path.join(config.repo.localPath, 'sessions', 'repos', 'github.com%2Facme%2Fapp', 'bob', 'fix-login-flow.jsonl'), 'TRANSCRIPT-SECRET\n');
     write(path.join(config.dataHome ?? '', 'scores', 'reasoning', 'x.md'), 'REASONING-SECRET');
     const view = await scorerResults({ config, query: { windowDays: 30 }, now: NOW });
-    expect(view.selected?.failing).toEqual({ total: 1, labels: [{ author: 'bob', scoredAt: '2026-03-18T10:00:00.000Z', label: 'poor', source: 'session', platform: 'claude', sessionName: 'fix-login-flow' }] });
+    expect(view.selected?.failing).toEqual({ total: 1, covered: 0, startable: 0, labels: [{ author: 'bob', scoredAt: '2026-03-18T10:00:00.000Z', label: 'poor', source: 'session', platform: 'claude', sessionName: 'fix-login-flow', start: { refused: 'not_recorded' }, learnings: [] }] });
     expect(JSON.stringify(view)).not.toMatch(/native-7f3a91|TITLE-SECRET|private\/work|TRANSCRIPT-SECRET|REASONING-SECRET|isolation|access/);
   });
 

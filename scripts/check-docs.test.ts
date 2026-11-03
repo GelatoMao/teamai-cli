@@ -9,6 +9,9 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const command = path.join(ROOT, 'scripts/check-docs.mjs');
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+// The cases that run the check three times compile the TypeScript sources it reads each time. They take 13-16 s on a CI
+// runner, around the default 15 s, so they get 60 s.
+const THREE_RUNS_MS = 60_000;
 
 function checkout(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-docs-command-'));
@@ -44,7 +47,7 @@ it('write regenerates the command reference and a second write is stable', () =>
   expect(run(root, '--write').status).toBe(0);
   expect(fs.readFileSync(reference, 'utf8')).toBe(generated);
   expect(run(root).status).toBe(0);
-});
+}, THREE_RUNS_MS);
 it('check refuses stale support pages in both languages and write repairs them', () => {
   const root = checkout();
   const pages = ['docs/guide/tool-support.md', 'docs/guide/zh-CN/tool-support.md'];
@@ -56,7 +59,7 @@ it('check refuses stale support pages in both languages and write repairs them',
   expect(run(root, '--write').status).toBe(0);
   for (const page of pages) expect(fs.readFileSync(path.join(root, page), 'utf8')).toContain('Claude');
   expect(run(root).status).toBe(0);
-});
+}, THREE_RUNS_MS);
 it('check rejects a README matrix that disagrees with the tool descriptor', () => {
   const root = checkout();
   const readme = path.join(root, 'README.md');

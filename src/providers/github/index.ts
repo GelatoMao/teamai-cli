@@ -8,7 +8,9 @@ import {
   ghRepoClone,
   ghCreateRepo,
   ghPrCreate,
+  ghCommitChecks,
   ghFindOpenPull,
+  ghPullHistory,
   RepoNotFoundError as GhRepoNotFoundError,
 } from './gh-cli.js';
 import { ghListOrgRepos } from './gh-org.js';
@@ -16,7 +18,7 @@ import { parseGitHubRepoInput } from './repo-url.js';
 
 export class GitHubProvider implements GitProvider {
   readonly name = 'github';
-  readonly pullRequests: PullRequestLookup = { findOpen: ghFindOpenPull };
+  readonly pullRequests: PullRequestLookup = { findOpen: ghFindOpenPull, history: ghPullHistory, checks: ghCommitChecks };
 
   parseRepoInput(input: string): RepoInfo {
     return parseGitHubRepoInput(input);
@@ -29,8 +31,10 @@ export class GitHubProvider implements GitProvider {
   async authenticate(): Promise<string> {
     if (this.isAuthenticated()) {
       const username = await ghAuthWhoami();
+
       if (username) return username;
     }
+
     return ensureGhAuthenticated();
   }
 
@@ -45,6 +49,7 @@ export class GitHubProvider implements GitProvider {
       if (e instanceof GhRepoNotFoundError) {
         throw new RepoNotFoundError(repo);
       }
+
       throw e;
     }
   }

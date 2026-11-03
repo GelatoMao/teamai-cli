@@ -81,7 +81,7 @@ related:
 ---
 ```
 
-`MAPS_TO` 指向 teamwiki 代码页面，`REFERENCES` 指向任意资产，`SUPERSEDES` / `CONFLICTS_WITH` 指向规则、文档或 learning。`teamai recall` 会把每条声明的关系作为 `Related:` 行打印在命中结果上，会话拿到关系的一端时也就看到了另一端。`teamai review --branch` 会判定 `related:` 块使用了表格外关系的规则或文档为失败；指向分支上不存在资产的关系是警告，不会判定失败。
+`MAPS_TO` 指向 teamwiki 代码页面，`REFERENCES` 指向任意资产，`SUPERSEDES` / `CONFLICTS_WITH` 指向规则、文档或 learning。`teamai recall` 会把每条声明的关系、以及每条由 `paths:` glob 派生的关系（见知识指南），作为 `Related:` 行打印在命中结果上，会话拿到关系的一端时也就看到了另一端。`teamai review --branch` 会判定 `related:` 块使用了表格外关系的规则或文档为失败；指向分支上不存在资产的关系是警告，不会判定失败。
 
 ## Agents
 
@@ -341,6 +341,8 @@ servers:
 
 密钥写 `${VAR}`，并在 `env/secrets.yaml` 里声明。只给一个项目时，写到 `mcp/<ns>/mcp.yaml`。
 
+stdio server 的 `env` 键在 Codex TOML 中保持原样：`HTTP.PROXY` 是一个变量，`ProgramFiles(x86)` 等名称会自动加引号。
+
 ZCode 的 server 写入 `~/.zcode/cli/config.json` 或项目的 `.zcode/config.json`，位于 `mcp.servers` 下。这基于 3.16.2 源码，尚未认证 3.15.1。Pull 只从 `~/.agents/mcp.json` 移走未被修改的 teamai 条目。原生配置中有 server 后，桌面应用不再读取该备用文件，doctor 会列出其中的其他 server。
 
 Antigravity 的用户级 server 写入 `~/.gemini/config/mcp_config.json`。项目级 server 它只从插件读取，所以 teamai 把它们写成一个插件：
@@ -354,7 +356,7 @@ agy 支持 stdio 和 HTTP server，不写 `type`；`sse` server 不会写给 agy
 
 WorkBuddy 按顺序使用第一个已存在的用户文件：`~/.workbuddy/.mcp.json`、`~/.workbuddy/mcp.json`、`~/.codebuddy.json`。`CODEBUDDY_CONFIG_DIR` 会移动最后一个文件。项目使用 `.mcp.json`，仅有 `mcp.json` 时使用后者。开启 `sharing.gitExclude` 后，server 写入 `.codebuddy.json` 的 `projects[<项目路径>].mcpServers`。这些路径基于 CodeBuddy 2.168.0 引擎，尚未认证 WorkBuddy 启动器的主目录绑定。Pull 只从旧项目文件 `.workbuddy/mcp.json` 移除未被修改的 teamai 条目。
 
-主目录或项目中存在 `.workbuddy-ai/` 时（WorkBuddy 5.7+），默认技能路径改为 `.workbuddy-ai/skills`。其他内容仍要等 `.workbuddy/` 存在才写入，所以只有 `.workbuddy-ai/` 的成员收不到规则、团队指令、agent、MCP server 和钩子，`teamai doctor` 会以 `workbuddy receives ...` 失败并列出被搁置的项。
+主目录或项目中存在 `.workbuddy-ai/` 时（WorkBuddy AI，即国际版），默认技能路径改为 `.workbuddy-ai/skills`。其他内容仍要等 `.workbuddy/` 存在才写入，所以只有 `.workbuddy-ai/` 的成员收不到规则、团队指令、agent、MCP server 和钩子，`teamai doctor` 会以 `workbuddy receives ...` 失败并列出被搁置的项。
 
 工具主目录或配置的 MCP 路径改变时，pull 保留旧副本并提示一次。确认没有工具读取后再删除。Doctor 会报告工具不读取的映射、已移动的文件，以及仅在项目根目录启动会话时才读取的项目 MCP。MCP 通道未知的内部版本只显示提示，不猜测配置路径。
 
@@ -390,6 +392,43 @@ profiles:
 ```bash
 teamai models switch tokenhub
 ```
+
+## 把一个文件推送到确切路径
+
+`teamai push --file <本地文件> --path <团队路径>` 把一个文件按字节原样提议到一个团队路径，作为拉取请求。团队 clone 里的其他改动都不会加入，也不会改写或移动它：
+
+```console
+$ teamai push --file /tmp/refresh-race.yaml --path benchmarks/fix-auth/tasks/refresh-race.yaml
+✔ Pull Request created: https://github.com/acme/team/pull/77
+
+$ teamai push --file ./review.md --path scorers/review.md
+✔ Pull Request created: https://github.com/acme/team/pull/78
+
+$ teamai push --file /tmp/refresh-race.yaml --path benchmarks/fix-auth/tasks/refresh-race.yaml   # the same bytes again
+ℹ No changes to push: benchmarks/fix-auth/tasks/refresh-race.yaml already holds these bytes on main.
+
+$ teamai push --file /tmp/refresh-race.yaml --path benchmarks/fix-auth/refresh-race.yaml
+✖ benchmarks/fix-auth/refresh-race.yaml is not a benchmark task path. A task goes in benchmarks/<suite>/tasks/<task>.yaml or benchmarks/<namespace>/<suite>/tasks/<task>.yaml.
+
+$ teamai push --file /tmp/refresh-race.yaml --path benchmarks/missing/tasks/refresh-race.yaml
+✖ benchmarks/missing/suite.yaml does not exist, so benchmarks/missing/tasks/refresh-race.yaml belongs to no suite. Pick a suite the team repo has under benchmarks/.
+
+$ teamai push --file /tmp/refresh-race.yaml --path benchmarks/fix-auth/tasks/refresh-race.yaml --role web
+✖ --path names the destination, so it cannot be combined with --skill, --role, --project, --shared, --all or --carried.
+```
+
+[teamai-session-to-task](benchmarks.md#把会话变成任务) 就是这样提议它起草的任务文件。
+
+| 参数 | 结果 |
+| --- | --- |
+| `--file` 和 `--path` | 从默认分支新建分支，把该文件推送到该路径，不再询问，并像 `push` 一样开拉取请求。团队 clone 的文件、index 和分支保持原样。 |
+| 只给其中一个 | 拒绝：两者必须一起用。 |
+| 同时给 `--skill`、`--role`、`--project`、`--shared`、`--all` 或 `--carried` | 拒绝，如上。 |
+| 同时给 `--branch` | 推送到该分支（不能是默认分支）。该分支已有打开的拉取请求时，会以默认分支加上这个文件重建它，并更新那个拉取请求，而不是新开一个：修改文件后再运行同一条命令即可。重建后只含这个文件，之前推送到该分支的其他文件会离开该拉取请求。远端已有但没有打开的拉取请求的分支会被拒绝，其提交保持不变。 |
+| `--path` 不在 `skills/`、`rules/`、`scorers/`、`benchmarks/` 或 teamai 拉取的其他目录下、含 `..`，或经过团队仓库中的符号链接 | 拒绝。 |
+| `--path` 在 `benchmarks/` 下 | 必须是默认分支上某个套件的任务。 |
+
+单仓库模式下，拉取请求包含 `.teamai/<path>`，你的 checkout 的文件、index 和 `HEAD` 保持原样。
 
 ## 团队包
 

@@ -53,15 +53,15 @@ teamai 为每个工具把每类资源写到哪里，以及工具读取哪里，�
 | Cursor | written; reads ? | `.cursor/rules` v | `.cursor/rules` v | `.cursor/agents` v | `.cursor/hooks.json` s | `.cursor/mcp.json` s |
 | Copilot | `.github/skills` v | `.github/instructions` v | `.github/copilot-instructions.md` v<br>`.github/instructions` v | `.github/agents` s | `.github/hooks/teamai.json` s | `.github/mcp.json` v |
 | JoyCode | written; reads ? | `.joycode/rules` v | — | `.joycode/agents` s<br>indexed by `agent.json` | `.joycode/hooks.json` s | — |
-| Qoder | written; reads ? | `.qoder/rules` v | `.qoder/rules` s | `.qoder/agents` s | `.qoder/settings.json` s cwd only | `.qoder/settings.json` s |
-| Qoder CN | written; reads ? | `.qoder/rules` v | `.qoder/rules` t | `.qoder/agents` t | `.qoder/settings.json` s cwd only | `.qoder/settings.json` t |
+| Qoder | written; reads ? | `.qoder/rules` v | `.qoder/rules` s | `.qoder/agents` s | `.qoder/settings.json` s cwd only<br>`.qoder/settings.local.json` s cwd only | `.qoder/settings.json` s |
+| Qoder CN | written; reads ? | `.qoder/rules` v | `.qoder/rules` t | `.qoder/agents` t | `.qoder/settings.json` s cwd only<br>`.qoder/settings.local.json` t cwd only | `.qoder/settings.json` t |
 | Kiro | written; reads ? | `.kiro/steering` d | `.kiro/steering` d | `.kiro/agents` d | user hooks | `.kiro/settings/mcp.json` d |
 | Trae | written; reads ? | `.trae/rules` t | `.trae/rules` d | `.trae/agents` s cwd only | ? | `.trae/mcp.json` d |
 | Trae CN | written; reads ? | `.trae/rules` t | `.trae/rules` d | `.trae/agents` s cwd only | ? | `.trae/mcp.json` d |
 | ZCode | written; reads ? | session hook s | session hook s | `.zcode/agents` s cwd only | user hooks | `.zcode/config.json` s |
 | Oh My Pi | written; reads ? | `.omp/rules` v cwd only | extension v | `.omp/agents` v | user hooks | `.omp/mcp.json` v cwd only |
 | Pi Coding Agent | `.pi/skills` v cwd only | extension v | extension v | — | user hooks | `.pi/mcp.json` v cwd only |
-| CodeBuddy | written; reads ? | `.codebuddy/rules` s cwd only | `.codebuddy/rules` s cwd only | `.codebuddy/agents` s cwd only | `.codebuddy/settings.json` s cwd only | first of `.mcp.json`, `mcp.json` s cwd only |
+| CodeBuddy | written; reads ? | `.codebuddy/rules` s cwd only | `.codebuddy/rules` s cwd only | `.codebuddy/agents` s cwd only | `.codebuddy/settings.json` s cwd only<br>`.codebuddy/settings.local.json` v cwd only | first of `.mcp.json`, `mcp.json` s cwd only |
 | OpenClaw | written; reads ? | — | — | — | user hooks | — |
 | Hermes | `~/.hermes/skills` s | — | plugin s | — | user hooks | — |
 | DeepSeek Harness | written; reads ? | session hook s | session hook s | — | user hooks | — |
@@ -74,33 +74,33 @@ teamai 为每个工具把每类资源写到哪里，以及工具读取哪里，�
 
 用户范围，取自 #1221 的矩阵；之后合入的修复标为 `t` 并附注。`✓` 可用。`◐` 默认可用，但某个条件会让它失效，而 doctor 仍报告已送达。`✗` 默认配置下不可用。`+` 工具支持，teamai 尚未实现。`—` 工具没有此功能。`?` 未知。标记后的字母是依据，含义同上。
 
-| 工具 | 环境变量 | 工作流（本地驱动） | Recall | 统计 | Token 与费用 | AI 后端 | 投票评审 | 会话评审 | HTTP agent hooks |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Claude Code | ✓t | ✓v | ✓v | ✓v | ✓v | ✓v | ✓v | ✓t<sup>1</sup> | ✓v |
-| Codex CLI | ✓t | ✓t | ✓v | ✓t<sup>2</sup> | ✓v | ✓v | ✓t<sup>3</sup> | ✓t<sup>1</sup> | ✓t<sup>4</sup> |
-| Codex CLI Internal | ? | ✓t | ? | ? | ✓t | ✓t | ? | ? | ? |
-| Claude Code Internal | ? | ✓t | ? | ? | ✓t | ✓t | ? | ? | ? |
-| TClaude | ? | ✓t | ? | ? | ✓t | ✓t | ? | ? | ? |
-| TCodex | ? | ✓t | ? | ? | ✓t | ✓t | ? | ? | ? |
-| Cursor | ? | +s<sup>5</sup> | ✗v<sup>6</sup> | ✓v<sup>7</sup> | +d<sup>8</sup> | ✓d | +s | ✓t<sup>1</sup> | +t<sup>9</sup> |
-| Copilot | ? | +s | ✓v | ✓t<sup>2</sup> | ✓t<sup>10</sup> | ✓d | ? | ✓t<sup>1</sup> | —t |
-| JoyCode | ? | ? | ◐s | ✓t<sup>2</sup> | ✓t | ? | ? | ✓t<sup>1</sup> | ? |
-| Qoder | ? | ? | ◐s | ✓s | ◐t<sup>11</sup> | ✓d | ? | ✓s<sup>12</sup> | ✓s |
-| Qoder CN | ? | ? | ◐s | ✓s | ◐t<sup>11</sup> | ? | ? | ✓s<sup>12</sup> | ✓t<sup>13</sup> |
-| Kiro | ? | ? | ◐d | ? | ? | ✓d | ? | ✓d<sup>14</sup> | ✓d<sup>15</sup> |
-| Trae | ? | ? | ? | ? | ? | ? | ? | ✓s<sup>16</sup> | ? |
-| Trae CN | ? | ? | ? | ? | ? | ? | ? | ✓s<sup>16</sup> | ? |
-| ZCode | ✓t | +s | ✓s | ✓s | ? | +s | ✓t<sup>3</sup> | ✓d<sup>17</sup> | +t<sup>18</sup> |
-| Oh My Pi | ✓s | +s | ✓v | ✓t<sup>2</sup> | ✓t | ✓d | ? | ✓s<sup>19</sup> | ✓s<sup>20</sup> |
-| Pi Coding Agent | ✓s | +v | ✓v | ✓t<sup>2</sup> | ✓t | ✓s | ? | ◐s<sup>21</sup> | ✓s<sup>22</sup> |
-| CodeBuddy | ? | ✓d | ✓s | ✓v | ✓t | ✓d | +v | ✓t<sup>1</sup> | ✓s |
-| OpenClaw | ◐d | +d | ✓s | +s | +s<sup>23</sup> | ✓d | —t | ◐s<sup>24</sup> | ✓s<sup>25</sup> |
-| Hermes | ◐s | +s | ✓v | +s | +s<sup>23</sup> | ✓s | —t | ✓s<sup>26</sup> | ✓s<sup>27</sup> |
-| DeepSeek Harness | ✗s | +s | ✓s | ✓t<sup>2</sup> | +s<sup>28</sup> | +s | ? | ◐s<sup>29</sup> | —t |
-| WorkBuddy | ? | ✓t | ✓t | ? | ✓t | ✓t | ? | ✓t<sup>30</sup> | ? |
-| OpenCode | ? | ✓t | ✓v | ✓t<sup>2</sup> | ✓v | ✓v | ? | ✓t<sup>1</sup> | ✓v<sup>31</sup> |
-| Muse Code | ✓t | +v | ✓t | ✓v | ✓t | ✓v | ✓t<sup>3</sup> | ✓t<sup>1</sup> | ✓t<sup>32</sup> |
-| Antigravity | ✓v<sup>33</sup> | ✓v | ✓v | ✓v | ◐v<sup>34</sup> | ✓v | ✗v<sup>35</sup> | ✓t<sup>36</sup> | ✓t<sup>37</sup> |
+| 工具 | 环境变量 | 工作流（本地驱动） | 无人值守提示 | Recall | 统计 | Token 与费用 | AI 后端 | 投票评审 | 会话评审 | HTTP agent hooks |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Claude Code | ✓t | ✓v | ✓v | ✓v | ✓v | ✓v | ✓v | ✓v | ✓t<sup>1</sup> | ✓v |
+| Codex CLI | ✓t | ✓t | ✓d | ✓v | ✓t<sup>2</sup> | ✓v | ✓v | ✓t<sup>3</sup> | ✓t<sup>1</sup> | ✓t<sup>4</sup> |
+| Codex CLI Internal | ? | ✓t | ✓t | ? | ? | ✓t | ✓t | ? | ? | ? |
+| Claude Code Internal | ? | ✓t | ✓t | ? | ? | ✓t | ✓t | ? | ? | ? |
+| TClaude | ? | ✓t | ✓t | ? | ? | ✓t | ✓t | ? | ? | ? |
+| TCodex | ? | ✓t | ✓t | ? | ? | ✓t | ✓t | ? | ? | ? |
+| Cursor | ? | +s<sup>5</sup> | ? | ✗v<sup>6</sup> | ✓v<sup>7</sup> | +d<sup>8</sup> | ✓d | +s | ✓t<sup>1</sup> | +t<sup>9</sup> |
+| Copilot | ? | +s | ? | ✓v | ✓t<sup>2</sup> | ✓t<sup>10</sup> | ✓d | ? | ✓t<sup>1</sup> | —t |
+| JoyCode | ? | ? | ? | ◐s | ✓t<sup>2</sup> | ✓t | ? | ? | ✓t<sup>1</sup> | ? |
+| Qoder | ? | ? | ? | ◐s | ✓s | ◐t<sup>11</sup> | ✓d | ? | ✓s<sup>12</sup> | ✓s |
+| Qoder CN | ? | ? | ? | ◐s | ✓s | ◐t<sup>11</sup> | ? | ? | ✓s<sup>12</sup> | ✓t<sup>13</sup> |
+| Kiro | ? | ? | ? | ◐d | ? | ? | ✓d | ? | ✓d<sup>14</sup> | ✓d<sup>15</sup> |
+| Trae | ? | ? | ? | ? | ? | ? | ? | ? | ✓s<sup>16</sup> | ? |
+| Trae CN | ? | ? | ? | ? | ? | ? | ? | ? | ✓s<sup>16</sup> | ? |
+| ZCode | ✓t | +s | ? | ✓s | ✓s | ? | +s | ✓t<sup>3</sup> | ✓d<sup>17</sup> | +t<sup>18</sup> |
+| Oh My Pi | ✓s | +s | ? | ✓v | ✓t<sup>2</sup> | ✓t | ✓d | ? | ✓s<sup>19</sup> | ✓s<sup>20</sup> |
+| Pi Coding Agent | ✓s | +v | ? | ✓v | ✓t<sup>2</sup> | ✓t | ✓s | ? | ◐s<sup>21</sup> | ✓s<sup>22</sup> |
+| CodeBuddy | ? | ✓d | ✓d | ✓s | ✓v | ✓t | ✓d | +v | ✓t<sup>1</sup> | ✓s |
+| OpenClaw | ◐d | +d | ? | ✓s | +s | +s<sup>23</sup> | ✓d | —t | ◐s<sup>24</sup> | ✓s<sup>25</sup> |
+| Hermes | ◐s | +s | ? | ✓v | +s | +s<sup>23</sup> | ✓s | —t | ✓s<sup>26</sup> | ✓s<sup>27</sup> |
+| DeepSeek Harness | ✗s | +s | ? | ✓s | ✓t<sup>2</sup> | +s<sup>28</sup> | +s | ? | ◐s<sup>29</sup> | —t |
+| WorkBuddy | ? | ✓t | ✓t | ✓t | ? | ✓t | ✓t | ? | ✓t<sup>30</sup> | ? |
+| OpenCode | ? | ✓t | ✓d | ✓v | ✓t<sup>2</sup> | ✓v | ✓v | ? | ✓t<sup>1</sup> | ✓v<sup>31</sup> |
+| Muse Code | ✓t | +v | ? | ✓t | ✓v | ✓t | ✓v | ✓t<sup>3</sup> | ✓t<sup>1</sup> | ✓t<sup>32</sup> |
+| Antigravity | ✓v<sup>33</sup> | ✓v | ✓d | ✓v | ✓v | ◐v<sup>34</sup> | ✓v | ✗v<sup>35</sup> | ✓t<sup>36</sup> | ✓t<sup>37</sup> |
 
 注：
 

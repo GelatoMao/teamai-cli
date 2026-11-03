@@ -9,7 +9,7 @@ teamai dashboard
 teamai dashboard --port 8080
 ```
 
-浏览器打开 `http://localhost:3721`。侧栏是总览，下面分三组：执行（会话、Token 与费用、工作流运行、评分器）、上下文（知识库、资源、分发）、改进（改进中心）。会话和趋势是这台机器上的；知识库和改进中心读团队仓库。
+浏览器打开 `http://localhost:3721`。侧栏是总览，下面分三组：执行（会话、Token 与费用、工作流运行、评分器、基准测试、分发）、上下文（知识库、资源）、改进（改进中心、自我改进）。会话和趋势是这台机器上的；知识库和改进中心读团队仓库。
 
 ## 改进中心
 
@@ -61,7 +61,7 @@ teamai dashboard --port 8080
 
 在交出运行的那个安装上，下一步改为 `teamai workflow resume <run>`，在那里把它收回。待接手的本机运行，或现在由其他安装持有的本机运行，会在状态下方注明。**运行器需要**（需要人工的运行上为**其机器需要**）列出剩余步骤的 `requires.env` 键和提示词步骤：照[其作业](workflow.md#从-ci-接手交出的运行)那样在运行器上配好。**本机缺少**是本机缺的那部分，与 `teamai workflow resume` 列为 `cannot run here` 的一致。状态栏统计待接手的运行和需要人工的运行。页面本身不认领任何运行：命令在接手运行的机器上启动驱动。
 
-页面显示运行记录会发布的内容，以及每个步骤的实时状态和等待中 HITL 请求的选项。输入、`for_each` 条目、输出、提示词、HITL 消息和本地路径都留在运行文件里。HITL 问题请在运行的驱动提问处阅读。运行详情显示每个 pass 的产出：它分支上的 commit、为它交付的拉取请求，以及 `teamai contribute` 在它的 attempt 中记录的经验。
+页面显示运行记录会发布的内容，以及每个步骤的实时状态和等待中 HITL 请求的选项。输入、`for_each` 条目、输出、提示词、HITL 消息和本地路径都留在运行文件里。HITL 问题请在运行的驱动提问处阅读。运行详情显示每个 pass 的产出：它分支上的 commit、为它交付的拉取请求，以及 `teamai contribute` 在它的 attempt 中记录的经验。每个 pass 标出它的 Harness，例如 `claude · claude-sonnet-5-5 · review 步骤角色 · 3bb7751`。Harness 与同一步骤上一个 pass 不同的 pass 会写明改了什么，例如 `review` 第 2 个 pass 下的 `模型已变: claude-sonnet-5-5 → claude-opus-5-5`。每个 pass 的评分显示标签，不是评审模型判定时还显示判定它的阶段，例如 `delivered: partial  合并请求 CI`。运行的评审次数不计入这些标签。已结束的[基准测试](benchmarks.md)运行的详情显示它的结果、用量和任务 × arm 表格，与 CLI 打印的一致。
 
 等待中的 approve 或 choose 请求可以在运行详情里回答。回答和 CLI 走同一个 `respond` 操作，渠道为 `dashboard`，`agent: false`，因此可以回答必需审批。在 agent 会话中启动的仪表盘记录为 `agent: true`，与从该 shell 回答相同，不能回答必需审批。回答带上页面显示的 pass：如果该请求期间已被回答或替换，页面会显示拒绝原因并刷新。其他网站无法提交回答。不带 `Origin` 请求头的请求（如普通 `curl`）也会被拒绝。这只表明回答来自浏览器，并不能阻止自行设置该请求头的本地脚本。
 
@@ -69,7 +69,7 @@ teamai dashboard --port 8080
 
 评分器页面显示每个有标签的[评分器](scorers.md)的通过率，数据来自 `teamai-reports` 上的 `scores/<member>/<YYYY-MM>.jsonl` 和本机的标签存储。它回答两个问题：评分器的通过率是否在变化，以及它是否因工具、模型、团队修订或定义而不同。
 
-**一次只看一个度量。** 一个度量固定了评分器、评分标准版本（`rubric.sourceHash`，有 `teamRevision` 时一并显示）、来源（`workflow` 或 `session`）、运行模式，以及评审（人工标注，或评审的工具和记录的模型）。其中任何一项不同的标签都不会合并统计。评分器有模型评审时默认打开模型评审的度量，即使成员人工标注的会话更多也是如此；并默认打开标签带有 `teamRevision` 的最新评分标准，因此未提交的草稿不会成为默认视图。其他度量列在数字上方。没有运行模式的标签计入“未记录”。
+**一次只看一个度量。** 一个度量固定了评分器、评分标准版本（`rubric.sourceHash`，有 `teamRevision` 时一并显示）、来源（`workflow` 或 `session`）、运行模式，以及评审（人工标注，或评审的工具和记录的模型）。其中任何一项不同的标签都不会合并统计。例外是在任何评审者运行之前由某个阶段判定的标签（例如 CI 失败）。它记录了评分器的评审工具，但没有模型，因此计入该工具在其评分标准下的度量。评分器有模型评审时默认打开模型评审的度量，即使成员人工标注的会话更多也是如此；并默认打开标签带有 `teamRevision` 的最新评分标准，因此未提交的草稿不会成为默认视图。其他度量列在数字上方。没有运行模式的标签计入“未记录”。
 
 **页面显示：**
 
@@ -77,9 +77,27 @@ teamai dashboard --port 8080
 - 每周趋势。没有标签的一周显示为空缺，而不是 0%。
 - **按值统计的标签**：此度量中保存每个值的标签有多少，以及该值对应的分数，分数高的在前。这些计数加起来等于标签数，因此有两个以上取值的评分器不会丢掉区分各种未通过的信息，也可以从中读出精确率或召回率。值按标签保存的原样显示。
 - 通过与否以每个标签保存的结果为准。修改评分器的 `passingScore` 不会改变过去的结果。
-- **分组依据**：工具、模型、团队修订、智能体定义、团队资产交付时针对的角色、项目或标签、指纹，或工作使用的团队技能。列出两个技能的标签会同时计入两组。模型分组会把工具报告的模型和仅请求的模型分开。没有记录该项的标签记为“未记录”。工作流标签按它评审的那一轮的智能体分组，从运行记录中读取。在记录智能体之前的运行只提供定义。
+- **分组依据**：工具、模型、团队修订、智能体定义、团队资产交付时针对的角色、项目或标签、指纹、工作使用的团队技能，或判定工作流标签的阶段。列出两个技能的标签会同时计入两组。模型分组会把工具报告的模型和仅请求的模型分开。没有记录该项的标签记为“未记录”。标签按它[记录的 `agent`](scorers.md#标签评判的-harness) 分组。轮次以步骤自己的角色运行时，角色为该步骤角色，否则为成员角色。在标签记录 `agent` 之前写入的工作流标签，按它评审的那一轮的智能体分组，从运行记录中读取。在记录智能体之前的运行只提供定义。
 - **按团队提交拆分。** 给出团队仓库的一个提交。标签的团队修订包含该提交时算作“之后”，由本机团队克隆中的 `git merge-base --is-ancestor` 检查。没有团队修订、或修订不在本机克隆中的标签记为“未记录”。拆分也作用于每个分组，因此可以比较加载某个技能的会话在修改该技能的提交前后的表现。
-- **未通过的标签**，最新优先：作者、评分时间、平台和使用的技能。页面每次列出 25 条，最多 1,000 条，点击 **显示更多** 列出后面的标签。选择一个分组即可只列出它的未通过标签。已推送到团队归档的会话显示 `teamai session resume <name> --platform <platform>`。工作流标签可以打开它的运行。
+- **未通过的标签**，最新优先：作者、评分时间、它评判的 Harness（工具、模型、effort、角色和团队修订短哈希，或`未记录 Harness`）、平台、使用的技能、**回归**（指向这个失败的回归任务，或能否从它开始一个任务）和**经验**（指向这个会话的 learnings）；工作流度量还显示判定每个标签的阶段。页面每次列出 25 条，最多 1,000 条，点击 **显示更多** 列出后面的标签。选择一个分组即可只列出它的未通过标签。已推送到团队归档的会话显示 `teamai session resume <name> --platform <platform>`。工作流标签可以打开它的运行。
+- **按 Harness 汇总的失败**，选中一个分组时显示：按 Harness 统计它的未通过标签，最多的在前，用来判断失败是否来自同一个 Harness。按工具分组并选中 `claude` 时，两个未通过标签显示为 `1 个未通过 claude · claude-sonnet-5-5 · spec 步骤角色 · 3bb7751` 和 `1 个未通过 claude · claude-sonnet-5-5 · frontend 成员角色 · 3bb7751`。点击团队修订短哈希即可按该提交拆分。
+- **首次失败于**，选中一个分组且它的标签明显由通过转为失败时显示：`首次失败于团队修订 bbbbbbb · 最后通过于 aaaaaaa`。只有按评分时间排序后，该分组的标签先全部通过、之后全部失败，且失败标签的团队修订都没有出现在通过标签中时才显示。点击该修订即可在那里拆分。
+- 按角色分组时，有基准测试 arm 以该角色运行的角色会链接到这些 arm：`review 步骤 · 基准测试 arm: review-sql · review ↗` 会打开基准测试页面上 `review-sql` 的 Arm 视图，并标出 `review`。列出的 arm 来自基准测试页面当前的时间窗口。
+- **这些标签由什么判定**（标签记录了判定阶段的工作流度量）。[交付的合并请求](scorers.md#为交付的工作评分)由第一个未通过的阶段判定，评审模型只读取每个阶段都通过的工作：
+
+  ```text
+  这些标签由什么判定
+  评审前已判定     38%   15 / 40 个标签 · 未调用评审模型
+  评审模型通过率   72%   25 个标签交给了评审模型
+
+  判定来源       标签数  通过  未通过  占比
+  评审模型       25      18    7       63%
+  合并请求 CI    9       0     9       23%
+  评分器检查     4       0     4       10%
+  受保护路径     2       0     2       5%
+  ```
+
+  此例中有 9 个合并请求在评审前就没通过 CI。问题出在工作本身或产生它的提示词，而不在评分标准。选择一行即可按该阶段分组并列出它的未通过标签。在 teamai 记录判定阶段之前评分的标签记为“未记录”。
 - **摩擦提醒**（会话度量）：摩擦提醒触发过和未触发的会话，其中有多少有此度量的标签，以及其中多少通过。它只统计此时间窗口内（最多最近 30 天）在本机开始的你自己的会话，因为提醒状态只保存在本机。项目工作区统计它自己的会话。用户范围工作区统计本机上在所有项目工作区之外开始的会话。通过率只计算已标注的会话。本机没有提醒状态的会话记为“未记录”。会话的状态文件在最后一次写入一天后被删除时，teamai 会把它的提醒是否触发保留 30 天。
 
 **评审者与人工标注的一致性**（会话度量）。[人工标注](scorers.md#手动标注会话)是成员自己对会话的判断。这个面板说明评审者的通过率是否可信：
@@ -107,6 +125,93 @@ partial 未通过     alice   good 通过  codex / gpt-5.1-codex            10/2
 基准测试运行的标签不计入。页面只读取标签和记录的配置，从不读取或显示评审的推理、提示词、对话记录、diff 或会话自身的 id。
 
 来自会话和工作流运行的标签反映的是工具在实际遇到的工作上的表现。要在相同任务上比较工具、模型或团队资产，请运行基准测试。
+
+## 自我改进（Self-improvement）
+
+自我改进页面跟踪 [`teamai self-improvement run`](self-improvement.md)：从评分器的未通过标签，到修复它们的修改、修改在回归套件上的证明，再到合并后的通过率。它读团队仓库的克隆、`teamai-reports` 和 origin 上的 `teamai/self-improvement/*` 分支，不运行任何东西。
+
+```text
+Runs in CI · Last run 11/2/2026 07:29 · succeeded
+
+10 Failing labels › 3 Regression tasks › 1 Proposed › 2 Proven › 2 Landed › 2 Better after
+
+Landed 2                 Pull requests merged 2 / 3 · 67%     Failures with a regression task 3 / 10   Ready to run 1 / 2
+Pass rate after them     1 closed without merging · 1 open    4 can become a task                      scorers with enough failures
++14 pts on average
+
+Changes  All 4 | Proposed 1 | Landed 2 | Closed 1
+CHANGE                                             SCORER          ASSETS                           PROOF ON THE REGRESSION SUITE   PASS RATE BEFORE → AFTER   WHEN                       OPEN
+Proposed  [teamai] Add skills/code-review/SKILL.md review-quality  prompts/review skills/code-review claude 3/5 → 5/5 +40 pts        Measured once it lands     11/2/2026 · Opened         Pull request
+          and 3 more files · 2 regression tasks                                                     codex  2/5 → 4/5 +40 pts
+Landed    Reviewer agent: read tests before the code   review-quality  agents/reviewer                  claude 2/3 → 3/3 +33 pts        53% → 62% +8 pts           10/24/2026                 a16e6e2
+          (#44) · 1 regression task                                    rules/review-checklist
+Closed    Review skill: ask for tests first            review-quality  —                                —                               Never landed               10/16/2026 · Closed        Pull request
+                                                                                                                                                                without merging
+Landed    Review skill: check every early return       review-quality  skills/code-review               Not run yet                     44% → 63% +19 pts          10/12/2026                 415b103
+          (#41) · 2 regression tasks
+```
+
+| 部分 | 来源 |
+| --- | --- |
+| 已提议（Proposed） | origin 上默认分支还没包含的 `teamai/self-improvement/<scorer>` 分支。托管平台有回应时，**Open** 链接到它的 pull request，否则显示分支名。**When** 是 pull request 打开的时间，或分支最后一次提交的时间。 |
+| 已合并（Landed） | 最近 180 天默认分支上的一个提交，它新增的回归任务来源于一个未通过的标签。 |
+| 已关闭（Closed） | 来自 `teamai/self-improvement/<scorer>` 分支、被托管平台未合并就关闭的 pull request：团队拒绝的修改。 |
+| 已合并的 PR（Pull requests merged） | 所有评分器分支上已结束的请求中，托管平台合并了多少。本机能登录 GitHub、GitLab、TGit 和 GitCode 时它们会回答。其他托管平台或没有回应的平台改为显示**打开的提议（Open proposals）**。 |
+| 资产（Assets） | 修改新增或改动的文件，按顶层目录和名字显示。回归任务只计数，不列出。 |
+| 证明（Proof） | `pulled` 臂运行了这个修改及其回归任务的最新一次基准测试：每个工具先在 `main` 上、再在修改上的通过率。以 squash 或 rebase 方式合并的 PR 保留托管平台所合并 head 的那次运行，GitHub 和 GitLab 会给出这个 head。点下面的日期打开这次运行。 |
+| 前 → 后通过率 | 评分器的默认度量在修改的提交处拆分，和评分器页面的**按团队提交拆分**一样，统计 180 天。 |
+
+**参与循环的评分器**显示最近 30 天有标签的每个评分器，现在运行一次会从哪些失败开始：
+
+```text
+SCORER          PASS RATE, 30 DAYS  FAILURES                                      NEXT RUN                                                                      CHANGES
+review-quality  61% · 23 labels     3 can become a task · 3 covered               teamai self-improvement run review-quality --tools default=claude --sandbox  1 open · 2 merged · 1 closed
+                                    Not usable: 1 uncommitted changes ·
+                                    1 start not recorded · 1 commit not in this checkout
+test-quality    80% · 5 labels      1 can become a task · 0 covered               Waiting for a second failure a task can start from                            0 open · 0 merged · 0 closed
+```
+
+对 `digest --json --scorer` 输出的内容，工作流 `improve` 步骤的 `if` 成立时，评分器就可以运行：默认是两个能开始任务的失败，或者 origin 上已有提案时再有一个。**设置**检查其余部分：生效的工作流（默认的，或团队的 `workflows/teamai-self-improvement.yaml`）、`.github/workflows/` 或 `.gitlab-ci.yml` 里运行 `teamai self-improvement run` 的定时任务和运行 `teamai benchmark run` 的 pull request 任务，以及回归套件和它的任务。**最近运行**列出这个工作流最近十次运行。点击评分器会在评分器页面打开它。
+
+## 基准测试（Benchmarks）
+
+基准测试页面显示所选工作区每一次已结束的[基准测试](benchmarks.md)运行：本机上的运行，以及 `teamai-reports` 上的运行记录，时间窗口为 30、90 或 365 天。在 **套件** 中选择一个套件。下面每个问题都指出回答它的面板，以及该面板在一个团队里显示的内容：这个团队每周运行 `fix-auth`，并用三个 Claude 模型运行 `migrate-db`：
+
+| 问题 | 面板 | 显示的内容 |
+|---|---|---|
+| 团队的 auth 修复要不要改用 claude？ | **领先的 arm** | `claude 67% · 95% 57%–75% · 未能区分于 codex`。codex 是 56%（47%–65%）。两个区间重叠，所以这 7 次运行区分不了两者。改用之前先增加重复次数或任务。 |
+| 我们 10 月 7 日合入的 auth 技能有用吗？ | **每次运行的通过率** | 一条点线 `团队资产已改动 · 62432de` 标出第一次带这个技能的运行。比较每个 arm 在线两侧的点。**运行** 表把这次运行的团队修订标为 `已改动`。 |
+| `migrate-db` 上哪个模型值得花钱？ | **通过率与成本**，选 **成本** | sonnet 以每个 trial 0.31 USD 通过 73%，opus 以 0.89 USD 通过 78%，两者区间重叠。虚线连接通过率和成本都无人胜过的 arm：haiku、sonnet、opus。 |
+| 哪个任务需要修，是代码还是套件？ | **任务 × arm** | `refresh-race` 的 **不稳定的运行** 是 7/7：每次运行中都有 arm 对它既通过又失败，所以单个 trial 说明不了什么。`session-fixation` 在每个 arm 上都是 0% 到 19%：先读它的检查，再怪工具。 |
+| 9 月 23 日那次运行为什么降到 27%？ | **每次运行的任务** 和 **运行** | `login-copy` 在那次运行一列中是斜线格，**运行** 在它的通过率下显示 `1 未测量`：那次这个任务的检查不改代码就通过了，所以它的[基线](benchmarks.md#基线)无效，它的 trial 计为计划但未通过。**任务 × arm** 把它标为 `未测量 1/7`。从 **运行** 打开这次运行，查看它的 trial。 |
+
+**最近一次运行** 显示最新一次运行中每个 arm 按结果统计的 trial，以及用量、偏差和它没有测量的任务。**打开这次运行** 会在工作流运行页面打开它的详情。
+
+以上面板属于 **Arm** 标签页。另外两个标签页回答 arm 之间、以及团队修订之间变了什么。下面是 `onboarding-docs`（claude 和 codex 分别带 pull 到的团队资产和不带资产的 [matrix](benchmarks.md#用-matrix-交叉工具和团队资产)），以及前面的 `fix-auth`：
+
+| 问题 | 标签页和面板 | 显示了什么 |
+|---|---|---|
+| 团队资产对 onboarding 文档帮助有多大？ | **对比**，按 **团队资产** | claude 上 `无团队资产 → 已拉取的团队版本 +41 pp · 95% +16 pp 至 +59 pp`，共 27 个配对 trial，每个通过 trial 的成本 `−60%`。 |
+| 对 codex 帮助一样大吗？ | **每对 arm 的差异** | codex 提升 +15 pp，但区间跨过零：这些运行区分不了它的两个 arm。 |
+| 资产修好了哪个任务？ | **每个任务** | `oncall-runbook` 带资产后从 1/9 到 7/9；`first-pr-guide` 几乎没变。 |
+| auth-tokens skill 对 `fix-auth` 上的 claude 有帮助吗？ | **团队变更**，选 `claude · claude-opus-5-5` | 按提交顺序的三个团队版本上是 67%、62%、70%，没有一个与前一个可区分。点击 `67ee2ce · Add the auth-tokens skill and a security reviewer`：它改了三个文件，`session-fixation` 从 1/12 到 3/12。 |
+| 工具更新影响数字了吗？ | **Arm**，**每次运行的通过率** | 一条虚线 `工具已更新 · claude 2.4.0` 标出新版本上的第一次运行。 |
+
+**对比** 列出套件当前版本中只在团队资产、工具、模型、工作流或角色上不同的每两个 arm，并按运行、任务和重复次数配对它们的 trial。**团队变更** 跟踪同一工具、模型和工作流在它用 pull 到的资产或某个 ref 运行过的各团队版本上的表现，用本机的团队仓库克隆为每个版本命名，并列出它相对前一个版本改动的 `benchmarks/` 之外的文件。
+
+数字的计算方式：
+
+- 通过率是通过的 trial 数除以计划的 trial 数，与运行自己的表一致。
+- 合并统计的数字、任务表和领先者只统计套件当前版本的运行：即最新一次运行的套件文件。**每次运行的通过率** 也会画出更早的运行，位于一条 `套件已改动` 虚线之后。
+- 一个 arm 由它的名称、工具、模型、effort、团队资产、工作流和角色确定。带角色的 arm 在名字下方显示角色，例如 `review 角色`。其中一项改变时，更早的运行是另一条线，标为 `较早的配置`。
+- 带角色的 arm 还会显示该角色在生产中的通过率：角色相同的评分器标签，按评分器页面当前的时间窗口和度量统计，附带 95% 区间，并像按角色分组一样标明该角色是作为工作流步骤自己的角色（`步骤`）、成员的角色（`成员`）还是`两者`运行。`review` 为 2/2 时，旁边显示 `生产中: 100% 1/1 · 95% 21%–100% · 无法区分 · 步骤 · review-quality · 30 天 评分器 ↗`。显示`无法区分`、通过率不加粗时，表示该区间与 arm 的区间重叠：这些标签无法区分生产与基准测试。点击 **评分器 ↗** 会打开按角色分组、选中 `review` 的评分器页面。没有标签的角色显示 `该角色没有标签`。
+- **各 arm 的通过率** 还会按每次运行自己的表的算法，统计这些运行中该 arm 的偏差和未验证的 trial。偏差是指 prompt 运行时用的工具、模型、团队修订或角色与它的 arm 不同的 trial。
+- 区间是 95% Wilson score 区间。两个 arm 的区间重叠时，这些运行区分不了它们。
+- **对比** 中的差异基于配对 trial，区间是配对比例的 95% 区间（Newcombe）。区间跨过零时标为 `无法区分`。
+- 用量是工具报告了用量的 trial 的中位数。成本按每个 trial 计。
+- 本机上的运行若也已发布，只显示一次，取本机的副本。
+
+页面只显示运行记录发布的内容，从不显示 prompt、diff 或对话记录。
 
 ## 资源（Resources）
 

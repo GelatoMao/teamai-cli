@@ -3,9 +3,10 @@ import { AgentObservationSchema, UsedSchema } from '../agent-observation.js';
 import { DriverSchema } from '../driver-identity.js';
 import { RunModeSchema } from '../launch-context.js';
 import { WorkOutcomeSchema } from '../outcomes.js';
+import { JudgeUsageSchema } from '../scorers/label.js';
 import type { TokenUsage } from '../tool-launch/stdout.js';
 import { PrUrlSchema } from './pr-url.js';
-import { UnenforcedSchema } from './requirements.js';
+import { LimitSchema, TurnLimitsSchema, UnenforcedSchema } from './requirements.js';
 import type { RunState, StepLease, WorkflowFailure } from './types.js';
 import type { WorkspaceMode } from './workspace.js';
 
@@ -20,10 +21,12 @@ const TokenUsageSchema: z.ZodType<TokenUsage> = z.object({
  * does not count. A workflow step records it each time it starts; the run, when a retry reopens it.
  */
 export const LimitsFromSchema = z.object({ at: z.string(), tokens: z.number() });
+
 export type LimitsFrom = z.infer<typeof LimitsFromSchema>;
 
 /** The tokens a released attempt spent, which a budget still counts once its step has nothing of the attempt. */
 export const ReleasedTokensSchema = z.object({ step: z.string(), attempt: z.string(), tokens: TokenUsageSchema });
+
 export type ReleasedTokens = z.infer<typeof ReleasedTokensSchema>;
 
 /**
@@ -31,6 +34,7 @@ export type ReleasedTokens = z.infer<typeof ReleasedTokensSchema>;
  * the driver that held the lease, and when the engine stopped it, so a budget that started counting later does not pay.
  */
 export const StoppedAttemptSchema = z.object({ attempt: z.string(), step: z.string(), driver: DriverSchema, stoppedAt: z.string() });
+
 export type StoppedAttempt = z.infer<typeof StoppedAttemptSchema>;
 
 export const FailureSchema: z.ZodType<WorkflowFailure> = z.object({ code: z.string(), message: z.string() });
@@ -39,13 +43,15 @@ const SessionRefSchema = z.object({ tool: z.string().min(1), id: z.string().min(
 
 /** One entry of `RunState.sessionContinuations`: the session a step resumed, and the session it continued it in. */
 export const SessionContinuationSchema = z.object({ from: SessionRefSchema, to: SessionRefSchema });
+
 export type SessionContinuation = z.infer<typeof SessionContinuationSchema>;
 
 const LeaseSessionSchema = SessionRefSchema.extend({ earlier: z.array(SessionRefSchema).optional() });
 
 const LeaseSchema: z.ZodType<StepLease> = z.object({
   attempt: z.string(), revision: z.number(), driver: DriverSchema, session: LeaseSessionSchema.optional(),
-  unenforced: z.array(UnenforcedSchema).optional(), expiresAt: z.string().optional(), runMode: RunModeSchema.optional(),
+  unenforced: z.array(UnenforcedSchema).optional(), expiresAt: z.string().optional(), leasedAt: z.string().optional(), runMode: RunModeSchema.optional(),
+  limits: TurnLimitsSchema.optional(),
 });
 
 export const ChangesSchema = z.object({
@@ -62,6 +68,7 @@ export const ReadSchema = z.object({
   base: z.string().min(1),
   commit: z.string().min(1),
 });
+
 export type StepRead = z.infer<typeof ReadSchema>;
 
 /** What a driver reports about the attempt that settled a step. */
@@ -72,6 +79,10 @@ const report = {
   model: z.string().optional(),
   session: z.string().optional(),
   tokens: TokenUsageSchema.optional(),
+  /** Milliseconds around the tool launch only, as the driver measured it. */
+  durationMs: z.number().int().nonnegative().optional(),
+  /** What the tool stated the attempt cost, in its own unit. */
+  cost: JudgeUsageSchema.shape.cost,
   changes: ChangesSchema.optional(),
   read: ReadSchema.optional(),
   /**
@@ -89,9 +100,12 @@ const report = {
   runMode: RunModeSchema.optional(),
   /** What the attempt's own commands appended to its outcome file, such as a learning `contribute` recorded (#1387). */
   outcomes: z.array(WorkOutcomeSchema).optional().catch(undefined),
+  /** The limit that ended the prompt's turn under `on_limit: end_turn`. */
+  limit: LimitSchema.optional(),
 };
 
 export const OutcomeSchema = z.enum(['success', 'failed', 'timeout', 'skipped', 'cancelled']);
+
 /** The outcome an expression reads of a settled step. */
 export type VisibleOutcome = z.infer<typeof OutcomeSchema>;
 
@@ -101,6 +115,7 @@ const ResultsSchema = z.array(z.object({
   outputs: z.unknown().optional(),
   branch: z.string().optional(),
 }));
+
 export type ItemResult = z.infer<typeof ResultsSchema>[number];
 
 const AnswerSchema = z.object({
@@ -112,6 +127,7 @@ const AnswerSchema = z.object({
   /** Identity of the UI that carried the person's answer, kept locally. */
   driver: DriverSchema.optional(),
 });
+
 /** The answer and provenance retained for one pass of a step with HITL. */
 export type HitlAnswer = z.infer<typeof AnswerSchema>;
 
@@ -120,6 +136,7 @@ export type HitlAnswer = z.infer<typeof AnswerSchema>;
  * origin, and a URL its driver reported and the engine kept. The target is not kept; it follows from the run.
  */
 const DeliverySchema = z.object({ branch: z.string().min(1), head: z.string().min(1), reported: PrUrlSchema.optional() });
+
 export type Delivery = z.infer<typeof DeliverySchema>;
 
 /** One earlier pass of a step instance that a loop ran again. */
@@ -137,6 +154,7 @@ export const StepPassSchema = z.object({
   /** The answer retained with this archived pass. */
   answer: AnswerSchema.optional(),
 });
+
 export type StepPass = z.infer<typeof StepPassSchema>;
 
 /** A pass of a child or item instance that a loop removed from the run; `step` is its full path. */
@@ -145,6 +163,7 @@ export const ArchivedPassSchema = StepPassSchema.extend({
   /** The step whose new pass archived this one, and that step's pass when it did. */
   within: z.object({ step: z.string(), pass: z.number().int() }).optional(),
 });
+
 export type ArchivedPass = z.infer<typeof ArchivedPassSchema>;
 
 /**
@@ -163,6 +182,7 @@ const StepBaseSchema = z.object({
   iteration: z.number().int().optional(),
   round: z.number().int().optional(),
 });
+
 type StepBase = z.infer<typeof StepBaseSchema>;
 
 /**
@@ -188,24 +208,35 @@ const settledFields = {
  */
 const PendingSchema = StepBaseSchema.extend({ status: z.literal('pending') });
 const WaitingSchema = StepBaseSchema.extend({ status: z.literal('waiting') });
+
 /**
  * `expiresAt`: when the step's `timeout`, or that of the workflow file it runs, ends it. `limitsFrom`: where the budget of
  * the workflow it runs counts from. Both are set when it starts.
  */
-const RunningSchema = StepBaseSchema.extend({ status: z.literal('running'), expiresAt: z.string().optional(), limitsFrom: LimitsFromSchema.optional() });
+const RunningSchema = StepBaseSchema.extend({
+  status: z.literal('running'), expiresAt: z.string().optional(), limitsFrom: LimitsFromSchema.optional(),
+  /** Under `on_limit: end_turn`: a prompt inside reached a limit its allowance set, so the allowance is spent. */
+  allowanceSpent: z.literal(true).optional(),
+});
+
 /** `delivering`: the agent succeeded and its work is on its branch; dependents wait until that branch has its pull request. */
 const DeliveringSchema = StepBaseSchema.extend({ status: z.literal('delivering'), ...settledFields, delivery: DeliverySchema });
+
 const SucceededSchema = StepBaseSchema.extend({
   status: z.literal('succeeded'), outcome: z.literal('success').default('success'), ...settledFields, loopFinal: z.boolean().optional(),
 });
+
 const FailedSchema = StepBaseSchema.extend({
   status: z.literal('failed'), outcome: z.literal('failed').default('failed'), ...settledFields, failure: FailureSchema.optional(),
 });
+
 const SkippedSchema = StepBaseSchema.extend({ status: z.literal('skipped'), settledAt: z.number().int().default(0) });
+
 /** A step cancelled while it delivered keeps what its agent settled, as `delivering` holds it. */
 const CancelledSchema = StepBaseSchema.extend({ status: z.literal('cancelled'), ...settledFields, failure: FailureSchema });
 
 const LeasedSchema = StepBaseSchema.extend({ status: z.literal('leased'), attempt: z.string(), lease: LeaseSchema });
+
 /**
  * A step as a run handed to another machine carries it. A leased step keeps its attempt and the kind of driver that
  * holds it, not that driver's machine or workspace, which mean nothing on the machine that takes the run.
@@ -213,34 +244,48 @@ const LeasedSchema = StepBaseSchema.extend({ status: z.literal('leased'), attemp
 const HandedLeaseSchema = StepBaseSchema.extend({
   status: z.literal('leased'), attempt: z.string(), lease: z.object({ attempt: z.string(), revision: z.number(), driverKind: z.string() }),
 });
+
 /** Every status but `leased` is the same locally and in a snapshot, so a status added here reaches both unions. */
 const SHARED_VARIANTS = [PendingSchema, WaitingSchema, RunningSchema, DeliveringSchema, SucceededSchema, FailedSchema, SkippedSchema, CancelledSchema] as const;
 
 export const StepStateSchema = z.discriminatedUnion('status', [LeasedSchema, ...SHARED_VARIANTS]);
+
 type ReadonlyId<T> = T extends unknown ? Omit<T, 'id'> & { readonly id: string } : never;
+
 /** A step instance's `id` is read-only: the engine indexes instances by it, and every transition keeps it. */
 export type StepState = ReadonlyId<z.infer<typeof StepStateSchema>>;
 
 export const StepCheckpointSchema = z.discriminatedUnion('status', [HandedLeaseSchema, ...SHARED_VARIANTS]);
+
 export type StepCheckpoint = ReadonlyId<z.infer<typeof StepCheckpointSchema>>;
+
 /** A lease another machine held when the run was handed over. */
 export type HandedLease = Extract<StepCheckpoint, { status: 'leased' }>;
+
 type StepStatus = StepState['status'];
 
 type StepIn<S extends StepStatus> = Extract<StepState, { status: S }>;
+
 type PendingStep = StepIn<'pending'>;
+
 export type LeasedStep = StepIn<'leased'>;
+
 type RunningStep = StepIn<'running'>;
+
 export type DeliveringStep = StepIn<'delivering'>;
+
 type SucceededStep = StepIn<'succeeded'>;
+
 type FailedStep = StepIn<'failed'>;
+
 type SkippedStep = StepIn<'skipped'>;
+
 type CancelledStep = StepIn<'cancelled'>;
 
 type Settlement<T extends StepState> = Omit<T, keyof StepBase | 'status' | 'outcome'>;
 
-const BASE_KEYS = Object.keys(StepBaseSchema.shape) as Array<keyof StepBase>;
-const SETTLED_KEYS = Object.keys(settledFields) as Array<keyof typeof settledFields>;
+const BASE_KEYS = StepBaseSchema.keyof().options;
+const SETTLED_KEYS = z.object(settledFields).keyof().options;
 const VISIBLE_OUTCOMES = { succeeded: 'success', failed: 'failed', skipped: 'skipped', cancelled: 'cancelled' } as const;
 
 /** The outcome expressions and records read of a settled step: a failure with code `timeout` reads as `timeout`. */
@@ -253,9 +298,13 @@ export function visibleOutcome(step: Extract<StepState, { status: keyof typeof V
  * In place, because `run.steps` holds the instance and the engine finds positions in it by identity.
  */
 function become<T extends StepState>(state: StepState | HandedLease, next: Omit<T, keyof StepBase>): T {
-  const fields = state as Record<string, unknown>;
+  // oxlint-disable-next-line teamai/no-unsafe-dictionary-type -- rewrites the step's own keys in place, whatever its variant
+  const fields: Record<string, unknown> = state;
   const kept = Object.fromEntries(BASE_KEYS.filter((key) => fields[key] !== undefined).map((key) => [key, fields[key]]));
+
   for (const key of Object.keys(fields)) delete fields[key];
+
+  // SAFETY: every key was deleted above, so the object holds only the base fields it had and the fields of `next`, which together are a T
   return Object.assign(fields, kept, next) as T;
 }
 
@@ -310,6 +359,7 @@ export function takeOver(step: StepCheckpoint, mode: WorkspaceMode | undefined):
       return step;
     default: {
       const unknown: never = step;
+
       return unknown;
     }
   }
@@ -323,9 +373,11 @@ export function lease(state: StepState, held: StepLease): LeasedStep {
  * A workflow step starts; `inputs` are the values its `with` passed, when that workflow declares inputs, and `limits`
  * when its timeout ends it and where its workflow's budget counts from.
  */
-export function start(state: StepState, inputs?: Record<string, unknown>, limits: Pick<RunningStep, 'expiresAt' | 'limitsFrom'> = {}): RunningStep {
+export function start(state: StepState, inputs?: RunningStep['inputs'], limits: Pick<RunningStep, 'expiresAt' | 'limitsFrom'> = {}): RunningStep {
   const running = become<RunningStep>(state, { status: 'running', ...limits });
+
   if (inputs) running.inputs = inputs;
+
   return running;
 }
 
@@ -341,22 +393,26 @@ export function startDelivery(state: StepState, settlement: Settlement<Succeeded
 /** A delivered step settles as its agent left it, at the revision the agent's report settled it. */
 export function delivered(state: DeliveringStep): SucceededStep {
   const { id: _id, status: _status, ...settlement } = state;
+
   return succeed(state, settlement);
 }
 
 /** The failure codes only delivery gives a step, always after its agent succeeded. */
 const DELIVERY_FAILURE_CODES = ['delivery_failed', 'protected_path'] as const;
+
 export type DeliveryFailure = { code: (typeof DELIVERY_FAILURE_CODES)[number]; message: string };
 
 /** A delivery that failed stops the step, keeping what its agent did and the branch a retry delivers again. */
 export function deliveryFailed(state: DeliveringStep, failure: DeliveryFailure): FailedStep {
   const { id: _id, status: _status, ...settlement } = state;
+
   return fail(state, { ...settlement, message: failure.message, failure });
 }
 
 /** A failed delivery is retried in the same pass and attempt: the agent does not run again. */
 export function redeliver(state: FailedStep, delivery: Delivery): DeliveringStep {
   const { id: _id, status: _status, outcome: _outcome, failure: _failure, message: _message, ...settlement } = state;
+
   return startDelivery(state, settlement, delivery);
 }
 
@@ -368,7 +424,14 @@ export function fail(state: StepState, settlement: Settlement<FailedStep>): Fail
 function stoppedLease(state: StepState): Pick<StepLease, 'unenforced' | 'runMode'> & { attempt?: string } {
   if (state.status !== 'leased') return {};
   const { unenforced, runMode } = state.lease;
-  return { attempt: state.attempt, ...(unenforced ? { unenforced } : {}), ...(runMode ? { runMode } : {}) };
+
+  const left: ReturnType<typeof stoppedLease> = { attempt: state.attempt };
+
+  if (unenforced) left.unenforced = unenforced;
+
+  if (runMode) left.runMode = runMode;
+
+  return left;
 }
 
 /**
@@ -393,8 +456,10 @@ export function timeOut(state: LeasedStep | RunningStep, failure: WorkflowFailur
 export function cancel(state: StepIn<'pending' | 'waiting' | 'leased' | 'running' | 'delivering'>, failure: WorkflowFailure, settledAt: number): CancelledStep {
   if (state.status === 'delivering') {
     const { id: _id, status: _status, ...settlement } = state;
+
     return become<CancelledStep>(state, { ...settlement, status: 'cancelled', failure });
   }
+
   return become<CancelledStep>(state, { status: 'cancelled', settledAt, ...stoppedLease(state), failure });
 }
 
@@ -402,6 +467,7 @@ export function cancel(state: StepIn<'pending' | 'waiting' | 'leased' | 'running
 export function passOf(state: StepState): StepPass | undefined {
   if (!settled(state)) return undefined;
   const outcome = visibleOutcome(state);
+
   return StepPassSchema.parse({ ...state, pass: state.pass ?? 1, outcome });
 }
 
@@ -416,6 +482,7 @@ export function agentPassOf(state: StepState): StepPass | undefined {
 /** Whether the agent of `pass` succeeded: it did, or only the delivery of what it wrote failed or was cancelled. */
 export function agentSucceeded(pass: StepPass): boolean {
   const code: string | undefined = pass.failure?.code;
+
   return pass.outcome === 'success'
     || (pass.outcome === 'failed' && DELIVERY_FAILURE_CODES.some((delivery) => delivery === code))
     || (pass.outcome === 'cancelled' && pass.delivery !== undefined);
@@ -433,6 +500,7 @@ export function repend(state: StepState, iteration?: number): PendingStep {
   delete pending.inputs;
   delete pending.round;
   delete pending.answer;
+
   return Object.assign(pending, { pass, passes }, iteration !== undefined ? { iteration } : {});
 }
 
@@ -452,10 +520,13 @@ export function endLoop(owner: SucceededStep, iteration: number): SucceededStep 
  */
 export function exhaust(state: SucceededStep | PendingStep, failure: WorkflowFailure, settledAt: number, iteration?: number): FailedStep {
   const latest = state.status === 'succeeded' ? state : state.passes?.at(-1);
+
   const ran = state.status === 'succeeded'
     ? Object.fromEntries(SETTLED_KEYS.filter((key) => state[key] !== undefined).map((key) => [key, state[key]]))
     : latest?.outputs !== undefined ? { outputs: latest.outputs } : {};
+
   const failed = fail(state, { ...ran, settledAt, message: failure.message, failure });
+
   return iteration === undefined ? failed : Object.assign(failed, { iteration });
 }
 
@@ -475,6 +546,7 @@ export function stopped(step: StepState): boolean {
       return false;
     default: {
       const unknown: never = step;
+
       return unknown;
     }
   }
@@ -496,6 +568,7 @@ export function inProgress(step: StepState): boolean {
       return false;
     default: {
       const unknown: never = step;
+
       return unknown;
     }
   }
@@ -517,6 +590,7 @@ export function cancellable(step: StepState): step is StepIn<'pending' | 'waitin
       return false;
     default: {
       const unknown: never = step;
+
       return unknown;
     }
   }
@@ -525,6 +599,7 @@ export function cancellable(step: StepState): step is StepIn<'pending' | 'waitin
 /** A step that will not run again in this pass, so steps that need or read it can go on. */
 export function settled(step: StepState | undefined): step is Extract<StepState, { status: 'succeeded' | 'failed' | 'skipped' | 'cancelled' }> {
   if (!step) return false;
+
   switch (step.status) {
     case 'succeeded':
     case 'failed':
@@ -539,6 +614,7 @@ export function settled(step: StepState | undefined): step is Extract<StepState,
       return false;
     default: {
       const unknown: never = step;
+
       return unknown;
     }
   }
@@ -547,17 +623,23 @@ export function settled(step: StepState | undefined): step is Extract<StepState,
 /**
  * Stops every open step whose path `under` matches, in sub-workflows too: a leased step is cancelled and its attempt
  * stopped at `now` (`stopAttempt`), a running workflow step is cancelled, and a pending or waiting step is skipped. Used
- * by an end or break, cancel and retry, each with its own failure. Returns the ids this walk changed.
+ * by an end or break, cancel and retry, each with its own failure. While the run's `finally` steps run, only a cancel or
+ * the deadline stops them, and one not started yet is cancelled too: it was ended, not passed over. Returns the ids this
+ * walk changed.
  */
 export function stopWhere(run: RunState, under: (id: string) => boolean, failure: WorkflowFailure, settledAt: number, now: string): string[] {
   const changed: string[] = [];
+
   for (const state of run.steps) {
     if (!under(state.id)) continue;
+
     if (!settled(state)) changed.push(state.id);
+
     switch (state.status) {
       case 'pending':
       case 'waiting':
-        skip(state, settledAt);
+        if (run.finalizing) cancel(state, failure, settledAt);
+        else skip(state, settledAt);
         break;
       case 'running':
       case 'delivering':
@@ -574,9 +656,11 @@ export function stopWhere(run: RunState, under: (id: string) => boolean, failure
         break;
       default: {
         const unknown: never = state;
+
         return unknown;
       }
     }
   }
+
   return changed;
 }

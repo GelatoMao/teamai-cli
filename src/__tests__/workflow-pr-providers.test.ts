@@ -9,7 +9,7 @@ import { TGitProvider } from '../providers/tgit/index.js';
 import { GitCodeProvider } from '../providers/gitcode/index.js';
 import { GenericGitProvider } from '../providers/git/index.js';
 import { providerForRemote } from '../providers/registry.js';
-import type { GitProvider, PullRequestLookup, PullRequestRef } from '../providers/types.js';
+import type { CommitRef, GitProvider, PullRequestLookup, PullRequestRef } from '../providers/types.js';
 import { fakeGh, resolveGh } from './helpers/fake-gh.js';
 
 const ref: PullRequestRef = { repo: 'acme/app', source: 'teamai/run/work/p1', target: 'main', timeoutMs: 3000 };
@@ -112,6 +112,115 @@ setInterval(() => {}, 1000);
   });
 });
 
+const SHA = 'c'.repeat(40);
+const commit: CommitRef = { repo: 'acme/app', commit: SHA, timeoutMs: 3000 };
+const run = (status: string, conclusion: string | null = null) => ({ status, conclusion });
+type CombinedStatus = { state: string; total_count: number; statuses: Array<{ state: string }> };
+
+/** Answers GitHub's check runs and combined status of a commit, by path. */
+/** The combined status GitHub answers for commit statuses in `states`: its state as GitHub combines them, and each context. */
+function statuses(...states: string[]): CombinedStatus {
+  const state = states.some((each) => each === 'failure' || each === 'error') ? 'failure' : states.includes('pending') || states.length === 0 ? 'pending' : 'success';
+  return { state, total_count: states.length, statuses: states.map((each) => ({ state: each })) };
+}
+
+function githubAnswering(runs: unknown[], status: CombinedStatus) {
+  const fetcher = vi.fn<typeof fetch>().mockImplementation(async (url) => {
+    const { pathname } = new URL(String(url));
+    if (pathname.endsWith('/check-runs')) return new Response(JSON.stringify({ total_count: runs.length, check_runs: runs }));
+    if (pathname.endsWith('/status')) return new Response(JSON.stringify(status));
+    return new Response('{}', { status: 404 });
+  });
+  vi.stubGlobal('fetch', fetcher);
+  return fetcher;
+}
+
+describe('GitHub commit checks', () => {
+  beforeEach(() => {
+    resolveGh(null);
+    vi.stubEnv('GITHUB_TOKEN', 'test-token');
+  });
+
+  it.each([
+    ['a check run that failed', [run('completed', 'success'), run('completed', 'failure')], statuses(), 'failed'],
+    ['a check run that timed out', [run('completed', 'timed_out')], statuses(), 'failed'],
+    ['a commit status that failed', [run('completed', 'success')], statuses('failure'), 'failed'],
+    ['a check run still running', [run('completed', 'success'), run('in_progress')], statuses(), 'pending'],
+    ['a failed check run while another still runs', [run('completed', 'failure'), run('in_progress')], statuses(), 'pending'],
+    ['a failed check run while a commit status is pending', [run('completed', 'failure')], statuses('pending'), 'pending'],
+    // GitHub's combined state is failure here, though one context has not finished.
+    ['a failed commit status while another is pending', [run('completed', 'success')], statuses('failure', 'pending'), 'pending'],
+    ['more commit statuses than one page shows', [run('completed', 'success')], { ...statuses('failure'), total_count: 101 }, 'pending'],
+    ['a commit status still pending', [run('completed', 'success')], statuses('pending', 'success'), 'pending'],
+    ['every check passed or skipped', [run('completed', 'success'), run('completed', 'skipped')], statuses('success'), 'passed'],
+    ['no check at all', [], statuses(), 'none'],
+    ['only cancelled check runs', [run('completed', 'cancelled')], statuses(), 'none'],
+  ])('reads %s', async (_case, runs, status, expected) => {
+    const fetcher = githubAnswering(runs, status);
+
+    expect(await lookup().checks?.(commit)).toBe(expected);
+    expect(fetcher.mock.calls.map(([url]) => new URL(String(url)).pathname).sort())
+      .toEqual([`/repos/acme/app/commits/${SHA}/check-runs`, `/repos/acme/app/commits/${SHA}/status`]);
+  });
+
+  it('asks an installed gh with prompts off', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-fake-gh-'));
+    dirs.push(dir);
+    const gh = fakeGh(dir, { checks: { runs: [run('completed', 'failure')] } });
+
+    expect(await lookup().checks?.(commit)).toBe('failed');
+    expect(gh.calls().sort((left, right) => String(left.args[1]).localeCompare(String(right.args[1])))).toMatchObject([
+      { args: ['api', `repos/acme/app/commits/${SHA}/check-runs?per_page=100`], prompt: '0' },
+      { args: ['api', `repos/acme/app/commits/${SHA}/status?per_page=100`], prompt: '0' },
+    ]);
+  });
+
+  it('fails, rather than reading no checks, without credentials or on an answer it cannot read', async () => {
+    vi.stubEnv('GITHUB_TOKEN', ''); vi.stubEnv('GH_TOKEN', '');
+    await expect(lookup().checks?.(commit)).rejects.toThrow('GitHub credentials are unavailable');
+    vi.stubEnv('GITHUB_TOKEN', 'test-token');
+    answering({ message: 'private-token-in-body' }, 403);
+    await expect(lookup().checks?.(commit)).rejects.toThrow(/^GitHub answered the commit checks lookup with HTTP 403\.(?!.*private-token-in-body)/);
+    answering({ unexpected: true });
+    await expect(lookup().checks?.(commit)).rejects.toThrow(/^GitHub answered the commit checks lookup with data TeamAI cannot read\.$/);
+  });
+});
+
+describe('GitHub pull request history', () => {
+  const ended = (head: string, number: number, state: 'open' | 'closed', mergedAt: string | null, repo = 'acme/app') => ({
+    ...pull(head, repo, number), state, title: `Change ${number}`, created_at: `2026-10-0${number}T10:00:00Z`,
+    closed_at: state === 'closed' ? `2026-10-0${number}T12:00:00Z` : null, merged_at: mergedAt,
+  });
+
+  it('lists every request of this repository branch into the target with how it ended, never a fork with the same branch name', async () => {
+    resolveGh(null);
+    vi.stubEnv('GITHUB_TOKEN', 'test-token');
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify([
+      ended(ref.source, 9, 'open', null), ended(ref.source, 8, 'closed', null), ended(ref.source, 6, 'closed', null, 'fork/app'),
+      { ...ended(ref.source, 5, 'closed', '2026-10-05T12:00:00Z'), head: { ref: ref.source, repo: { full_name: 'acme/app' }, sha: 'h'.repeat(40) }, merge_commit_sha: 's'.repeat(40) },
+    ])));
+    vi.stubGlobal('fetch', fetcher);
+
+    expect(await lookup().history(ref)).toEqual([
+      { url: 'https://github.com/acme/app/pull/9', title: 'Change 9', openedAt: '2026-10-09T10:00:00Z', state: 'open' },
+      { url: 'https://github.com/acme/app/pull/8', title: 'Change 8', openedAt: '2026-10-08T10:00:00Z', state: 'closed', closedAt: '2026-10-08T12:00:00Z' },
+      { url: 'https://github.com/acme/app/pull/5', title: 'Change 5', openedAt: '2026-10-05T10:00:00Z', state: 'merged', closedAt: '2026-10-05T12:00:00Z', merge: { head: 'h'.repeat(40), commit: 's'.repeat(40) } },
+    ]);
+    const url = new URL(String(fetcher.mock.calls[0]?.[0]));
+    expect([url.pathname, url.searchParams.get('state'), url.searchParams.get('head'), url.searchParams.get('base')])
+      .toEqual(['/repos/acme/app/pulls', 'all', `acme:${ref.source}`, 'main']);
+  });
+
+  it('fails, rather than listing nothing, on an answer it cannot read or see past', async () => {
+    resolveGh(null);
+    vi.stubEnv('GITHUB_TOKEN', 'test-token');
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify([pull(ref.source)]))));
+    await expect(lookup().history(ref)).rejects.toThrow(/^GitHub answered the pull request history lookup with data TeamAI cannot read\.$/);
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify(Array.from({ length: 100 }, (_, index) => ended(`other-${index}`, 1, 'open', null))))));
+    await expect(lookup().history(ref)).rejects.toThrow('more pull requests than one page');
+  });
+});
+
 function lookupOf(provider: GitProvider): PullRequestLookup {
   if (!provider.pullRequests) throw new Error(`${provider.name} has no pull request lookup`);
   return provider.pullRequests;
@@ -171,9 +280,55 @@ describe('GitLab merge request lookup', () => {
     await expect(gitlabLookup.findOpen({ ...ref, timeoutMs: 20 })).rejects.toThrow();
   });
 
+  it('lists every request of this project branch into the target with how it ended, never one from a fork', async () => {
+    const at = (iid: number, state: string, ended: Record<string, string | null>) => ({ ...mr(ref.source, iid), state, title: `Change ${iid}`, created_at: `2026-10-0${iid}T10:00:00Z`, ...ended });
+    const fetcher = answering([
+      at(9, 'opened', { closed_at: null, merged_at: null }), at(8, 'closed', { closed_at: '2026-10-08T12:00:00Z', merged_at: null }),
+      { ...at(6, 'closed', { closed_at: '2026-10-06T12:00:00Z', merged_at: null }), source_project_id: 2 },
+      at(5, 'merged', { closed_at: null, merged_at: '2026-10-05T12:00:00Z', sha: 'h'.repeat(40), merge_commit_sha: null, squash_commit_sha: 's'.repeat(40) }),
+      // A fast-forward merge: the head is the commit the target branch got.
+      at(4, 'merged', { closed_at: null, merged_at: '2026-10-04T12:00:00Z', sha: 'f'.repeat(40), merge_commit_sha: null }),
+    ]);
+
+    expect(await lookupOf(new GitLabProvider()).history(ref)).toEqual([
+      { url: 'https://gitlab.com/acme/app/-/merge_requests/9', title: 'Change 9', openedAt: '2026-10-09T10:00:00Z', state: 'open' },
+      { url: 'https://gitlab.com/acme/app/-/merge_requests/8', title: 'Change 8', openedAt: '2026-10-08T10:00:00Z', state: 'closed', closedAt: '2026-10-08T12:00:00Z' },
+      { url: 'https://gitlab.com/acme/app/-/merge_requests/5', title: 'Change 5', openedAt: '2026-10-05T10:00:00Z', state: 'merged', closedAt: '2026-10-05T12:00:00Z', merge: { head: 'h'.repeat(40), commit: 's'.repeat(40) } },
+      { url: 'https://gitlab.com/acme/app/-/merge_requests/4', title: 'Change 4', openedAt: '2026-10-04T10:00:00Z', state: 'merged', closedAt: '2026-10-04T12:00:00Z', merge: { head: 'f'.repeat(40), commit: 'f'.repeat(40) } },
+    ]);
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('state')).toBe('all');
+    answering([{ ...at(7, 'opened', {}), web_url: 'https://evil.example/acme/app/-/merge_requests/7' }]);
+    await expect(lookupOf(new GitLabProvider()).history(ref)).rejects.toThrow('on another host');
+  });
+
   it('gives up on a create GitLab does not answer in time', async () => {
     hanging();
     await expect(new GitLabProvider().createPullRequest({ repo: 'acme/app', source: ref.source, target: 'main', title: 't', spawnTimeoutMs: 20 })).rejects.toThrow();
+  });
+});
+
+describe('GitLab commit pipelines', () => {
+  beforeEach(() => {
+    vi.stubEnv('GITLAB_TOKEN', 'test-token');
+    vi.stubEnv('GITLAB_URL', '');
+    vi.stubEnv('TEAMAI_GITLAB_HOST', '');
+  });
+
+  it.each([
+    ['failed', 'failed'], ['success', 'passed'], ['running', 'pending'], ['created', 'pending'], ['canceled', 'none'], ['skipped', 'none'],
+  ])('reads the newest pipeline of the commit, %s, as %s', async (status, expected) => {
+    const fetcher = answering([{ status }, { status: 'success' }]);
+
+    expect(await lookupOf(new GitLabProvider()).checks?.(commit)).toBe(expected);
+    const url = new URL(String(fetcher.mock.calls[0]?.[0]));
+    expect([url.pathname, url.searchParams.get('sha'), url.searchParams.get('order_by')]).toEqual(['/api/v4/projects/acme%2Fapp/pipelines', SHA, 'id']);
+  });
+
+  it('reads a commit no pipeline ran for as none, and fails on an answer it cannot read', async () => {
+    answering([]);
+    expect(await lookupOf(new GitLabProvider()).checks?.(commit)).toBe('none');
+    answering({ message: 'private-token-in-body' }, 403);
+    await expect(lookupOf(new GitLabProvider()).checks?.(commit)).rejects.toThrow(/^GitLab answered the commit pipelines lookup with HTTP 403\.(?!.*private-token-in-body)/);
   });
 });
 
@@ -207,6 +362,18 @@ describe('TGit merge request lookup', () => {
     hanging();
     await expect(tgitLookup.findOpen({ ...ref, timeoutMs: 20 })).rejects.toThrow();
   });
+
+  it('lists every request of this project branch into the target with how it ended, a reopened one as open', async () => {
+    const at = (iid: number, state: string, updated: string) => ({ ...tgitMr(ref.source, iid, 1, state), title: `Change ${iid}`, created_at: `2026-10-0${iid}T10:00:00Z`, updated_at: updated });
+    const fetcher = answering([at(9, 'reopened', '2026-10-09T11:00:00Z'), at(8, 'closed', '2026-10-08T12:00:00Z'), at(5, 'merged', '2026-10-05T12:00:00Z')]);
+
+    expect(await lookupOf(new TGitProvider()).history(ref)).toEqual([
+      { url: 'https://git.woa.com/acme/app/merge_requests/9', title: 'Change 9', openedAt: '2026-10-09T10:00:00Z', state: 'open' },
+      { url: 'https://git.woa.com/acme/app/merge_requests/8', title: 'Change 8', openedAt: '2026-10-08T10:00:00Z', state: 'closed', closedAt: '2026-10-08T12:00:00Z' },
+      { url: 'https://git.woa.com/acme/app/merge_requests/5', title: 'Change 5', openedAt: '2026-10-05T10:00:00Z', state: 'merged', closedAt: '2026-10-05T12:00:00Z' },
+    ]);
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('state')).toBe('all');
+  });
 });
 
 describe('GitCode pull request lookup', () => {
@@ -238,6 +405,21 @@ describe('GitCode pull request lookup', () => {
     await expect(gitcodeLookup.findOpen(ref)).rejects.toThrow('on another host');
     hanging();
     await expect(gitcodeLookup.findOpen({ ...ref, timeoutMs: 20 })).rejects.toThrow();
+  });
+
+  it('lists every request of this repository branch into the target with how it ended, never a fork', async () => {
+    const at = (number: number, state: string, ended: Record<string, string | null>, repo = 'acme/app') => ({ ...gitcodePull(ref.source, repo, number, state), title: `Change ${number}`, created_at: `2026-10-0${number}T10:00:00Z`, ...ended });
+    const fetcher = answering([
+      at(9, 'open', { closed_at: null, merged_at: null }), at(8, 'closed', { closed_at: '2026-10-08T12:00:00Z', merged_at: null }),
+      at(6, 'closed', { closed_at: '2026-10-06T12:00:00Z', merged_at: null }, 'fork/app'), at(5, 'merged', { closed_at: '2026-10-05T12:00:00Z', merged_at: '2026-10-05T12:00:00Z' }),
+    ]);
+
+    expect(await lookupOf(new GitCodeProvider()).history(ref)).toEqual([
+      { url: 'https://gitcode.com/acme/app/pull/9', title: 'Change 9', openedAt: '2026-10-09T10:00:00Z', state: 'open' },
+      { url: 'https://gitcode.com/acme/app/pull/8', title: 'Change 8', openedAt: '2026-10-08T10:00:00Z', state: 'closed', closedAt: '2026-10-08T12:00:00Z' },
+      { url: 'https://gitcode.com/acme/app/pull/5', title: 'Change 5', openedAt: '2026-10-05T10:00:00Z', state: 'merged', closedAt: '2026-10-05T12:00:00Z' },
+    ]);
+    expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get('state')).toBe('all');
   });
 });
 
@@ -275,6 +457,6 @@ describe('the provider of a checkout origin', () => {
   });
 });
 
-it('request lookup exposes only finding open requests', () => {
-  expectTypeOf<keyof PullRequestLookup>().toEqualTypeOf<'findOpen'>();
+it('request lookup only reads: open requests, how a branch\'s requests ended, and the checks of a commit', () => {
+  expectTypeOf<keyof PullRequestLookup>().toEqualTypeOf<'findOpen' | 'history' | 'checks'>();
 });

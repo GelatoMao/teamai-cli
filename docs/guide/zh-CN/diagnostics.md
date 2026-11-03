@@ -43,6 +43,77 @@ OpenCode hooks 使用 `teamai hooks inject` 或 `teamai pull` 记录的 Node 可
 
 `doctor` 会检查 Hermes 的整个 `SOUL.md`，包括个人内容。Hermes 的 `config.yaml` 中显式设置的 `context_file_max_chars` 是明确上限；未设置时，上限随模型变化，超过最低 20,000 字符会产生提示性警告。请缩短文件或检查上限；`pull` 不会截断你的指令。
 
+在项目中，Hermes 通过 teamai 插件的提示段获得团队指令。所有插件的提示段共享 8,000 字符和 32 段的上限，Hermes 按段 id 顺序填充，放不下的段整段丢弃。其他插件添加哪些段只有运行后才知道，所以 `doctor` 读取 Hermes 在 `logs/agent.log` 中记录的最近一次结果。该日志不记录项目，所以段被丢弃时只给警告：
+
+```text
+  ⚠ Hermes's last logged session took teamai's instructions section
+    → The Hermes session at 2026-11-01 10:22:03 got none of the team instructions: teamai.instructions exceeded the aggregate session budget (8000 chars) and was skipped. Plugin sections share 8,000 characters and 32 sections, filled in id order, and other plugins' sections sorting before teamai.instructions took them first. Disable a plugin you do not need (plugins.disabled in /home/ana/.hermes/config.yaml) or shorten its section, then start a new Hermes session. /home/ana/.hermes/logs/agent.log lists each section Hermes rendered and its size.
+```
+
 Pi 扩展会启动 `teamai pull` 或 `teamai hooks inject` 记录的 Node 可执行文件和 TeamAI 入口。移动或重新安装后，请重新运行其中一个命令并重启 Pi。
 
+Pi 从 0.84.0（`@earendil-works/pi-coding-agent`）起先读 `AGENTS.override.md`，再读 `AGENTS.md`。保留 override 文件时，pull 把团队指令写进 override，更旧的 Pi 读不到：
+
+```text
+  ✖ Pi reads the AGENTS.override.md holding the team instructions
+    → Pi 0.73.1 reads /home/ana/.pi/agent/AGENTS.md, not /home/ana/.pi/agent/AGENTS.override.md, so it never sees the team instructions: Pi reads AGENTS.override.md from 0.84.0. Upgrade Pi (`npm uninstall -g @mariozechner/pi-coding-agent && npm install -g @earendil-works/pi-coding-agent`), or move your text from /home/ana/.pi/agent/AGENTS.override.md into AGENTS.md, delete the override, and run `teamai pull`.
+```
+
 Hermes hooks 和指令插件会启动 `teamai hooks inject` 或 `teamai pull` 记录的 Node 可执行文件与 TeamAI 入口。移动或重新安装后，请重新运行其中一个命令并重启 Hermes。
+
+## 工具还没有信任这个项目
+
+有些工具要等你信任项目后才读取项目里的文件，或者要等你批准后才启动项目的 MCP server。`pull` 照常写入文件；`doctor` 读取每个工具自己的结论：
+
+- `⚠` 工具还没问过。你第一次在项目里打开它时它会问。`doctor` 仍然通过，所以今天不用的工具不会让你多做什么。
+- `✖` 结论是否：你或某个设置拒绝了，或者 teamai 读不出结论。打开工具也不会改变，所以 `doctor` 报失败。
+
+新 checkout 第一次 pull 之后，装了 Pi 和 Claude Code：
+
+```text
+$ teamai doctor
+  ⚠ Pi trusts this project, so it loads its team skills
+    → /home/ana/work/web-app/.pi/skills holds team skills (release-notes), but Pi loads a project's skills only in a trusted project, and /home/ana/.pi/agent/trust.json has no entry for /home/ana/work/web-app or a folder above it. Start `pi` in /home/ana/work/web-app and choose Trust, or add "/home/ana/work/web-app": true to /home/ana/.pi/agent/trust.json. Until then a headless run (`pi -p`) skips them.
+  ⚠ Claude Code approves this project's team MCP servers
+    → /home/ana/work/web-app/.mcp.json holds team MCP servers (issues), but Claude Code starts a project's .mcp.json servers in an interactive session only once you approve them, and issues waits for approval. ...
+All checks passed!
+```
+
+在项目里打开某个工具时，回答它的提示：
+
+```text
+$ cd ~/work/web-app
+$ pi          # 选 "Trust"
+$ claude      # 信任文件夹，然后选 "Use this MCP server"
+$ teamai doctor
+  ✔ Pi trusts this project, so it loads its team skills
+  ✔ Claude Code approves this project's team MCP servers
+```
+
+有人拒绝过一次的 server 会一直关闭，也不会再被询问，所以这一项报失败：
+
+```text
+  ✖ Claude Code approves this project's team MCP servers
+    → /home/ana/work/web-app/.mcp.json holds team MCP servers (issues), but ... issues was rejected. Remove the rejected ones from disabledMcpjsonServers in /home/ana/work/web-app/.claude/settings.local.json; `claude mcp reset-project-choices` in /home/ana/work/web-app clears the local settings' choices.
+```
+
+只以无界面方式运行工具的机器（CI runner、跑 workflow 的机器）永远不会被询问，按修复提示加上那一项即可：
+
+```bash
+# Pi，信任 ~/work 下的所有 checkout（runner 上还没有 trust.json 时）
+mkdir -p ~/.pi/agent && echo '{ "/home/ci/work": true }' > ~/.pi/agent/trust.json
+```
+
+| 工具 | 等待的内容 | 结论保存在 | 如何给出 |
+|---|---|---|---|
+| Claude Code | `.mcp.json` 里的 server（交互式会话） | `~/.claude/settings.json`、主 checkout 的 `.claude/settings*.json`，信任记录在 `~/.claude.json` | 信任文件夹，再批准 server |
+| Claude Code | `disableAllHooks` 为 true 时的 teamai hooks | 依次为 `.claude/settings.local.json`、`.claude/settings.json`、`~/.claude/settings.json` | 删除 `disableAllHooks`，或设为 `false` |
+| Codex | 项目 agents、`.codex/config.toml` | `~/.codex/config.toml` 的 `[projects."<主 checkout>"]` | Codex 询问时信任项目 |
+| Copilot CLI | `.github/mcp.json`、`.github/hooks` | `~/.copilot/config.json` 的 `trustedFolders` | "Yes, and remember this folder" |
+| Pi（0.79.0 起） | `.pi/skills`、`.pi/mcp.json` | `~/.pi/agent/trust.json` | "Trust" |
+| Muse Code | `.agents/skills`、`.mcp.json`、`.muse/hooks.json` | `~/.config/muse/trust.json`，每个 worktree 一项 | "Trust and continue" |
+| Qoder CLI | `.qoder/settings.json`（交互式会话） | `~/.qoder/settings.json` 的 `permissions.trustDirectories` 和 `mcp.*ProjectMcpServers` | 信任文件夹，再批准 server |
+| CodeBuddy Code | `.mcp.json` 里的 server，`-p` 也一样 | `.codebuddy/settings.local.json` | "Use this MCP server" |
+| Cursor CLI | `.cursor/mcp.json` 里的 server | `~/.cursor/projects/<project>/` | `cursor-agent mcp enable <name>` |
+
+Oh My Pi 没有信任门槛。

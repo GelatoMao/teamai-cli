@@ -82,6 +82,22 @@ steps:
     command: node -e "process.exit(0)"
 `;
 
+// One step, then two finally steps at once: describe counts the finally steps as steps the run runs.
+const CLEANED = `schemaVersion: v1alpha1
+name: cleaned
+description: Lint, then report and clean up at once
+invoke: allow
+steps:
+  - id: lint
+    command: node -e "process.exit(0)"
+finally:
+  - id: report
+    command: node -e "process.exit(0)"
+  - id: clean
+    needs: []
+    command: node -e "process.exit(0)"
+`;
+
 // Two steps at once, then an optional approval: describe recommends running both at once, with the agent deciding.
 const WIDE = `schemaVersion: v1alpha1
 name: wide
@@ -231,6 +247,16 @@ describe('skill driver preflight', () => {
     } } } });
   });
 
+  it('counts finally steps among the steps a run runs, and asks how many run at once when two finally steps can', async () => {
+    const made = await harness({ cleaned: CLEANED });
+    expect(await made.call({ kind: 'describe', name: 'cleaned' })).toMatchObject({ data: { describe: {
+      workflow: { facts: { width: 2, runs: ['lint', 'report', 'clean'].map((step) => ({ step, executor: 'command', env: [] })) } },
+      ask: { kind: 'ask', question: { text: expect.stringContaining('- It can run up to 2 steps at once.') } },
+    } } });
+    expect(await made.call({ kind: 'start', name: 'cleaned', answers: { confirmed: false }, inputs: undefined }))
+      .toMatchObject({ error: { code: 'confirm_needed' } });
+  });
+
   it('routes a run whose continue step needs env to the local driver', async () => {
     const made = await harness({ 'release-docs': RELEASE_DOCS });
     expect(await made.call({ kind: 'describe', name: 'release-docs' })).toMatchObject({ data: { describe: {
@@ -238,6 +264,37 @@ describe('skill driver preflight', () => {
       ask: { kind: 'local', start: 'teamai workflow start release-docs --driver local --tools default=claude' },
     } } });
     expect(await made.call({ kind: 'start', name: 'release-docs', answers: { confirmed: false }, inputs: undefined }))
+      .toMatchObject({ error: { code: 'needs_local_driver', next: null } });
+    expect(runCount(made)).toBe(0);
+  });
+
+  it("routes a run whose steps run as a team role to a driver that delivers it, before any step runs on this one", async () => {
+    const made = await harness({ 'review-docs': `schemaVersion: v1alpha1
+name: review-docs
+description: Draft the notes, then check them, as the review role
+invoke: allow
+defaults:
+  role: review
+steps:
+  - id: docs
+    workspace: new
+    workflow:
+      steps:
+        - id: draft
+          prompt: Draft the release notes.
+        - id: check
+          needs: [draft]
+          prompt: Check the notes.
+` }, { teamFiles: { 'manifest/roles.yaml': 'version: 1\nroles:\n  - id: review\n    resources: { skills: [review] }\n' } });
+    expect(await made.call({ kind: 'describe', name: 'review-docs' })).toMatchObject({ data: { describe: {
+      workflow: { facts: { held: [{ step: 'docs.draft', missing: ['role'] }, { step: 'docs.check', missing: ['role'] }] } },
+      ask: {
+        kind: 'local',
+        reason: 'review-docs runs steps as a team role, which only a driver that declares can.role runs, as teamai must deliver the role into the copy each such step works in, and this driver does not. Start it with --driver local.',
+        start: 'teamai workflow start review-docs --driver local --tools default=claude',
+      },
+    } } });
+    expect(await made.call({ kind: 'start', name: 'review-docs', answers: { confirmed: false }, inputs: undefined }))
       .toMatchObject({ error: { code: 'needs_local_driver', next: null } });
     expect(runCount(made)).toBe(0);
   });

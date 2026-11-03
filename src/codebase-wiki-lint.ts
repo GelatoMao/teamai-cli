@@ -2,9 +2,16 @@ import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 
 import chalk from 'chalk';
+import { z } from 'zod';
 
 import { pathExists } from './utils/fs.js';
-import type { GraphIndex } from './wiki-engine/adapters/index.js';
+import type { LintAssetGraph } from './lint-asset-graph.js';
+
+/** The parts of graph-index.json the lint counts; a field of the wrong type reads as absent. */
+const LintedGraphSchema = z.object({
+  nodes: z.array(z.object({ slug: z.string().optional().catch(undefined) })),
+  edges: z.array(z.object({ from: z.string().optional().catch(undefined), to: z.string().optional().catch(undefined) })),
+});
 
 export type WikiLintSeverity = 'high' | 'medium' | 'low' | 'info';
 
@@ -24,12 +31,23 @@ export interface WikiLintReport {
     low: number;
     info: number;
   };
+  /**
+   * Graph metrics from `.indices/graph-index.json`; `null` when the graph is
+   * missing or corrupt — "not checked", never a measured 0% (#1637 review).
+   * The field can be `null` in every mode, standalone `--output` included:
+   * scripts reading `graphHealth.connectivity` must handle it.
+   */
   graphHealth: {
     nodeCount: number;
     edgeCount: number;
     orphanNodes: number;
     connectivity: number;
-  };
+  } | null;
+  /**
+   * The member's asset-relation counts (#1562). Absent with standalone
+   * `--output` or when there is no member: then there is no asset data.
+   */
+  assetGraph?: LintAssetGraph;
 }
 
 export async function lintTeamwiki(opts: {
@@ -51,66 +69,71 @@ export async function lintTeamwiki(opts: {
 
   // Check graph-index.json exists
   const graphPath = path.join(wikiRoot, '.indices', 'graph-index.json');
-  let graph: GraphIndex | null = null;
+  let graph: z.infer<typeof LintedGraphSchema> | null = null;
 
   if (!await pathExists(graphPath)) {
     addIssue({
       severity: 'high',
       category: 'graph-missing',
       location: 'teamwiki/.indices/graph-index.json',
-      message: 'graph-index.json 不存在，知识图谱未构建',
+      message: 'graph-index.json does not exist; the knowledge graph has not been built',
     });
   } else {
     try {
       const raw = await readFile(graphPath, 'utf-8');
-      graph = JSON.parse(raw) as GraphIndex;
+      graph = LintedGraphSchema.parse(JSON.parse(raw));
     } catch {
       addIssue({
         severity: 'high',
         category: 'graph-corrupt',
         location: graphPath,
-        message: 'graph-index.json 解析失败',
+        message: 'Failed to parse graph-index.json',
       });
     }
   }
 
   // Check evidence directory
   const evidenceDir = path.join(wikiRoot, 'evidence', 'code');
+
   if (!await pathExists(evidenceDir)) {
     addIssue({
       severity: 'high',
       category: 'evidence-missing',
       location: 'teamwiki/evidence/code/',
-      message: 'evidence 目录不存在，无代码事实页',
+      message: 'The evidence directory does not exist; no code fact pages are available',
     });
   } else {
     const projects = await readdir(evidenceDir);
+
     if (projects.length === 0) {
       addIssue({
         severity: 'medium',
         category: 'evidence-empty',
         location: 'teamwiki/evidence/code/',
-        message: 'evidence 目录为空，未提取任何项目',
+        message: 'The evidence directory is empty; no projects have been extracted',
       });
     }
 
     for (const project of projects) {
       const projectDir = path.join(evidenceDir, project);
       const pStat = await stat(projectDir).catch(() => null);
+
       if (!pStat?.isDirectory()) {
         if (!pStat) {
-          addIssue({ severity: 'low', category: 'stat-failed', location: `evidence/code/${project}`, message: '无法读取目录状态' });
+          addIssue({ severity: 'low', category: 'stat-failed', location: `evidence/code/${project}`, message: 'Could not read the directory status' });
         }
+
         continue;
       }
 
       const files = await readdir(projectDir);
+
       if (!files.includes('index.md')) {
         addIssue({
           severity: 'low',
           category: 'missing-index',
           location: `evidence/code/${project}/`,
-          message: '缺少 index.md 总索引页',
+          message: 'The project index.md page is missing',
         });
       }
     }
@@ -123,26 +146,29 @@ export async function lintTeamwiki(opts: {
         severity: 'low',
         category: 'nav-missing',
         location: `teamwiki/${navFile}`,
-        message: `导航文件 ${navFile} 不存在，知识库入口不完整`,
+        message: `Navigation file ${navFile} does not exist; the knowledge base entry point is incomplete`,
       });
     }
   }
 
   // Check source-manifest.json
   const manifestPath = path.join(wikiRoot, 'source-manifest.json');
+
   if (!await pathExists(manifestPath)) {
     addIssue({
       severity: 'low',
       category: 'manifest-missing',
       location: 'teamwiki/source-manifest.json',
-      message: 'source-manifest.json 不存在，增量更新不可用',
+      message: 'source-manifest.json does not exist; incremental updates are unavailable',
     });
   } else {
     try {
       const raw = await readFile(manifestPath, 'utf-8');
       const manifest = JSON.parse(raw);
+
       if (manifest.lastScan) {
         const daysSince = (Date.now() - new Date(manifest.lastScan).getTime()) / (1000 * 60 * 60 * 24);
+
         if (daysSince > 60) {
           addIssue({
             severity: 'medium',
@@ -157,20 +183,25 @@ export async function lintTeamwiki(opts: {
         severity: 'low',
         category: 'manifest-corrupt',
         location: manifestPath,
-        message: 'source-manifest.json 解析失败',
+        message: 'Failed to parse source-manifest.json',
       });
     }
   }
 
-  // Graph health metrics
-  let graphHealth = { nodeCount: 0, edgeCount: 0, orphanNodes: 0, connectivity: 0 };
+  // Graph health metrics; null stays "not checked" when the graph is missing
+  // or corrupt, so a JSON reader never mistakes it for a measured 0% (#1637).
+  let graphHealth: { nodeCount: number; edgeCount: number; orphanNodes: number; connectivity: number } | null = null;
+
   if (graph) {
-    const connectedNodes = new Set<string>();
+    const connectedNodes = new Set<string | undefined>();
+
     for (const edge of graph.edges) {
       connectedNodes.add(edge.from);
       connectedNodes.add(edge.to);
     }
+
     const orphans = graph.nodes.filter(n => !connectedNodes.has(n.slug));
+
     const connectivity = graph.nodes.length > 0
       ? (graph.nodes.length - orphans.length) / graph.nodes.length
       : 0;
@@ -187,7 +218,7 @@ export async function lintTeamwiki(opts: {
         severity: 'medium',
         category: 'low-connectivity',
         location: 'teamwiki/.indices/graph-index.json',
-        message: `图谱连通性 ${(connectivity * 100).toFixed(0)}% 过低（${orphans.length} 个孤立节点）`,
+        message: `Graph connectivity is too low at ${(connectivity * 100).toFixed(0)}% (${orphans.length} orphan nodes)`,
       });
     }
 
@@ -196,7 +227,7 @@ export async function lintTeamwiki(opts: {
         severity: 'high',
         category: 'no-edges',
         location: 'teamwiki/.indices/graph-index.json',
-        message: `图谱有 ${graph.nodes.length} 个节点但 0 条边，图谱构建可能失败`,
+        message: `The graph has ${graph.nodes.length} nodes but no edges; graph construction may have failed`,
       });
     }
   }
@@ -215,36 +246,56 @@ export async function lintTeamwiki(opts: {
 export function formatWikiLintReport(report: WikiLintReport): string {
   const lines: string[] = [];
 
-  lines.push(chalk.bold('=== teamwiki/ 知识图谱健康度检查 ==='));
+  lines.push(chalk.bold('=== teamwiki/ knowledge graph health check ==='));
   lines.push('');
-  lines.push(`图谱: ${report.graphHealth.nodeCount} nodes, ${report.graphHealth.edgeCount} edges, 连通性 ${(report.graphHealth.connectivity * 100).toFixed(0)}%`);
-  if (report.graphHealth.orphanNodes > 0) {
-    lines.push(chalk.dim(`  (${report.graphHealth.orphanNodes} 个孤立节点)`));
+
+  if (report.graphHealth === null) {
+    lines.push('graph: not checked (graph-index.json missing or corrupt)');
+  } else {
+    lines.push(`Graph: ${report.graphHealth.nodeCount} nodes, ${report.graphHealth.edgeCount} edges, connectivity ${(report.graphHealth.connectivity * 100).toFixed(0)}%`);
+
+    if (report.graphHealth.orphanNodes > 0) {
+      lines.push(chalk.dim(`  (${report.graphHealth.orphanNodes} orphan nodes)`));
+    }
   }
+
   lines.push('');
 
   if (report.issues.length === 0) {
-    lines.push(chalk.green('✓ 无问题'));
-    return lines.join('\n');
-  }
+    lines.push(chalk.green('✓ No issues'));
+  } else {
+    const byCategory = new Map<string, WikiLintIssue[]>();
 
-  const byCategory = new Map<string, WikiLintIssue[]>();
-  for (const issue of report.issues) {
-    const existing = byCategory.get(issue.category) ?? [];
-    existing.push(issue);
-    byCategory.set(issue.category, existing);
-  }
-
-  for (const [category, categoryIssues] of byCategory) {
-    lines.push(chalk.bold(`[${category}] (${categoryIssues.length})`));
-    for (const issue of categoryIssues) {
-      const sevColor = issue.severity === 'high' ? chalk.red
-        : issue.severity === 'medium' ? chalk.yellow : chalk.dim;
-      lines.push(`  ${sevColor(`[${issue.severity}]`)} ${issue.location}: ${issue.message}`);
+    for (const issue of report.issues) {
+      const existing = byCategory.get(issue.category) ?? [];
+      existing.push(issue);
+      byCategory.set(issue.category, existing);
     }
-    lines.push('');
+
+    for (const [category, categoryIssues] of byCategory) {
+      lines.push(chalk.bold(`[${category}] (${categoryIssues.length})`));
+
+      for (const issue of categoryIssues) {
+        const sevColor = issue.severity === 'high' ? chalk.red
+          : issue.severity === 'medium' ? chalk.yellow : chalk.dim;
+
+        lines.push(`  ${sevColor(`[${issue.severity}]`)} ${issue.location}: ${issue.message}`);
+      }
+
+      lines.push('');
+    }
+
+    lines.push(`Total: ${report.summary.high} high, ${report.summary.medium} medium, ${report.summary.low} low, ${report.summary.info} info`);
   }
 
-  lines.push(`总计: ${report.summary.high} high, ${report.summary.medium} medium, ${report.summary.low} low, ${report.summary.info} info`);
+  if (report.assetGraph) {
+    lines.push(formatAssetGraphLine(report.assetGraph));
+  }
+
   return lines.join('\n');
+}
+
+/** The one asset-count line `--lint` prints after the report (#1562). */
+export function formatAssetGraphLine(graph: LintAssetGraph): string {
+  return `Assets: ${graph.assetCount}, relations: ${graph.relationCount}, without a relation: ${graph.withoutRelation.length}, unresolved: ${graph.unresolved.length}`;
 }

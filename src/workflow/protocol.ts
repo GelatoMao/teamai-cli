@@ -1,5 +1,8 @@
 /** The workflow protocol in process: the calls behind `workflow start`, `next`, `report`, `respond`, `retry` and `cancel`, for every driver. */
+import fs from 'node:fs/promises';
 import path from 'node:path';
+import { z } from 'zod';
+import type { ReportedAgent } from '../agent-observation.js';
 import { DefaultWorkflows } from '../default-workflows.js';
 import { driverIdentity, sameDriver } from '../driver-identity.js';
 import type { WorkflowEnv } from '../env-resolution.js';
@@ -8,7 +11,7 @@ import type { PinnedScorer } from '../scorers/pin.js';
 import { isJudgeTool, judgeToolLevel } from '../scorers/judge.js';
 import { resolveRunMode, type RunMode } from '../launch-context.js';
 import { stopRecordedGroup } from '../tool-launch/process-stop.js';
-import type { LocalConfig } from '../types.js';
+import type { JsonValue, LocalConfig } from '../types.js';
 import { nestedWorkflowError, type AgentEvidence } from './attempt-marker.js';
 import { loadCachedWorkflow, loadWorkflowTree } from './cache.js';
 import { describeWorkflow, type WorkflowDescription } from './describe.js';
@@ -16,15 +19,18 @@ import { LeaseIdSchema, LeaseWireSchema } from './lease-wire.js';
 import { carriedRun, claimOffered, reconcileTakenCopies, resumeRun, settledSteps } from './handoff.js';
 import { leaseNext, parseNextPayload, parseReport, parseResponsePayload, reportable, reportAttempt, startRun, withIgnored, type NextOptions, type ReportInput } from './engine.js';
 import {
-  abandonPlace, adoptedPlaceOf, finishPlace, placeHeldBy, placeLeaseOf, placeOf, placeRecorded, preparePlace, releasePlace, runPlaceSetup, type PlaceLease, type PlacePrepared,
+  abandonPlace, adoptedPlaceOf, finishPlace, placeHeldBy, placeLeaseOf, placeOf, placeRecorded, preparedClone, preparedCopyTeam, preparePlace, releasePlace, runPlaceSetup, stagePassEvidence, sweepClones, type PlaceLease,
+  type PlacePrepared,
   type StepEnd,
 } from './place/place.js';
 import { cancelRun, respondProvenance, respondToHitl, retryStep, type CallerProvenance, type Via } from './run-controls.js';
 import { nextJudgeLease, parseJudgeRequest, runJudgeLease, verifiedScorers } from './scoring.js';
+import { stepDefinitions } from './scope.js';
+import { StepModelSchema } from './step-model.js';
 import { attemptDir, AttemptIdSchema, readRun, RunIdSchema, withRunLock, type AttemptId, type RunId, type RunLock } from './store.js';
 import type { DriverCan } from './requirements.js';
 import { isWorkflowError, type DriverIdentity, type RunState, type RunStatus, type WorkflowDefinition, type WorkflowEnvelope, type WorkflowFailure } from './types.js';
-import { deliveryProblem } from './workspace.js';
+import { cloneBranchOf, deliveryProblem, stepRoleOf } from './workspace.js';
 import { headCommit } from './worktree.js';
 
 /**
@@ -58,18 +64,20 @@ export interface WorkflowClient {
    * tool of the caller's coding session, whose confined judge would judge the scored steps here. `undeliverable`: why
    * a start from `checkout` would be refused for its delivery (`deliveryProblem`).
    */
-  describe: (name: string, options: { ceiling: number; can: DriverCan; checkout?: string; tool?: string }) => Promise<{ description: WorkflowDescription; judging: Judging; undeliverable?: WorkflowFailure } | { error: WorkflowFailure }>;
+  describe: (name: string, options: { ceiling: number; can: DriverCan; checkout?: string; tool?: string }) => Promise<DescribedWorkflow | { error: WorkflowFailure }>;
   /**
    * Prepares the place of `lease`, the lease `next` answered with, in the checkout the run started from, or in the place
    * the host made for its branch, while that passes the adopt checks. `busy` when another attempt the run leased holds
    * that place.
    */
+  // oxlint-disable-next-line teamai/no-unknown-parameters -- the skill driver passes the lease of an envelope it has not parsed; LeaseWireSchema parses it here
   prepare(lock: RunLock, lease: unknown): Promise<PlacePrepared | PlaceBusy>;
   /**
    * Prepares the place of `lease` in a place its host made, when the lease commits to a branch, and as `prepare` does
    * when it does not. `host` asks for the place the last attempt to finish on the branch was prepared in, while it
    * passes the adopt checks, and is `busy` while another open attempt holds it. `adopt` asks for the place at `dir`.
    */
+  // oxlint-disable-next-line teamai/no-unknown-parameters -- the skill driver passes the lease of an envelope it has not parsed; LeaseWireSchema parses it here
   prepareHostPlace(lock: RunLock, lease: unknown, request: HostPlaceRequest): Promise<HostPlacePrepared>;
   /**
    * Runs the setup of the place `prepare` made for `attempt`, outside the run lock, in the run's `mode`, until it ends
@@ -79,17 +87,20 @@ export interface WorkflowClient {
   /**
    * Starts `name` with `inputs`, from `checkout` when given: the run's workspaces start from its HEAD. A `caller`
    * inside a workflow attempt starts none, `nested_workflow`, and an agent one only a workflow whose `invoke` lets it:
-   * `invoke_denied` for `deny`, and `confirm_needed` for `ask` without `confirmed`.
+   * `invoke_denied` for `deny`, and `confirm_needed` for `ask` without `confirmed`. `alone`: what the local driver,
+   * the run's only driver, gives strict requirements; a step it could never take refuses the start, `requirement_unmet`.
    */
-  start(name: string, options: { inputs?: unknown; checkout?: string; caller: InvokeCaller }): Promise<WorkflowEnvelope>;
+  start(name: string, options: { inputs?: unknown; checkout?: string; caller: InvokeCaller; timeout?: number; alone?: DriverCan }): Promise<WorkflowEnvelope>;
   /**
    * Asks the run what to do. With `prepare`, a lease comes with `cwd`, its place in the checkout the run started from,
    * made under the run's lock, and a prepare that fails settles the attempt `failed` with its own code.
    */
+  // oxlint-disable-next-line teamai/no-unknown-parameters -- the payload as a driver sent it; parseNextPayload in engine.ts parses it, and the skill driver passes typed requests
   next(runId: string, body: unknown, options?: { prepare?: NextPrepare }): Promise<WorkflowEnvelope>;
   /** What the run file of `runId` says now, or undefined while this machine cannot read it. */
   runVersion(runId: RunId): Promise<RunVersion | undefined>;
   /** Reports an attempt. A prepared one is finished first: its `changes` or `read` come from its place. */
+  // oxlint-disable-next-line teamai/no-unknown-parameters -- the payload as a driver sent it; parseReport in engine.ts parses it, and the skill driver's tick.ts passes typed reports
   report(runId: string, body: unknown, options?: { lock?: RunLock }): Promise<WorkflowEnvelope>;
   /** Records an answer, with the provenance decided from the process or driver `via` names. A process inside a workflow attempt answers none: `nested_workflow`. */
   respond(runId: string, step: string, choice: string, options: { note?: string; pass?: number; via: RespondVia }): Promise<WorkflowEnvelope>;
@@ -113,11 +124,13 @@ export interface WorkflowClient {
   /** Why `caller` may not continue run `runId`, by a resume or a takeover, as `resumeRefusal` decides it. */
   resumeRefusal(runId: RunId, options: { caller: InvokeCaller; published: boolean }): Promise<WorkflowFailure | undefined>;
   /** Takes or renews judge work, as `teamai score --next` does with `body` as its payload. */
+  // oxlint-disable-next-line teamai/no-unknown-parameters -- the payload as a driver sent it; parseJudgeRequest parses it
   scoreNext(body: unknown): Promise<WorkflowEnvelope>;
   /**
    * Judges lease `ref` with the confined judge of the tool it was leased for, as `teamai score --lease <ref>` does with
    * `body` as its payload, and records the judge tool's process group in the directory `group`.
    */
+  // oxlint-disable-next-line teamai/no-unknown-parameters -- the payload as a driver sent it; runJudgeLease parses it
   judge(ref: string, body: unknown, options: { group: string }): Promise<WorkflowEnvelope>;
 }
 
@@ -139,6 +152,7 @@ function readiedHere(config: LocalConfig, runId: RunId, claim: 'none' | ResumeCl
       return resumeRun(config, runId, { claim: false, checkout });
     default: {
       const unhandled: never = claim;
+
       return unhandled;
     }
   }
@@ -183,6 +197,7 @@ function agentClause(evidence: Exclude<AgentEvidence, { kind: 'none' }>): string
       return 'this command uses --driver skill, which only a coding agent drives';
     default: {
       const unhandled: never = evidence;
+
       return unhandled;
     }
   }
@@ -198,6 +213,7 @@ export function invokeDeniedMessage(name: string, evidence: Exclude<AgentEvidenc
       return `Workflow "${name}" has invoke: deny, so no coding agent continues it, with any driver, and ${agentClause(evidence)}. The person can continue it from their own terminal with teamai workflow resume ${act.run}. To let agents continue it, the team sets invoke: allow, or invoke: ask for a resume after the person agrees, in workflows/${name}.yaml.`;
     default: {
       const unhandled: never = act;
+
       return unhandled;
     }
   }
@@ -222,6 +238,7 @@ export function unattendedReason(name: string, needs: string, act: 'start' | 'co
  */
 export function invokeRefusal(definition: WorkflowDefinition | undefined, caller: InvokeCaller, act: InvokeAct): WorkflowFailure | undefined {
   const { evidence } = caller;
+
   switch (evidence.kind) {
     case 'none':
       return undefined;
@@ -232,8 +249,11 @@ export function invokeRefusal(definition: WorkflowDefinition | undefined, caller
       if (definition === undefined) return undefined;
       const { name } = definition;
       const invoke = definition.invoke ?? 'deny';
+
       if (invoke === 'allow' || (invoke === 'ask' && caller.confirmed && caller.mode !== 'unattended')) return undefined;
+
       if (invoke === 'deny') return { code: 'invoke_denied', message: invokeDeniedMessage(name, evidence, act) };
+
       switch (act.kind) {
         case 'start':
           return caller.mode === 'unattended'
@@ -244,17 +264,21 @@ export function invokeRefusal(definition: WorkflowDefinition | undefined, caller
           if (caller.mode === 'unattended') {
             return { code: 'unattended_denied', message: unattendedReason(name, 'the team asks that a person agree before an agent continues it (invoke: ask)', 'continue') };
           }
+
           return act.kind === 'continue'
             ? { code: 'confirm_needed', message: `Workflow "${name}" has invoke: ask, so a coding agent continues it only after the person agrees, and ${agentClause(evidence)}. Ask the person whether to continue ${name}; once they agree, run the same command with --confirmed.` }
             : { code: 'confirm_needed', message: `Workflow "${name}" has invoke: ask, so a coding agent continues it only after the person agrees, and ${agentClause(evidence)}. A next payload cannot say the person agreed. Ask the person whether to continue ${name}; once they agree, run teamai workflow resume ${act.run} --claim --confirmed.` };
         default: {
           const unhandled: never = act;
+
           return unhandled;
         }
       }
     }
+
     default: {
       const unhandled: never = evidence;
+
       return unhandled;
     }
   }
@@ -275,7 +299,9 @@ export async function resumeRefusal(
 ): Promise<WorkflowFailure | undefined> {
   if (caller.evidence.kind === 'none') return undefined;
   const carried = await carriedRun(config, runId, { published });
+
   if (!carried.ok) return { code: carried.error.code, message: carried.error.message };
+
   return invokeRefusal(carried.value?.definition, caller, { kind: act, run: runId });
 }
 
@@ -290,6 +316,9 @@ export function workflowNotFound(name: string): WorkflowFailure {
  * verified judge of it, for `reason`, leaving open the work of the `verified` scorers that ask for more; or nobody on
  * this machine, for `reason`.
  */
+/** A workflow as `describe` answers it: what it does, who judges it here, and why it cannot deliver, when it cannot. */
+export type DescribedWorkflow = { description: WorkflowDescription; judging: Judging; undeliverable?: WorkflowFailure };
+
 export type Judging =
   | { kind: 'none' }
   | { kind: 'here'; tool: string }
@@ -303,19 +332,31 @@ export type Judging =
 async function judgingOf(config: LocalConfig, description: WorkflowDescription, tool: string | undefined, pinned?: Record<string, PinnedScorer>): Promise<Judging> {
   if (description.facts.scored.length === 0) return { kind: 'none' };
   const unavailable = scoringUnavailable(config);
+
   if (unavailable) return { kind: 'elsewhere', reason: unavailable };
+
   if (tool === undefined) return { kind: 'elsewhere', reason: 'This coding session names no tool.' };
   const level = isJudgeTool(tool) ? await judgeToolLevel(tool) : undefined;
+
   if (level?.isolation === 'verified') return { kind: 'here', tool };
+
   const reason = !isJudgeTool(tool) ? `The coding session's tool, ${tool}, has no confined judge teamai runs`
     : level ? `${tool} ${level.version || '(version unknown)'} has no verified judge profile` : `The ${tool} executable is not on PATH`;
+
   const scorers = [...new Set(description.facts.scored.flatMap((step) => step.scorers))];
   const verified = await verifiedScorers(config, scorers, pinned);
+
   if (!verified.ok) return { kind: 'elsewhere', reason: `${reason}. ${verified.reason}` };
+
   if (verified.scorers.length === scorers.length) {
     return { kind: 'elsewhere', reason: `${reason}, and ${verified.scorers.join(', ')} ${verified.scorers.length > 1 ? 'ask' : 'asks'} for verified isolation.` };
   }
-  return { kind: 'session', tool, reason: `${reason}.`, ...(verified.scorers.length > 0 ? { verified: verified.scorers } : {}) };
+
+  const session: Extract<Judging, { kind: 'session' }> = { kind: 'session', tool, reason: `${reason}.` };
+
+  if (verified.scorers.length > 0) session.verified = verified.scorers;
+
+  return session;
 }
 
 /** Where the host made the place of a lease: `host`, the place an earlier attempt adopted for its branch; `adopt`, `dir`. */
@@ -337,23 +378,97 @@ export type HostPlacePrepared =
 /** `mode`: the run mode the lease keeps, as its driver's `next` sent it. */
 type Leased = { kind: 'leased'; lease: PlaceLease; root: string; others: AttemptId[]; mode?: RunMode };
 
-/** What every driver fails a lease of run `run` with when this teamai cannot read the place it names, as a newer one writes. */
+/**
+ * `report` with what teamai knows of a prompt it prepared a copy for, whatever the driver says of it: in a clone, the team
+ * revision and project commit it observed of the clone, and the exact model and effort the step asked for; in a worktree
+ * copy that runs with a role, the team it delivered there. So the step records what its tool ran on. Unchanged when the
+ * report names no tool, or the attempt runs in no such copy this machine prepared.
+ */
+async function withPreparedCopy(config: LocalConfig, runId: RunId, report: ReportInput): Promise<ReportInput> {
+  const tool = report.tool ?? report.agent?.tool?.name;
+
+  if (tool === undefined) return report;
+  const run = await readRun(config, runId);
+
+  if (run === 'missing' || run === 'corrupt') return report;
+  const leased = run.steps.find((step) => step.status === 'leased' && step.attempt === report.attempt);
+  const branch = leased ? cloneBranchOf(run, leased.id) : undefined;
+  // A worktree copy that runs with a role: the team is what teamai delivered there, whatever role the driver names.
+  const attempt = AttemptIdSchema.safeParse(report.attempt);
+
+  if (leased && branch === undefined && attempt.success) {
+    const stepRole = stepRoleOf(run, leased.id);
+    const { team: _reported, ...sent } = report.agent ?? {};
+
+    switch (stepRole.kind) {
+      case 'role': {
+        const team = await preparedCopyTeam({ config, run: runId, attempt: attempt.data, tool });
+        const agent: NonNullable<ReportInput['agent']> = { ...sent };
+
+        if (team) agent.team = team;
+
+        return { ...report, agent };
+      }
+
+      case 'none':
+        break;
+      case 'unrenderable':
+        // teamai cannot tell the role, and the driver's team would read as the member's, so the pass records none.
+        return { ...report, agent: sent };
+      default: {
+        const unhandled: never = stepRole;
+
+        return unhandled;
+      }
+    }
+  }
+
+  const made = branch === undefined ? undefined : await preparedClone(config, runId, branch);
+
+  if (!leased || !made) return report;
+  const { team, project } = made.prepared;
+  const asked = stepDefinitions(run)(leased.id)?.model;
+  const model = StepModelSchema.safeParse(asked).data;
+  const sent = report.agent;
+  const agent: ReportedAgent = { ...sent };
+
+  if (team) agent.team = team;
+
+  if (project) agent.project = project;
+
+  if (model) agent.model = { ...sent?.model, requested: model.name };
+
+  if (model?.effort) agent.effort = { ...sent?.effort, requested: model.effort };
+
+  return { ...report, agent };
+}
+
 export function unreadablePlace(run: RunId): WorkflowFailure {
   return { code: 'workspace_base', message: `Run ${run} leased a place this teamai cannot read. Update teamai.` };
 }
 
 /** The lease `raw` names, as the run leases it now. */
+// oxlint-disable-next-line teamai/no-unknown-parameters -- the skill driver passes the lease of an envelope it has not parsed; LeaseWireSchema parses it here
 async function leasedPlace(config: LocalConfig, lock: RunLock, raw: unknown): Promise<Leased | { kind: 'failed'; failure: WorkflowFailure }> {
   const wire = LeaseWireSchema.safeParse(raw);
+
   if (!wire.success) return { kind: 'failed', failure: unreadablePlace(lock.run) };
   const lease = placeLeaseOf(wire.data);
   const run = await readRun(config, lock.run);
-  if (typeof run !== 'object') return { kind: 'failed', failure: { code: 'run_unreadable', message: `Run ${lock.run} cannot be read, so attempt ${lease.attempt} has no place to run in` } };
+
+  if (run === 'missing' || run === 'corrupt') return { kind: 'failed', failure: { code: 'run_unreadable', message: `Run ${lock.run} cannot be read, so attempt ${lease.attempt} has no place to run in` } };
   const leased = run.steps.find((step) => step.status === 'leased' && step.lease.attempt === lease.attempt);
+
   if (leased?.status !== 'leased') return { kind: 'failed', failure: { code: 'wrong_attempt', message: `Attempt ${lease.attempt} is not the leased attempt` } };
+
   if (run.checkout === undefined) return { kind: 'failed', failure: noCheckout(lock.run, lease.attempt) };
   const { driver, runMode } = leased.lease;
-  return { kind: 'leased', lease: { ...lease, step: leased.id }, root: run.checkout, others: otherLeases(run, { attempt: lease.attempt, driver }), ...(runMode ? { mode: runMode } : {}) };
+
+  const placed: Leased = { kind: 'leased', lease: { ...lease, step: leased.id }, root: run.checkout, others: otherLeases(run, { attempt: lease.attempt, driver }) };
+
+  if (runMode) placed.mode = runMode;
+
+  return placed;
 }
 
 /**
@@ -362,9 +477,11 @@ async function leasedPlace(config: LocalConfig, lock: RunLock, raw: unknown): Pr
  */
 async function placeLeased(config: LocalConfig, lock: RunLock, leased: Leased, adopt?: string): Promise<PlacePrepared | PlaceBusy> {
   const { lease, root, others } = leased;
-  const held = await placeHeldBy({ config, run: lock.run, root, lease, others, ...(adopt !== undefined ? { adopt } : {}) });
+  const held = await placeHeldBy({ config, run: lock.run, root, lease, others, adopt });
+
   if (held) return { kind: 'busy', ...held };
-  return preparePlace({ config, lock, root, lease, ...(adopt !== undefined ? { adopt } : {}) });
+
+  return preparePlace({ config, lock, root, lease, adopt });
 }
 
 /**
@@ -375,8 +492,10 @@ async function placeLeased(config: LocalConfig, lock: RunLock, leased: Leased, a
 function otherLeases(run: RunState, { attempt, driver }: { attempt: AttemptId; driver: DriverIdentity }): AttemptId[] {
   const leased = run.steps.flatMap((step) => (step.status === 'leased' ? [step.lease.attempt] : []));
   const stopped = (run.stoppedAttempts ?? []).flatMap((entry) => (sameDriver(entry.driver, driver) ? [entry.attempt] : []));
+
   return [...leased, ...stopped].flatMap((candidate) => {
     const other = candidate !== attempt ? AttemptIdSchema.safeParse(candidate) : undefined;
+
     return other?.success ? [other.data] : [];
   });
 }
@@ -397,74 +516,112 @@ export function inProcessClient({ config, env }: { config: LocalConfig; env: Wor
   return {
     describe: async (name, { ceiling, can, checkout, tool }) => {
       const cached = await loadCachedWorkflow(config, name);
+
       if (!cached) return { error: workflowNotFound(name) };
       const tree = await loadWorkflowTree(config, cached);
+
       if ('failed' in tree) return { error: tree.failed };
       const head = checkout === undefined ? undefined : await headCommit(checkout);
+
       const description = describeWorkflow({
-        definition: cached.definition, source: cached.source, workflows: tree.workflows, ceiling, can, allow: config.workflows?.allow ?? {}, env: env.facts, ...(head?.ref !== undefined ? { base: head.ref } : {}),
+        definition: cached.definition, source: cached.source, workflows: tree.workflows, ceiling, can, allow: config.workflows?.allow ?? {}, env: env.facts, base: head?.ref,
       });
+
       const undeliverable = deliveryProblem(cached.definition, tree.workflows, head);
-      return { description, judging: await judgingOf(config, description, tool), ...(undeliverable ? { undeliverable } : {}) };
+
+      const described: DescribedWorkflow = { description, judging: await judgingOf(config, description, tool) };
+
+      if (undeliverable) described.undeliverable = undeliverable;
+
+      return described;
     },
     prepare: async (lock, raw) => {
       const leased = await leasedPlace(config, lock, raw);
+
       return leased.kind === 'leased' ? placeLeased(config, lock, leased) : leased;
     },
     prepareHostPlace: async (lock, raw, request) => {
       const leased = await leasedPlace(config, lock, raw);
+
       if (leased.kind === 'failed') return leased;
       const { lease, root } = leased;
       const { workspace } = lease;
-      if (workspace?.mode !== 'new' && workspace?.mode !== 'continue') {
+
+      // A clone is teamai's to make, never the host's.
+      if ((workspace?.mode !== 'new' && workspace?.mode !== 'continue') || workspace.clone !== undefined) {
         const placed = await placeLeased(config, lock, leased);
+
         return placed.kind === 'refused' ? { kind: 'failed', failure: placed.failure } : placed;
       }
+
       const ask = { kind: 'needs-place' as const, name: path.basename(placeOf(lease, root)), branch: workspace.branch, start: workspace.start.commit };
       const adopt = request.kind === 'adopt' ? request.dir : await adoptedPlaceOf({ config, run: lock.run, branch: workspace.branch });
+
       if (adopt === undefined) return ask;
       const placed = await placeLeased(config, lock, leased, adopt);
+
       if (placed.kind === 'busy' && request.kind === 'adopt') return { ...ask, refused: heldPlaceRefusal({ ...placed, run: lock.run, attempt: lease.attempt }) };
+
       if (placed.kind !== 'refused') return placed;
+
       // The place an earlier attempt adopted no longer passes the checks, so the host makes another.
       return request.kind === 'adopt' ? { ...ask, refused: placed.failure.message } : ask;
     },
-    setup: (run, attempt, mode, signal) => runPlaceSetup({ config, run, attempt, mode, env, ...(signal ? { signal } : {}) }),
-    start: async (name, { inputs, checkout, caller }) => {
+    setup: (run, attempt, mode, signal) => runPlaceSetup({ config, run, attempt, mode, env, signal }),
+    start: async (name, { inputs, checkout, caller, timeout, alone }) => {
       const cached = await loadCachedWorkflow(config, name);
       const refused = invokeRefusal(cached?.definition, caller, { kind: 'start' });
+
       if (refused) return { error: refused };
       const base = checkout === undefined ? undefined : await headCommit(checkout);
-      return startRun(config, name, inputs ?? {}, { secrets: env.secrets, runMode: caller.mode, ...(checkout !== undefined ? { checkout } : {}), ...(base ? { base } : {}) });
+
+      return startRun(config, name, inputs ?? {}, { secrets: env.secrets, runMode: caller.mode, checkout, base, timeout, alone });
     },
     runVersion: async (runId) => {
       const run = await readRun(config, runId);
-      return typeof run === 'object' ? { status: run.status, revision: run.revision, receipts: run.deliveries?.length ?? 0, creating: (run.creating?.length ?? 0) > 0 } : undefined;
+
+      return run === 'missing' || run === 'corrupt' ? undefined : { status: run.status, revision: run.revision, receipts: run.deliveries?.length ?? 0, creating: (run.creating?.length ?? 0) > 0 };
     },
     next: async (runId, body, options) => {
       const parsed = parseNextPayload(body);
-      if (typeof parsed === 'string') return { error: { code: 'invalid_json', message: parsed } };
+
+      if (isRefusal(parsed)) return { error: { code: 'invalid_json', message: parsed } };
       const { driver, ...next } = parsed.request;
       const lease = (): Promise<WorkflowEnvelope> => leaseNext(config, runId, driver, { ...next, env });
       const run = RunIdSchema.safeParse(runId);
       const prepare = options?.prepare;
+
       if (prepare === undefined || !run.success) return withIgnored(await lease(), parsed.ignored);
-      return withIgnored(await withRunLock(config, run.data, async (lock) => (prepare === true
-        ? prepareLeased({ config, lock, driver, env, answer: await lease() })
-        : prepareAttempt({ config, lock, driver, env, next, ...prepare })), { waitMs: 0 }), parsed.ignored);
+
+      return withIgnored(await withRunLock(config, run.data, async (lock) => {
+        const answer = prepare === true ? await prepareLeased({ config, lock, driver, env, answer: await leaseNext(config, runId, driver, { ...next, env, prepare: true }) })
+            : await prepareAttempt({ config, lock, driver, env, next, ...prepare });
+
+        // A clone whose steps all settled is not needed any more.
+        await sweepClones(config, lock.run);
+
+        return answer;
+      }, { waitMs: 0 }), parsed.ignored);
     },
     report: async (runId, body, options) => {
       const parsed = parseReport(body);
-      if (typeof parsed === 'string') return { error: { code: 'invalid_report', message: parsed } };
-      return withIgnored(await managedReport({ config, runId, report: parsed.report, secrets: env.secrets, lock: options?.lock }), parsed.ignored);
+
+      if (isRefusal(parsed)) return { error: { code: 'invalid_report', message: parsed } };
+      const run = RunIdSchema.safeParse(runId);
+      const report = run.success ? await withPreparedCopy(config, run.data, parsed.report) : parsed.report;
+
+      return withIgnored(await managedReport({ config, runId, report, secrets: env.secrets, lock: options?.lock }), parsed.ignored);
     },
     respond: async (runId, step, choice, { via, ...answer }) => {
       if (via.kind === 'skill') return respondToHitl(config, runId, env.secrets, { step, choice, ...answer, provenance: respondProvenance(via) });
       const { evidence } = via.caller;
+
       if (evidence.kind === 'attempt') return { error: nestedWorkflowError({ kind: 'marker', attempt: evidence.attempt }) };
       const declared = via.json !== undefined ? parseResponsePayload(via.json) : undefined;
-      if (typeof declared === 'string') return { error: { code: 'invalid_json', message: declared } };
+
+      if (declared !== undefined && isRefusal(declared)) return { error: { code: 'invalid_json', message: declared } };
       const provenance = respondProvenance(declared ? { kind: 'driver-json', driver: declared.driver, caller: via.caller } : { kind: 'terminal', caller: via.caller });
+
       return withIgnored(await respondToHitl(config, runId, env.secrets, { step, choice, ...answer, provenance }), declared?.ignored ?? []);
     },
     retry: (runId, step) => retryStep(config, runId, env.secrets, step),
@@ -472,49 +629,65 @@ export function inProcessClient({ config, env }: { config: LocalConfig; env: Wor
     resume: async (runId, { lock, claim, checkout, ceiling, can, tool }) => {
       if (claim === 'none' && await readRun(config, runId) === 'missing') return { kind: 'not-here' };
       const resumed = await readiedHere(config, runId, claim, checkout);
+
       if (!resumed.ok) {
         const { error } = resumed;
+
         return error.code === 'not_owner'
           ? { kind: 'not-owner', owner: `${error.owner.user} (install ${error.owner.id})`, since: error.ownedAt }
           : { kind: 'failed', failure: { code: error.code, message: error.message } };
       }
+
       const run = await readRun(config, runId);
-      if (typeof run !== 'object') return { kind: 'failed', failure: { code: 'run_unreadable', message: `Run ${runId} cannot be read` } };
+
+      if (run === 'missing' || run === 'corrupt') return { kind: 'failed', failure: { code: 'run_unreadable', message: `Run ${runId} cannot be read` } };
       const { machine } = driverIdentity('local', checkout);
+
       for (const step of run.steps) {
         if (step.status !== 'leased' || step.lease.driver.kind !== 'local' || step.lease.driver.machine !== machine) continue;
         const { attempt, revision, driver } = step.lease;
         // That driver is gone, but the setup or command it detached may not be: it is stopped before the step is leased
         // again. An attempt id no lease could carry has no group recorded.
         const left = AttemptIdSchema.safeParse(attempt);
+
         if (left.success) await stopRecordedGroup(attemptDir(config, runId, left.data));
         const released = await managedReport({ config, runId, report: { attempt, revision, outcome: 'released', driver }, secrets: env.secrets, lock });
+
         if (isWorkflowError(released)) return { kind: 'failed', failure: released.error };
       }
+
       // An attempt of that driver the run already stopped, cancelled or expired, holds no lease, but what it detached may
       // still run beside the step's next attempt.
       for (const stopped of run.stoppedAttempts ?? []) {
         if (stopped.driver.kind !== 'local' || stopped.driver.machine !== machine) continue;
         const left = AttemptIdSchema.safeParse(stopped.attempt);
+
         if (left.success) await stopRecordedGroup(attemptDir(config, runId, left.data));
       }
+
       const unreconciled = await reconcileTakenCopies(config, runId, run.checkout ?? checkout);
+
       if (unreconciled) return { kind: 'failed', failure: unreconciled };
+
       const description = describeWorkflow({
         definition: run.definition, source: DefaultWorkflows.sourceOfRun(run), workflows: run.workflows ?? {}, ceiling, can, allow: config.workflows?.allow ?? {}, env: env.facts,
       });
+
       return { kind: 'ready', installed: resumed.value?.ownership === 'claimed', description, settled: settledSteps(run), status: run.status, judging: await judgingOf(config, description, tool, run.scorers) };
     },
     carried: async (runId, { published, claim, ceiling, can }) => {
       const carried = await carriedRun(config, runId, { published, claim });
+
       if (!carried.ok || carried.value === undefined) return undefined;
       const { definition, workflows, source, settled, status } = carried.value;
+
       return { description: describeWorkflow({ definition, source, workflows, ceiling, can, allow: config.workflows?.allow ?? {}, env: env.facts }), settled, status };
     },
     resumeRefusal: (runId, { caller, published }) => resumeRefusal(config, runId, caller, { published }),
     scoreNext: async (body) => {
       const request = parseJudgeRequest(body);
-      return typeof request === 'string' ? { error: { code: 'invalid_json', message: request } } : nextJudgeLease(config, request);
+
+      return isRefusal(request) ? { error: { code: 'invalid_json', message: request } } : nextJudgeLease(config, request);
     },
     judge: (ref, body, { group }) => runJudgeLease(config, ref, body, { group }),
   };
@@ -535,21 +708,27 @@ async function prepareAttempt(input: {
 }): Promise<WorkflowEnvelope> {
   const { config, lock, driver, env, next, attempt, adopt } = input;
   const run = await readRun(config, lock.run);
-  if (typeof run !== 'object') return { error: { code: 'run_unreadable', message: `Run ${lock.run} cannot be read, so attempt ${attempt} was not prepared` } };
+
+  if (run === 'missing' || run === 'corrupt') return { error: { code: 'run_unreadable', message: `Run ${lock.run} cannot be read, so attempt ${attempt} was not prepared` } };
   const running = run.steps.flatMap((step) => (step.status === 'leased' && step.lease.attempt !== attempt ? [step.lease.attempt] : []));
-  const answer = await leaseNext(config, lock.run, driver, { ...next, env, running, canTakeLease: false });
+  const answer = await leaseNext(config, lock.run, driver, { ...next, env, running, canTakeLease: false, prepare: true });
+
   if (!('data' in answer) || answer.data.done !== undefined) return answer;
   const leased = LeaseIdSchema.safeParse(answer.data.lease);
+
   if (!leased.success || leased.data.attempt !== attempt) {
     // The engine gives up a lease it would hand back to a driver whose can no longer covers the step, which waits again.
     const step = run.steps.find((candidate) => candidate.status === 'leased' && candidate.lease.attempt === attempt);
     const after = step ? await readRun(config, lock.run) : undefined;
-    if (step && typeof after === 'object' && after.steps.find((candidate) => candidate.id === step.id)?.status === 'pending') {
+
+    if (step && after !== undefined && after !== 'missing' && after !== 'corrupt' && after.steps.find((candidate) => candidate.id === step.id)?.status === 'pending') {
       return { error: { code: 'wrong_attempt', message: `Run ${lock.run} released attempt ${attempt} of step "${step.id}" when this driver asked for it back, since the can this next declares no longer covers the step, so it was not prepared. Call next without --attempt: the run leases the step again to a driver whose can covers it.` } };
     }
+
     return { error: { code: 'wrong_attempt', message: `Run ${lock.run} does not lease attempt ${attempt} to this driver, so it was not prepared. Prepare an attempt next leased this driver, or call next without --attempt.` } };
   }
-  return prepareLeased({ config, lock, driver, env, answer, ...(adopt !== undefined ? { adopt } : {}) });
+
+  return prepareLeased({ config, lock, driver, env, answer, adopt });
 }
 
 /**
@@ -561,29 +740,44 @@ async function prepareAttempt(input: {
  */
 async function prepareLeased(input: { config: LocalConfig; lock: RunLock; driver: DriverIdentity; env: WorkflowEnv; answer: WorkflowEnvelope; adopt?: string }): Promise<WorkflowEnvelope> {
   const { config, lock, driver, env, answer, adopt } = input;
+
   if (!('data' in answer) || answer.data.lease === undefined) return answer;
   // What names the lease is read first, so a lease whose place this teamai cannot read is still reported.
   const named = LeaseIdSchema.passthrough().safeParse(answer.data.lease);
+
   if (!named.success) return { error: { code: 'run_unreadable', message: `Run ${lock.run} returned a lease this teamai cannot read` } };
   const { attempt, revision } = named.data;
+
   const failed = async (failure: WorkflowFailure): Promise<WorkflowEnvelope> => {
     await reportAttempt(config, lock.run, { attempt, revision, driver, outcome: 'failed', message: failure.message, failure }, env.secrets);
+
     return { error: failure };
   };
+
   const leased = await leasedPlace(config, lock, answer.data.lease);
   const placed = leased.kind === 'leased' ? await placeLeased(config, lock, leased, adopt) : leased;
+
   if (placed.kind === 'refused') return { error: placed.failure };
+
   if (placed.kind === 'busy') {
     if (adopt !== undefined) return { error: { code: 'adopt_mismatch', message: heldPlaceRefusal({ ...placed, run: lock.run, attempt }) } };
+
     return { error: { code: 'busy', message: `Attempt ${attempt} of run ${lock.run} runs in ${placed.dir}, the place of attempt ${placed.behind}, which is still open, so it was not prepared. Report attempt ${placed.behind}, then prepare this one with next --prepare --attempt ${attempt}.` } };
   }
+
   if (placed.kind === 'failed') return failed(placed.failure);
   // Setup runs in the mode the lease keeps, else in the mode of the process that prepares the attempt; never in the
   // mode the run started in, since a run another machine claimed can run its passes in another mode.
   const mode = (leased.kind === 'leased' ? leased.mode : undefined) ?? resolveRunMode(process.env);
   const failure = await runPlaceSetup({ config, run: lock.run, attempt, mode, env });
+
   if (failure) return failed(failure);
-  return { data: { ...answer.data, lease: { ...named.data, cwd: placed.dir, ...(placed.prompt !== undefined ? { prompt: placed.prompt } : {}) } } };
+
+  const lease: { cwd: string; prompt?: string } & typeof named.data = { ...named.data, cwd: placed.dir };
+
+  if (placed.prompt !== undefined) lease.prompt = placed.prompt;
+
+  return { data: { ...answer.data, lease } };
 }
 
 /**
@@ -596,30 +790,58 @@ export async function managedReport(input: { config: LocalConfig; runId: string;
   const { config, runId, report, secrets, lock } = input;
   const attempt = AttemptIdSchema.safeParse(report.attempt);
   const run = RunIdSchema.safeParse(runId);
+
   if (!attempt.success || !run.success) return reportAttempt(config, runId, report, secrets);
+
   if (!await placeRecorded({ config, run: run.data, attempt: attempt.data })) return reportAttempt(config, runId, report, secrets);
   const settle = (held: RunLock): Promise<WorkflowEnvelope> => settleManaged({ config, lock: held, attempt: attempt.data, report, secrets });
+
   return lock ? settle(lock) : withRunLock(config, run.data, settle, { waitMs: 0 });
 }
 
+/** What an accepted report answers of the step it settled. */
+const AcceptedSchema = z.object({ step: z.object({ outcome: z.string() }) });
+
 async function settleManaged(input: { config: LocalConfig; lock: RunLock; attempt: AttemptId; report: ReportInput; secrets: Record<string, string> }): Promise<WorkflowEnvelope> {
   const { config, lock, attempt, report, secrets } = input;
+
   // Checked first, so finishing the place does not commit for an attempt the run would refuse.
   if (!await reportable(config, lock.run, report)) {
     const answer = await reportAttempt(config, lock.run, report, secrets);
+
     if (isWorkflowError(answer) && answer.error.code === 'lease_cancelled') await abandonPlace({ config, lock, attempt });
+
     return answer;
   }
+
   if (report.changes || report.read) return { error: { code: 'invalid_report', message: 'Prepared workspace reports fill changes/read automatically; omit those fields' } };
+
   if (report.outcome === 'released') {
     await abandonPlace({ config, lock, attempt });
+
     return reportAttempt(config, lock.run, report, secrets);
   }
-  const end: StepEnd = { outcome: report.outcome, ...(report.message !== undefined ? { message: report.message } : {}), ...(report.failure ? { failure: report.failure } : {}) };
+
+  const end: StepEnd = { outcome: report.outcome };
+
+  if (report.message !== undefined) end.message = report.message;
+
+  if (report.failure) end.failure = report.failure;
   const finished = await finishPlace({ config, lock, attempt, end, secrets });
-  const body = { ...report, ...finished };
+  // A limit goes only with a step that succeeded: a failure to keep its work replaces both.
+  const { limit, ...unlimited } = report;
+  const body: ReportInput = { ...unlimited, ...finished };
+
+  if (limit !== undefined && finished.outcome === 'success') body.limit = limit;
+  const staged = await stagePassEvidence({ config, lock, attempt, report: body });
   const answer = await reportAttempt(config, lock.run, body, secrets);
+  const outcome = AcceptedSchema.safeParse('data' in answer ? answer.data : undefined).data?.step.outcome;
+
+  // No judge reads the evidence of a pass that did not succeed, and nothing else removes it.
+  if (staged !== undefined && outcome !== 'success') await fs.rm(staged, { recursive: true, force: true, maxRetries: 3 });
+
   if ('data' in answer && answer.data.cleanup === true) await releasePlace({ config, lock, attempt });
+
   return answer;
 }
 
@@ -627,23 +849,42 @@ async function settleManaged(input: { config: LocalConfig; lock: RunLock; attemp
  * What a command step reports once it exited: `success` on status 0, else `failed` with its status and the start of
  * its stderr; and its whole stdout as its outputs, when that is JSON.
  */
-export function commandEnd(result: { exitCode: number; stdout: string; stderr: string }): { outcome: 'success' | 'failed'; exitCode: number; message?: string; outputs?: unknown } {
+/** How a command step ended, as its report carries it. */
+export interface CommandEnd {
+  outcome: 'success' | 'failed';
+  exitCode: number;
+  message?: string;
+  outputs?: JsonValue;
+}
+
+export function commandEnd(result: { exitCode: number; stdout: string; stderr: string }): CommandEnd {
   const { exitCode } = result;
   const outputs = commandOutputs(result.stdout);
   const snippet = result.stderr.trim().slice(0, 400);
-  return {
-    outcome: exitCode === 0 ? 'success' : 'failed', exitCode,
-    ...(exitCode !== 0 ? { message: snippet === '' ? `command exited with status ${exitCode}` : `command exited with status ${exitCode}: ${snippet}` } : {}),
-    ...(outputs !== undefined ? { outputs } : {}),
-  };
+  const end: CommandEnd = { outcome: exitCode === 0 ? 'success' : 'failed', exitCode };
+
+  if (exitCode !== 0) end.message = snippet === '' ? `command exited with status ${exitCode}` : `command exited with status ${exitCode}: ${snippet}`;
+
+  if (outputs !== undefined) end.outputs = outputs;
+
+  return end;
+}
+
+/** Whether an engine payload parser refused its payload: it answers the parsed payload, or the refusal as text. */
+export function isRefusal<TParsed extends object>(parsed: TParsed | string): parsed is string {
+  return !(parsed instanceof Object);
 }
 
 /** The outputs a command step reports: its whole stdout, when that is JSON. */
-export function commandOutputs(stdout: string): unknown {
+export function commandOutputs(stdout: string): JsonValue | undefined {
   const trimmed = stdout.trim();
+
   if (trimmed === '') return undefined;
+
   try {
-    return JSON.parse(trimmed) as unknown;
+    const outputs: JsonValue = JSON.parse(trimmed);
+
+    return outputs;
   } catch {
     return undefined;
   }

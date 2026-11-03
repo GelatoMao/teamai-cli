@@ -32,7 +32,7 @@ vi.mock('../utils/logger.js', () => {
 
 import { localAliasesPath } from '../models/aliases.js';
 import { reviewBranchDir, materializeRef, type BranchReview, type Finding } from '../review-branch.js';
-import { INVOKE_ALIAS_SINCE } from '../workflow/parse.js';
+import { INVOKE_ALIAS_SINCE, STEP_ROLE_SINCE } from '../workflow/parse.js';
 
 const BRANCH = 'teamai/push/tester/20260101-000000';
 
@@ -563,6 +563,63 @@ describe('reviewBranchDir — read-only health checks for a pushed branch (#776)
     expect(review.counts).toEqual({ fail: 4, warn: 2, info: 0 });
   });
 
+  it('warns that older CLIs drop a workflow with a step role, however deep the step is', async () => {
+    await fse.ensureDir(path.join(repoDir, 'manifest'));
+    await fse.writeFile(path.join(repoDir, 'manifest', 'roles.yaml'), 'version: 1\nroles:\n  - id: review\n    resources: { knowledge: [], skills: [review] }\n');
+    await writeWorkflow(repoDir, 'review', `schemaVersion: v1alpha1
+name: review
+description: Review in a clean clone.
+steps:
+  - id: outer
+    workflow:
+      steps:
+        - id: review
+          role: review
+          workspace:
+            clone:
+              commit: ${'a'.repeat(40)}
+              team: { revision: ${'b'.repeat(40)}, selection: { additionalRoles: [], projects: [], excludedSkills: [] }, treatment: pulled }
+          command: echo review
+`);
+
+    const review = await reviewBranchDir(BRANCH, repoDir);
+
+    expect(review.findings).toContainEqual({
+      level: 'warn', check: 'workflows', path: 'workflows/review.yaml',
+      message: `workflows/review.yaml sets role on step outer.review: teamai before ${STEP_ROLE_SINCE} drops a workflow that sets a step role, so members and CI jobs must run at least ${STEP_ROLE_SINCE}.`,
+    });
+  });
+
+  it('warns that older CLIs drop a workflow that sets defaults.role, or a role on a workflow step', async () => {
+    await fse.ensureDir(path.join(repoDir, 'manifest'));
+    await fse.writeFile(path.join(repoDir, 'manifest', 'roles.yaml'), 'version: 1\nroles:\n  - id: review\n    resources: { knowledge: [], skills: [review] }\n');
+    await writeWorkflow(repoDir, 'review', `schemaVersion: v1alpha1
+name: review
+description: Review the change as a reviewer.
+defaults:
+  role: review
+steps:
+  - id: change
+    workspace: new
+    prompt: Review the change.
+  - id: checks
+    needs: []
+    role: review
+    workflow:
+      steps:
+        - id: fix
+          workspace: new
+          prompt: Fix what the review found.
+`);
+
+    const review = await reviewBranchDir(BRANCH, repoDir);
+
+    expect(review.findings).toContainEqual({
+      level: 'warn', check: 'workflows', path: 'workflows/review.yaml',
+      message: `workflows/review.yaml sets defaults.role and role on step checks: teamai before ${STEP_ROLE_SINCE} drops a workflow that sets a role, so members and CI jobs must run at least ${STEP_ROLE_SINCE}.`,
+    });
+  });
+
   it('fails a workflow whose prompt file is missing', async () => {
     await writeWorkflow(repoDir, 'release', MISSING_PROMPT);
 
@@ -577,6 +634,43 @@ describe('reviewBranchDir — read-only health checks for a pushed branch (#776)
         message: 'workflows/release.yaml:6: field "steps[0].prompt_file": prompt_file "prompts/release.md" must be a readable, non-symlink file under prompts/',
       },
     ]);
+  });
+
+  it('fails a shared workflow a role overrides, which a member the team assigned no role still pulls', async () => {
+    await fse.outputFile(path.join(repoDir, 'manifest', 'roles.yaml'), 'version: 1\nroles:\n  - id: ops\n    resources: { knowledge: [], skills: [], workflows: [ops] }\n');
+    await fse.outputFile(path.join(repoDir, 'manifest', 'members.yaml'), 'version: 1\nmembers:\n  alice: [ops]\n');
+    await writeWorkflow(repoDir, 'release', MISSING_PROMPT);
+    await fse.outputFile(path.join(repoDir, 'workflows', 'ops', 'release.yaml'), VALID_BUILD.replace('name: build', 'name: release'));
+
+    const review = await reviewBranchDir(BRANCH, repoDir);
+
+    expect(review.findings).toContainEqual({
+      level: 'fail',
+      check: 'workflows',
+      path: 'workflows/release.yaml',
+      message: 'workflows/release.yaml:6: field "steps[0].prompt_file": prompt_file "prompts/release.md" must be a readable, non-symlink file under prompts/',
+    });
+  });
+
+  it('fails a shared workflow a role overrides, for members whose assigned roles roles.yaml no longer declares', async () => {
+    await fse.outputFile(path.join(repoDir, 'manifest', 'roles.yaml'), 'version: 1\nroles:\n  - id: ops\n    resources: { knowledge: [], skills: [], workflows: [ops] }\n');
+    await fse.outputFile(path.join(repoDir, 'manifest', 'members.yaml'), 'version: 1\nmembers:\n  alice: [ops]\ndefault: [retired]\n');
+    await writeWorkflow(repoDir, 'release', MISSING_PROMPT);
+    await fse.outputFile(path.join(repoDir, 'workflows', 'ops', 'release.yaml'), VALID_BUILD.replace('name: build', 'name: release'));
+
+    const review = await reviewBranchDir(BRANCH, repoDir);
+
+    expect(review.findings).toContainEqual(expect.objectContaining({ level: 'fail', path: 'workflows/release.yaml' }));
+  });
+
+  it('passes a shared workflow whose prompt only a role\'s namespace holds, in a team that assigns no roles', async () => {
+    await fse.outputFile(path.join(repoDir, 'manifest', 'roles.yaml'), 'version: 1\nroles:\n  - id: ops\n    resources: { knowledge: [], skills: [], prompts: [ops] }\n');
+    await fse.outputFile(path.join(repoDir, 'prompts', 'ops', 'release.md'), 'Write the release notes.\n');
+    await writeWorkflow(repoDir, 'release', MISSING_PROMPT);
+
+    const review = await reviewBranchDir(BRANCH, repoDir);
+
+    expect(review.findings.filter((finding) => finding.level === 'fail')).toEqual([]);
   });
 
   it('fails a workflow and the workflow that runs it when the child has no runnable version', async () => {
@@ -600,6 +694,60 @@ describe('reviewBranchDir — read-only health checks for a pushed branch (#776)
         message: 'workflows/ship.yaml:6: field "steps[0].workflow": step "run" runs workflow "check", which has no runnable version; fix or add workflows/check.yaml',
       },
     ]);
+  });
+
+  it('fails an invalid namespaced workflow of a team with a projects manifest once, whichever projects receive it', async () => {
+    await fse.outputFile(path.join(repoDir, 'manifest', 'projects.yaml'), [
+      'version: 1',
+      'projects:',
+      '  - id: svc-a',
+      '    resources: { skills: [], workflows: [svc] }',
+      '  - id: svc-b',
+      '    resources: { skills: [], workflows: [svc] }',
+      '',
+    ].join('\n'));
+    await fse.outputFile(path.join(repoDir, 'workflows', 'svc', 'build.yaml'), `${VALID_BUILD}\ncolour: blue\n`);
+
+    const review = await reviewBranchDir(BRANCH, repoDir);
+
+    expect(review.ok).toBe(false);
+    expect(review.findings).toEqual([{
+      level: 'fail',
+      check: 'workflows',
+      path: 'workflows/svc/build.yaml',
+      message: expect.stringContaining('"colour"'),
+    }]);
+  });
+
+  it('fails a namespaced workflow step of a team with a projects manifest that lists a missing scorer once, whichever projects receive it', async () => {
+    await fse.outputFile(path.join(repoDir, 'manifest', 'projects.yaml'), [
+      'version: 1',
+      'projects:',
+      '  - id: svc-a',
+      '    resources: { skills: [], workflows: [svc] }',
+      '  - id: svc-b',
+      '    resources: { skills: [], workflows: [svc] }',
+      '',
+    ].join('\n'));
+    await fse.outputFile(path.join(repoDir, 'workflows', 'svc', 'ship.yaml'), [
+      'schemaVersion: v1alpha1',
+      'name: ship',
+      'description: Ship it.',
+      'steps:',
+      '  - id: plan',
+      '    prompt: Plan it.',
+      '    scorers: [nope]',
+    ].join('\n'));
+
+    const review = await reviewBranchDir(BRANCH, repoDir);
+
+    expect(review.ok).toBe(false);
+    expect(review.findings).toEqual([{
+      level: 'fail',
+      check: 'workflows',
+      path: 'workflows/svc/ship.yaml',
+      message: 'workflows/svc/ship.yaml: step "plan" lists scorer "nope", which has no valid scorers/nope.md; the step runs without it',
+    }]);
   });
 });
 
@@ -1170,7 +1318,7 @@ describe('reviewBranchDir — scorers', () => {
     const scoring = (file: string, message: string) => ({ level: 'fail', check: 'scorers', path: `scorers/${file}`, message });
     expect(review.findings).toEqual([
       scoring('dev/scoring.yaml', 'scorers/dev/scoring.yaml: batch is "maybe", not true or false, so it is ignored'),
-      scoring('dev/scoring.yaml', 'scorers/dev/scoring.yaml: "isolaton" is not a scoring setting (batch, isolation, sessions, daily_limit), so it is ignored'),
+      scoring('dev/scoring.yaml', 'scorers/dev/scoring.yaml: "isolaton" is not a scoring setting (batch, isolation, sessions, skill_routing, daily_limit), so it is ignored'),
       scoring('qa/scoring.yaml', expect.stringMatching(/^scorers\/qa\/scoring\.yaml is not valid YAML: /)),
       scoring('shared/scoring.yaml', 'scorers/shared/scoring.yaml isolation is "strict", which is not verified or best-effort, so it counts as verified'),
     ]);
@@ -1404,6 +1552,100 @@ describe('reviewBranchDir — model aliases', () => {
     expect(modelFindings(await reviewBranchDir(BRANCH, repoDir))).toEqual([{
       level: 'fail', check: 'models', path: 'scorers/ops/quality.md',
       message: 'Scorer "quality" asks for model alias "fast", which has no model for any tool in models/aliases.yaml (role ops). Add one, or remove model from the scorer.',
+    }]);
+  });
+});
+
+describe('reviewBranchDir — benchmarks', () => {
+  let repoDir: string;
+
+  beforeEach(async () => {
+    repoDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-review-benchmarks-'));
+  });
+
+  afterEach(async () => {
+    await fse.remove(repoDir);
+  });
+
+  it('fails a 7-arm suite', async () => {
+    const arms = ['a', 'b', 'c', 'd', 'e', 'f', 'g'].map((name) => `  - { name: ${name}, tool: ${name} }`);
+    await fse.outputFile(path.join(repoDir, 'benchmarks', 'fix', 'suite.yaml'), [
+      'schemaVersion: v1alpha1', 'name: fix', 'repo: https://github.com/acme/app.git', 'defaults: { tool: claude }', 'arms:', ...arms, 'timeout: 1h', '',
+    ].join('\n'));
+    await fse.outputFile(path.join(repoDir, 'benchmarks', 'fix', 'tasks', 'fix.yaml'), [
+      'schemaVersion: v1alpha1', 'title: Fix it', 'prompt: Make the test pass.', `startingCommit: ${'a'.repeat(40)}`, 'check: { run: node test.js, protect: [test.js] }', '',
+    ].join('\n'));
+
+    const review = await reviewBranchDir(BRANCH, repoDir);
+
+    expect(review.ok).toBe(false);
+    expect(review.findings).toEqual([{
+      level: 'fail',
+      check: 'workflows',
+      path: 'benchmarks/fix/suite.yaml',
+      message: 'benchmarks/fix/suite.yaml:6: field "arms": a suite has 1 to 6 arms',
+    }]);
+  });
+
+  it('reads the files check.add names from the suite directory on the branch, and fails a task whose from names none', async () => {
+    await fse.outputFile(path.join(repoDir, 'benchmarks', 'fix', 'suite.yaml'), [
+      'schemaVersion: v1alpha1', 'name: fix', 'repo: https://github.com/acme/app.git', 'defaults: { tool: claude }', 'arms: [{ name: claude }]', 'timeout: 1h', '',
+    ].join('\n'));
+    const task = (from: string): string[] => [
+      'schemaVersion: v1alpha1', 'title: Fix it', 'prompt: Make the test pass.', `startingCommit: ${'a'.repeat(40)}`,
+      'check:', '  run: node test.js', "  protect: ['test/**']", '  add:', `    - from: ${from}`, '      to: test/refresh.test.js', '',
+    ];
+    await fse.outputFile(path.join(repoDir, 'benchmarks', 'fix', 'tasks', 'found.yaml'), task('check-files/refresh.test.js').join('\n'));
+    await fse.outputFile(path.join(repoDir, 'benchmarks', 'fix', 'tasks', 'missing.yaml'), task('check-files/missing.test.js').join('\n'));
+    await fse.outputFile(path.join(repoDir, 'benchmarks', 'fix', 'check-files', 'refresh.test.js'), 'assert(true);\n');
+
+    const review = await reviewBranchDir(BRANCH, repoDir);
+
+    expect(review.ok).toBe(false);
+    expect(review.findings).toEqual([{
+      level: 'fail',
+      check: 'workflows',
+      path: 'benchmarks/fix/tasks/missing.yaml',
+      message: 'benchmarks/fix/tasks/missing.yaml:9: field "check.add.0.from": "check-files/missing.test.js" is no file or directory of the suite directory; a symlink is not one',
+    }]);
+  });
+
+  it('fails a suite whose trial.timeout is not shorter than its timeout, with the line', async () => {
+    await fse.outputFile(path.join(repoDir, 'benchmarks', 'fix', 'suite.yaml'), [
+      'schemaVersion: v1alpha1', 'name: fix', 'repo: https://github.com/acme/app.git', 'defaults: { tool: claude }', 'arms: [{ name: claude }]', 'timeout: 45m', 'trial: { timeout: 1h }', '',
+    ].join('\n'));
+    await fse.outputFile(path.join(repoDir, 'benchmarks', 'fix', 'tasks', 'fix.yaml'), [
+      'schemaVersion: v1alpha1', 'title: Fix it', 'prompt: Make the test pass.', `startingCommit: ${'a'.repeat(40)}`, 'check: { run: node test.js, protect: [test.js] }', '',
+    ].join('\n'));
+
+    const review = await reviewBranchDir(BRANCH, repoDir);
+
+    expect(review.ok).toBe(false);
+    expect(review.findings).toEqual([{
+      level: 'fail',
+      check: 'workflows',
+      path: 'benchmarks/fix/suite.yaml',
+      message: 'benchmarks/fix/suite.yaml:7: field "trial.timeout": trial.timeout must be shorter than timeout, which bounds the whole run',
+    }]);
+  });
+
+  it('fails a suite that lists a scorer the branch does not have', async () => {
+    await writeScorer(repoDir, 'quality.md', VALID_SCORER);
+    await fse.outputFile(path.join(repoDir, 'benchmarks', 'fix', 'suite.yaml'), [
+      'schemaVersion: v1alpha1', 'name: fix', 'repo: https://github.com/acme/app.git', 'defaults: { tool: claude }', 'arms: [{ name: claude }]', 'timeout: 1h', 'scorers: [quality, nope]', '',
+    ].join('\n'));
+    await fse.outputFile(path.join(repoDir, 'benchmarks', 'fix', 'tasks', 'fix.yaml'), [
+      'schemaVersion: v1alpha1', 'title: Fix it', 'prompt: Make the test pass.', `startingCommit: ${'a'.repeat(40)}`, 'check: { run: node test.js, protect: [test.js] }', '',
+    ].join('\n'));
+
+    const review = await reviewBranchDir(BRANCH, repoDir);
+
+    expect(review.ok).toBe(false);
+    expect(review.findings).toEqual([{
+      level: 'fail',
+      check: 'workflows',
+      path: 'benchmarks/fix/suite.yaml',
+      message: 'benchmarks/fix/suite.yaml: suite "fix" lists scorer "nope", which has no valid scorers/nope.md; the benchmark does not start without it',
     }]);
   });
 });

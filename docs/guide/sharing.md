@@ -85,8 +85,9 @@ related:
 
 `MAPS_TO` points at a teamwiki code page, `REFERENCES` at any asset, and
 `SUPERSEDES` / `CONFLICTS_WITH` at a rule, doc or learning. `teamai recall`
-prints each declared relation as a `Related:` line on the hit, so a session
-that recalls one end of the relation starts with the other end too.
+prints each declared relation as a `Related:` line on the hit, and each
+`paths:`-glob-derived one (knowledge guide), so a session that recalls one end
+of the relation starts with the other end too.
 `teamai review --branch` fails a rule or doc whose `related:` block uses a
 relation outside that table; a relation that points at an asset not on the
 branch is a warning, not a failure.
@@ -349,6 +350,8 @@ servers:
 
 Write secrets as `${VAR}` and declare the key in `env/secrets.yaml`. A server for one project goes in `mcp/<ns>/mcp.yaml`.
 
+For stdio servers, `env` keys stay literal in Codex's TOML: `HTTP.PROXY` is one variable, and names such as `ProgramFiles(x86)` are quoted automatically.
+
 ZCode servers use `mcp.servers` in `~/.zcode/cli/config.json` or the project's `.zcode/config.json`. This follows the 3.16.2 source; 3.15.1 is not certified. Pull moves only unchanged teamai entries out of `~/.agents/mcp.json`. Doctor names other servers there because the desktop app stops reading that fallback once the native config has servers.
 
 Antigravity takes user servers in `~/.gemini/config/mcp_config.json`. It reads a project's servers only from a plugin, so teamai writes them as one:
@@ -362,7 +365,7 @@ agy takes stdio and HTTP servers, with no `type`; pull skips an `sse` server for
 
 WorkBuddy uses the first existing user file in `~/.workbuddy/.mcp.json`, `~/.workbuddy/mcp.json`, and `~/.codebuddy.json`. `CODEBUDDY_CONFIG_DIR` moves the last file. A project uses `.mcp.json`, or `mcp.json` when only that exists. With `sharing.gitExclude` on, its servers use `projects[<project path>].mcpServers` in `.codebuddy.json`. These paths follow the CodeBuddy 2.168.0 engine; WorkBuddy's launcher binding is not certified. Pull removes only unchanged teamai entries from the former `.workbuddy/mcp.json` project file.
 
-When `.workbuddy-ai/` exists in the home or project (WorkBuddy 5.7+), the default skills path moves to `.workbuddy-ai/skills`. Every other surface still waits for `.workbuddy/`, so a member with only `.workbuddy-ai/` gets no rules, team instructions, agents, MCP servers or hooks, and `teamai doctor` fails `workbuddy receives ...` with the ones held.
+When `.workbuddy-ai/` exists in the home or project (WorkBuddy AI, the international edition), the default skills path moves to `.workbuddy-ai/skills`. Every other surface still waits for `.workbuddy/`, so a member with only `.workbuddy-ai/` gets no rules, team instructions, agents, MCP servers or hooks, and `teamai doctor` fails `workbuddy receives ...` with the ones held.
 
 When a tool's home or configured MCP path moves, pull leaves old copies in place and names them once. Remove them after no tool reads them. Doctor reports unread mappings, moved files, and project MCP that is read only from a session started at the project root. Internal builds with an unknown MCP channel get a note instead of a guessed config.
 
@@ -398,6 +401,43 @@ profiles:
 ```bash
 teamai models switch tokenhub
 ```
+
+## Push one file to an exact path
+
+`teamai push --file <local file> --path <team path>` proposes one file, byte for byte, at one team path, as a pull request. Nothing else in your team clone joins it, and nothing rewrites or moves it:
+
+```console
+$ teamai push --file /tmp/refresh-race.yaml --path benchmarks/fix-auth/tasks/refresh-race.yaml
+✔ Pull Request created: https://github.com/acme/team/pull/77
+
+$ teamai push --file ./review.md --path scorers/review.md
+✔ Pull Request created: https://github.com/acme/team/pull/78
+
+$ teamai push --file /tmp/refresh-race.yaml --path benchmarks/fix-auth/tasks/refresh-race.yaml   # the same bytes again
+ℹ No changes to push: benchmarks/fix-auth/tasks/refresh-race.yaml already holds these bytes on main.
+
+$ teamai push --file /tmp/refresh-race.yaml --path benchmarks/fix-auth/refresh-race.yaml
+✖ benchmarks/fix-auth/refresh-race.yaml is not a benchmark task path. A task goes in benchmarks/<suite>/tasks/<task>.yaml or benchmarks/<namespace>/<suite>/tasks/<task>.yaml.
+
+$ teamai push --file /tmp/refresh-race.yaml --path benchmarks/missing/tasks/refresh-race.yaml
+✖ benchmarks/missing/suite.yaml does not exist, so benchmarks/missing/tasks/refresh-race.yaml belongs to no suite. Pick a suite the team repo has under benchmarks/.
+
+$ teamai push --file /tmp/refresh-race.yaml --path benchmarks/fix-auth/tasks/refresh-race.yaml --role web
+✖ --path names the destination, so it cannot be combined with --skill, --role, --project, --shared, --all or --carried.
+```
+
+[teamai-session-to-task](benchmarks.md#turn-a-session-into-a-task) proposes the task file it drafts this way.
+
+| Flags | Result |
+| --- | --- |
+| `--file` and `--path` | Pushes that file to that path on a new branch from the default branch, without asking, and opens the pull request as `push` does. Your team clone's files, index and branch stay as they were. |
+| only one of them | Refused: they go together. |
+| with `--skill`, `--role`, `--project`, `--shared`, `--all` or `--carried` | Refused, as above. |
+| with `--branch` | Pushes to that branch, which cannot be the default branch. When the branch already has an open pull request, it is rebuilt from the default branch with this file and that pull request is updated, not a new one opened: run the same command again after you edit the file. The rebuild holds only this file, so a file an earlier push put on the branch leaves the pull request. A branch origin already has with no open pull request is refused, so its commits stay. |
+| `--path` outside `skills/`, `rules/`, `scorers/`, `benchmarks/` or another directory teamai pulls, with `..`, or through a symlink in the team repo | Refused. |
+| `--path` under `benchmarks/` | Must be a task of a suite the default branch has. |
+
+In single-repo mode the pull request holds `.teamai/<path>`, and your checkout's files, index and `HEAD` stay as they were.
 
 ## Packages
 

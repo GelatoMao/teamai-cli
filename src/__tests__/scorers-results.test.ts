@@ -132,6 +132,83 @@ describe('scorer results', () => {
       expect(groups(labels, 'teamRevision')).toEqual([`${REV_A} n=3`]);
     });
 
+    it('groups a pass in a workflow copy under the role the copy ran with, not the member\'s', () => {
+      const selection = { scope: 'project' as const, primaryRole: 'frontend', additionalRoles: [] };
+      const labels = [
+        viewed(sessionLabel(), { agent: observed({ team: { revision: REV_A, localChanges: false, selection: { ...selection, stepRole: 'review' } } }) }),
+        viewed(sessionLabel(), { agent: observed({ team: { revision: REV_A, localChanges: false, selection } }) }),
+      ];
+      expect(groups(labels, 'role')).toEqual(['frontend n=1', 'review n=1']);
+    });
+
+    it("says whether each role group ran with the step's role, the member's, or both", () => {
+      const team = (selection: { primaryRole: string; stepRole?: string }) => ({ revision: REV_A, localChanges: false, selection: { scope: 'project' as const, additionalRoles: [], ...selection } });
+      const labels = [
+        viewed(sessionLabel(), { agent: observed({ team: team({ primaryRole: 'frontend', stepRole: 'review' }) }) }),
+        viewed(sessionLabel(), { agent: observed({ team: team({ primaryRole: 'frontend' }) }) }),
+        viewed(sessionLabel(), { agent: observed({ team: team({ primaryRole: 'frontend', stepRole: 'spec' }) }) }),
+        viewed(sessionLabel(), { agent: observed({ team: team({ primaryRole: 'spec' }) }) }),
+        viewed(sessionLabel()),
+      ];
+      const roleGroups = ScorerResults.of({ labels, query: { windowDays: 30, groupBy: 'role' }, now: NOW }).selected?.groups
+        ?.map((group) => (group.kind === 'value' ? `${group.value} ${group.roleOf ?? '-'}` : group.kind));
+      expect(roleGroups).toEqual(['spec both', 'frontend member', 'review step', 'not recorded']);
+      expect(groups(labels, 'tool')).toEqual(['claude n=4', 'not recorded n=1']);
+    });
+
+    it("sums a selected group's failing labels by the harness each ran with, the most failures first, past the listed page", () => {
+      const REV_B = 'b'.repeat(40);
+      const ranAs = ({ model, effort, revision, role }: { model: string; effort?: string; revision: string; role: string }) => observed({
+        model: { reported: model }, ...(effort ? { effort: { requested: effort } } : {}),
+        team: { revision, localChanges: false, selection: { scope: 'project', primaryRole: 'frontend', additionalRoles: [], stepRole: role } },
+      });
+      const failed = (agent: RecordedAgent) => viewed(sessionLabel({ passed: false, label: 'poor', score: 0 }), { agent });
+      const sonnet = ranAs({ model: 'claude-sonnet-5-5', effort: 'high', revision: REV_A, role: 'spec' });
+      const labels = [
+        failed(sonnet),
+        failed(ranAs({ model: 'claude-opus-5-5', revision: REV_B, role: 'spec' })),
+        failed(sonnet),
+        viewed(sessionLabel(), { agent: sonnet }),
+        failed(ranAs({ model: 'claude-opus-5-5', revision: REV_B, role: 'review' })),
+      ];
+      const spec = JSON.stringify(['value', 'spec', null, false]);
+      const failing = ScorerResults.of({ labels, query: { windowDays: 30, groupBy: 'role', failing: { group: spec, limit: 1 } }, now: NOW }).selected?.failing;
+
+      expect(failing?.labels).toHaveLength(1);
+      expect(failing?.byHarness).toEqual([
+        { harness: { tool: 'claude', model: 'claude-sonnet-5-5', effort: 'high', role: { of: 'step', names: ['spec'] }, teamRevision: REV_A }, failed: 2 },
+        { harness: { tool: 'claude', model: 'claude-opus-5-5', role: { of: 'step', names: ['spec'] }, teamRevision: REV_B }, failed: 1 },
+      ]);
+      expect(ScorerResults.of({ labels, query: { windowDays: 30, groupBy: 'role' }, now: NOW }).selected?.failing).not.toHaveProperty('byHarness');
+    });
+
+    it("gives each group its pass rate's 95% Wilson interval, as a benchmark arm's, so 1 of 1 weighs less than 20 of 20", () => {
+      const on = (stepRole: string) => observed({ team: { revision: REV_A, localChanges: false, selection: { scope: 'project', primaryRole: 'frontend', additionalRoles: [], stepRole } } });
+      const labels = [viewed(sessionLabel(), { agent: on('spec') }), ...Array.from({ length: 20 }, () => viewed(sessionLabel(), { agent: on('review') })),
+        viewed(sessionLabel(), { agent: on('plan') }), viewed(sessionLabel({ passed: false, label: 'poor', score: 0 }), { agent: on('plan') })];
+      const intervals = Object.fromEntries((ScorerResults.of({ labels, query: { windowDays: 30, groupBy: 'role' }, now: NOW }).selected?.groups ?? [])
+        .map((group) => [group.kind === 'value' ? group.value : group.kind, [group.interval.low, group.interval.high].map((bound) => Math.round(bound * 1000) / 1000)]));
+
+      expect(intervals).toEqual({ review: [0.839, 1], plan: [0.095, 0.905], spec: [0.207, 1] });
+    });
+
+    it("names the team revision a selected group's labels started failing on, only when they passed before it and failed from it on", () => {
+      const [REV_B, REV_C] = ['b'.repeat(40), 'c'.repeat(40)];
+      const on = (revision: string) => observed({ team: { revision, localChanges: false, selection: { scope: 'project', primaryRole: 'frontend', additionalRoles: [], stepRole: 'spec' } } });
+      const scored = (day: number, passed: boolean, revision: string) => viewed(sessionLabel({ passed, label: passed ? 'good' : 'poor', score: passed ? 1 : 0, scoredAt: `2026-03-${String(day).padStart(2, '0')}T10:00:00.000Z` }), { agent: on(revision) });
+      const spec = JSON.stringify(['value', 'spec', null, false]);
+      const changeOf = (labels: ViewedLabel[], group: string | null = spec) => ScorerResults.of({ labels, query: { windowDays: 30, groupBy: 'role', ...(group ? { failing: { group } } : {}) }, now: NOW }).selected?.failing.revisionChange;
+      // Passed on a, then failed on b and on c: b is where it turned.
+      const turned = [scored(12, false, REV_B), scored(10, true, REV_A), scored(13, false, REV_C), scored(11, true, REV_A)];
+
+      expect(changeOf(turned)).toEqual({ lastPassed: REV_A, firstFailed: REV_B });
+      expect(changeOf(turned, null)).toBeUndefined();
+      // A pass after the first failure, a revision that both passed and failed, or no pass at all is no clear change.
+      expect(changeOf([...turned, scored(14, true, REV_C)])).toBeUndefined();
+      expect(changeOf([scored(10, true, REV_A), scored(11, false, REV_A), scored(12, false, REV_B)])).toBeUndefined();
+      expect(changeOf([scored(10, false, REV_A), scored(11, false, REV_B)])).toBeUndefined();
+    });
+
     it('counts a label under every skill it used, and one that used none under none', () => {
       const labels = [
         viewed(sessionLabel({ used: { skills: ['tdd', 'review'] } })),
@@ -160,7 +237,7 @@ describe('scorer results', () => {
     expect(selected?.groups?.find((group) => group.kind === 'value' && group.value === 'tdd')?.split).toMatchObject({ before: { n: 1 }, after: { n: 1 }, notRecorded: { n: 2 } });
   });
 
-  it('lists the failing labels of a cohort newest first, with their author, platform, skills and session name only', () => {
+  it('lists the failing labels of a cohort newest first, with their author, platform, skills, session name and start only', () => {
     const labels = [
       viewed(sessionLabel({ passed: false, label: 'poor', scoredAt: '2026-03-12T00:00:00.000Z', used: { skills: ['tdd'] } }), { author: 'bob', sessionName: 'fix-login' }),
       viewed(sessionLabel({ passed: true })),
@@ -168,9 +245,11 @@ describe('scorer results', () => {
     ];
     expect(ScorerResults.of({ labels, query: { windowDays: 30 }, now: NOW }).selected?.failing).toEqual({
       total: 2,
+      covered: 0,
+      startable: 0,
       labels: [
-        { author: 'alice', scoredAt: '2026-03-15T00:00:00.000Z', label: 'poor', source: 'session', platform: 'claude' },
-        { author: 'bob', scoredAt: '2026-03-12T00:00:00.000Z', label: 'poor', source: 'session', platform: 'claude', skills: ['tdd'], sessionName: 'fix-login' },
+        { author: 'alice', scoredAt: '2026-03-15T00:00:00.000Z', label: 'poor', source: 'session', platform: 'claude', start: { refused: 'not_recorded' } },
+        { author: 'bob', scoredAt: '2026-03-12T00:00:00.000Z', label: 'poor', source: 'session', platform: 'claude', skills: ['tdd'], sessionName: 'fix-login', start: { refused: 'not_recorded' } },
       ],
     });
   });
@@ -258,6 +337,67 @@ describe('scorer results', () => {
   });
 });
 
+describe('what decided workflow labels', () => {
+  /** A label of `delivered` on a delivering pass, decided by `decidedBy`, passing only when the judge passed it. */
+  function delivered(decidedBy: 'check' | 'ci' | 'protected' | 'judge' | undefined, passed: boolean, pass: number): ScoreLabel {
+    return {
+      ...sessionLabel(), scorer: 'delivered', label: passed ? 'complete' : 'partial', score: passed ? 1 : 0.5, passed,
+      source: 'workflow', subject: { runId: 'run-1', step: 'change', pass }, ...(decidedBy ? { decidedBy } : {}),
+    };
+  }
+  const labels = [
+    delivered('ci', false, 1), delivered('ci', false, 2), delivered('check', false, 3), delivered('protected', false, 4),
+    delivered('judge', true, 5), delivered('judge', true, 6), delivered('judge', false, 7), delivered(undefined, true, 8),
+  ].map((label) => viewed(label));
+
+  it('says how many labels each stage decided, how many never reached a judge, and how the judge did on the rest', () => {
+    const decided = ScorerResults.of({ labels, query: { windowDays: 30 }, now: NOW }).selected?.decided;
+
+    expect(decided?.rows.map(({ by, stats }) => ({ by, stats }))).toEqual([
+      { by: 'judge', stats: { n: 3, passed: 2, failed: 1, rate: 2 / 3 } },
+      { by: 'ci', stats: { n: 2, passed: 0, failed: 2, rate: 0 } },
+      { by: 'check', stats: { n: 1, passed: 0, failed: 1, rate: 0 } },
+      { by: 'protected', stats: { n: 1, passed: 0, failed: 1, rate: 0 } },
+      { by: 'not recorded', stats: { n: 1, passed: 1, failed: 0, rate: 1 } },
+    ]);
+    expect(decided?.beforeJudge).toBe(4);
+  });
+
+  it('groups by what decided a label, and lists each failing label with the stage that decided it', () => {
+    const ci = ScorerResults.of({ labels, query: { windowDays: 30 }, now: NOW }).selected?.decided?.rows.find((row) => row.by === 'ci')?.key;
+    const selected = ScorerResults.of({ labels, query: { windowDays: 30, groupBy: 'decidedBy', failing: { group: ci } }, now: NOW }).selected;
+
+    expect(selected?.groups?.map((group) => `${group.kind === 'value' ? group.value : group.kind} ${group.stats.n}`)).toEqual(['judge 3', 'ci 2', 'check 1', 'protected 1', 'not recorded 1']);
+    expect(selected?.failing.labels.map((failing) => failing.decidedBy)).toEqual(['ci', 'ci']);
+    expect(selected?.decided?.rows.map((row) => row.key)).toEqual(selected?.groups?.map((group) => group.key));
+  });
+
+  it('counts a label a stage decided in the measurement of the judge tool it names, though that judge reported no model for it', () => {
+    // A stage label names the judge the lease chose, which never reported a model; the judge's own labels did.
+    const judge = (tool: string, model: { requested: string } | { reported: string }) => ({ kind: 'model' as const, tool, model, isolation: 'verified' as const, access: 'read' as const });
+    const claudeStage = { ...delivered('ci', false, 9), judge: judge('claude', { requested: 'haiku' }) };
+    const codexJudged = { ...delivered('judge', true, 10), judge: judge('codex', { reported: 'gpt-5.1-codex' }) };
+    const codexStage = { ...delivered('check', false, 11), judge: judge('codex', { requested: 'gpt-5.1-codex' }) };
+    const all = [...labels, viewed(claudeStage), viewed(codexJudged), viewed(codexStage)];
+    const view = ScorerResults.of({ labels: all, query: { windowDays: 30 }, now: NOW });
+
+    expect(view.scorers[0]?.cohorts.map((cohort) => `${cohort.judge.kind === 'model' ? cohort.judge.tool : 'human'} ${cohort.stats.n}`).sort()).toEqual(['claude 9', 'codex 2']);
+    const claude = view.scorers[0]?.cohorts.find((cohort) => cohort.judge.kind === 'model' && cohort.judge.tool === 'claude')?.id;
+    expect(ScorerResults.of({ labels: all, query: { windowDays: 30, cohort: claude }, now: NOW }).selected?.decided?.rows
+      .map((row) => `${row.by} ${row.stats.n}`)).toEqual(['ci 3', 'judge 3', 'check 1', 'protected 1', 'not recorded 1']);
+  });
+
+  it('keeps labels a stage decided as their own measurement while no judge labelled the rubric', () => {
+    const view = ScorerResults.of({ labels: [delivered('ci', false, 1), delivered('protected', false, 2)].map((label) => viewed(label)), query: { windowDays: 30 }, now: NOW });
+
+    expect(view.scorers[0]?.cohorts.map((cohort) => cohort.stats.n)).toEqual([2]);
+  });
+
+  it('says nothing of stages for session labels, which a judge always decides', () => {
+    expect(ScorerResults.of({ labels: [viewed(sessionLabel())], query: { windowDays: 30 }, now: NOW }).selected).not.toHaveProperty('decided');
+  });
+});
+
 describe('agreement with hand labels', () => {
   const session = (n: number) => ({ platform: 'claude-code', sessionId: `s-${n}` });
   const byHand = (n: number, overrides: Partial<Extract<ScoreLabel, { source: 'session' }>> = {}) => sessionLabel({ subject: session(n), judge: { kind: 'human' }, ...overrides });
@@ -310,6 +450,20 @@ describe('agreement with hand labels', () => {
     expect(selected?.agreement.judges).toMatchObject([
       { judge: { tool: 'codex' }, labels: 2, paired: 2, agree: 1, judgePassedHumanFailed: 1 },
       { judge: { tool: 'claude' }, labels: 1, paired: 1, agree: 1, judgePassedHumanFailed: 0 },
+    ]);
+  });
+
+  it('pairs every model judge that labelled the same sessions, so a second tool does not hide the first one\'s pairs', () => {
+    const codex = { kind: 'model', tool: 'codex', model: { reported: 'gpt-5.1-codex' }, isolation: 'best-effort', access: 'read' } as const;
+    const labels = [0, 1].flatMap((n) => [
+      viewed(sessionLabel({ subject: session(n), scoredAt: '2026-03-17T00:00:00.000Z' })),
+      viewed(sessionLabel({ subject: session(n), judge: codex, scoredAt: '2026-03-18T00:00:00.000Z', ...(n === 1 ? missedBug : {}) })),
+      viewed(byHand(n)),
+    ]);
+    const { selected } = ScorerResults.of({ labels, query: { windowDays: 30 }, now: NOW });
+    expect(selected?.agreement.judges).toMatchObject([
+      { judge: { tool: 'claude' }, labels: 2, paired: 2, agree: 2 },
+      { judge: { tool: 'codex' }, labels: 2, paired: 2, agree: 1, judgeFailedHumanPassed: 1 },
     ]);
   });
 
@@ -368,5 +522,78 @@ describe('agreement with hand labels', () => {
     const { scorers, selected } = ScorerResults.of({ labels, query: { windowDays: 30 }, now: NOW, rubricLabels });
     expect(selected?.cohort).toMatchObject({ rubric: judged, judge: { kind: 'model' }, stats: { n: 2 } });
     expect(scorers[0]?.agreement).toEqual({ paired: 2, agree: 1 });
+  });
+});
+
+describe('failures to improve from', () => {
+  const COMMIT = 'c'.repeat(40);
+  const ran = (project?: { commit: string; dirty: boolean }): RecordedAgent => ({
+    v: 1, tool: { name: 'claude' }, teamai: '1.0.0', driver: 'local', ...(project ? { project } : {}),
+  });
+  const failing = (sessionId: string, overrides: Partial<Extract<ScoreLabel, { source: 'session' }>> = {}) => sessionLabel({
+    subject: { platform: 'claude-code', sessionId }, label: 'missed-bug', score: 0, passed: false, ...overrides,
+  });
+
+  it('lists each failing label once, newest first, with its subject, the commit its work started at, and nothing that passed', () => {
+    const labels = [
+      viewed(failing('7c1e', { scoredAt: '2026-03-10T00:00:00.000Z' }), { agent: ran({ commit: COMMIT, dirty: false }) }),
+      viewed(failing('7c1e', { scoredAt: '2026-03-12T00:00:00.000Z', runMode: 'attended' }), { agent: ran({ commit: COMMIT, dirty: false }), sessionName: 'claude-code_fix-retry_20260309' }),
+      viewed(failing('9d2f', { scoredAt: '2026-03-11T00:00:00.000Z' }), { agent: ran({ commit: COMMIT, dirty: true }) }),
+      viewed(failing('a0b1', { scoredAt: '2026-03-09T00:00:00.000Z' })),
+      viewed(sessionLabel({ subject: { platform: 'claude-code', sessionId: 'passed' } })),
+      viewed(failing('old', { scoredAt: '2026-01-01T00:00:00.000Z' }), { agent: ran({ commit: COMMIT, dirty: false }) }),
+    ];
+    const { window, failures } = ScorerResults.failures({ labels, windowDays: 30, now: NOW });
+    expect(window.days).toBe(30);
+    expect(failures.map(({ failure, start }) => [failure.subject, start])).toEqual([
+      [{ platform: 'claude-code', sessionId: '7c1e' }, { commit: COMMIT }],
+      [{ platform: 'claude-code', sessionId: '9d2f' }, { refused: 'tracked_changes' }],
+      [{ platform: 'claude-code', sessionId: 'a0b1' }, { refused: 'not_recorded' }],
+    ]);
+    expect(failures[0]).toMatchObject({
+      failure: { scorer: 'review-quality', label: 'missed-bug', author: 'alice', runMode: 'attended', scoredAt: '2026-03-12T00:00:00.000Z', agent: { tool: { name: 'claude' } } },
+      session: { name: 'claude-code_fix-retry_20260309' },
+    });
+    expect(JSON.stringify(failures)).not.toContain('reasoning');
+  });
+
+  it('shows with each failing label where its work started, its regression task and its learnings, and counts what is covered and what can become a task', () => {
+    const covered = { platform: 'claude-code', sessionId: '7c1e' };
+    const labels = [
+      viewed(failing('7c1e', { scoredAt: '2026-03-12T00:00:00.000Z' }), { agent: ran({ commit: COMMIT, dirty: false }) }),
+      viewed(failing('9d2f', { scoredAt: '2026-03-11T00:00:00.000Z' }), { agent: ran({ commit: COMMIT, dirty: false }) }),
+      viewed(failing('a0b1', { scoredAt: '2026-03-10T00:00:00.000Z' }), { agent: ran({ commit: COMMIT, dirty: true }) }),
+    ];
+    const links = {
+      tasks: new Map([[JSON.stringify(covered), 'benchmarks/regressions/tasks/missed-null-check.yaml']]),
+      learnings: new Map([[JSON.stringify(covered), [{ id: 'retry-loops-need-a-bound', path: '/tmp/l.md' }]]]),
+    };
+    const { selected } = ScorerResults.of({ labels, query: { windowDays: 30 }, now: NOW, links: { taskOf: (subject) => links.tasks.get(JSON.stringify(subject)), learningsOf: (subject) => links.learnings.get(JSON.stringify(subject)) ?? [] } });
+    expect(selected?.failing.labels.map(({ start, task, learnings }) => ({ start, task, learnings }))).toEqual([
+      { start: { commit: COMMIT }, task: 'benchmarks/regressions/tasks/missed-null-check.yaml', learnings: ['retry-loops-need-a-bound'] },
+      { start: { commit: COMMIT }, task: undefined, learnings: [] },
+      { start: { refused: 'tracked_changes' }, task: undefined, learnings: [] },
+    ]);
+    expect(selected?.failing).toMatchObject({ total: 3, covered: 1, startable: 1 });
+  });
+
+  it('gives each scorer its cohorts, and each model cohort its agreement with hand labels in both directions', () => {
+    const labels = [
+      viewed(failing('s1')),
+      viewed(sessionLabel({ subject: { platform: 'claude-code', sessionId: 's2' } })),
+      viewed(sessionLabel({ subject: { platform: 'claude-code', sessionId: 's1' }, judge: { kind: 'human' } })),
+      viewed(sessionLabel({ subject: { platform: 'claude-code', sessionId: 's2' }, judge: { kind: 'human' }, label: 'missed-bug', score: 0, passed: false })),
+    ];
+    const { scorers, failures } = ScorerResults.failures({ labels, windowDays: 30, now: NOW });
+    const [scorer] = scorers;
+    expect(scorer?.scorer).toBe('review-quality');
+    expect(scorer?.cohorts.map(({ judge, stats, agreement }) => ({ judge: judge.kind, stats: [stats.passed, stats.failed], agreement }))).toEqual([
+      { judge: 'model', stats: [1, 1], agreement: { handLabelled: 2, paired: 2, agree: 0, judgePassedHumanFailed: 1, judgeFailedHumanPassed: 1 } },
+      { judge: 'human', stats: [1, 1], agreement: undefined },
+    ]);
+    expect(failures.map(({ failure }) => [failure.subject, failure.cohort === scorer?.cohorts[0]?.id ? 'model' : 'human'])).toEqual([
+      [{ platform: 'claude-code', sessionId: 's1' }, 'model'],
+      [{ platform: 'claude-code', sessionId: 's2' }, 'human'],
+    ]);
   });
 });

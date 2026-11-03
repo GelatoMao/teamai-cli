@@ -10,27 +10,33 @@ import { LeaseWireSchema } from '../../src/workflow/lease-wire.js';
 import { syncScorerDefinitions } from '../../src/scorers/cache.js';
 import { ciRecipesOf, runCommandsOf } from '../ci-recipe.js';
 import { formatScorerDiagnostic } from '../../src/scorers/definition.js';
-import type { LocalConfig } from '../../src/types.js';
+import { isJsonObject, JsonValueSchema, type JsonObject, type JsonValue, type LocalConfig, JsonObjectSchema } from '../../src/types.js';
 import { formatUnknownScorer, syncWorkflowDefinitions } from '../../src/workflow/cache.js';
 import { leaseNext, reportAttempt, startRun } from '../../src/workflow/engine.js';
 import { formatDiagnostic } from '../../src/workflow/parse.js';
-import type { DriverIdentity, WorkflowEnvelope } from '../../src/workflow/types.js';
+import { WORKSPACE_MODES, type DriverIdentity, type WorkflowEnvelope } from '../../src/workflow/types.js';
 import { knownSecrets } from '../../src/env-resolution.js';
+import { parseSuite, type SourceFile } from '../../src/benchmark/suite.js';
 
 const ROOT = process.cwd();
-const GUIDE = path.join(ROOT, 'docs', 'guide');
 
-// docs/guide/**/workflow*.md, so a new page or language is checked by default. fs.globSync needs Node 22; CI runs Node 20.
-function guidePages(name: RegExp): string[] {
+// docs/<dir>/**/<name>, so a new page or language is checked by default. fs.globSync needs Node 22; CI runs Node 20.
+function docPages(dir: string, name: RegExp): string[] {
   return fs
-    .readdirSync(GUIDE, { recursive: true, encoding: 'utf8' })
+    .readdirSync(path.join(ROOT, 'docs', dir), { recursive: true, encoding: 'utf8' })
     .filter((file) => name.test(path.basename(file)))
-    .map((file) => path.posix.join('docs/guide', file.split(path.sep).join('/')))
+    .map((file) => path.posix.join('docs', dir, file.split(path.sep).join('/')))
     .sort();
 }
 
+const guidePages = (name: RegExp): string[] => docPages('guide', name);
+
 const PAGES = guidePages(/^workflow.*\.md$/);
 const SCORER_PAGES = guidePages(/^scorers.*\.md$/);
+const BENCHMARK_PAGES = guidePages(/^benchmarks.*\.md$/);
+
+/** Every other guide page and design note: a workflow example there passes pull too, though the page need not show one. */
+const OTHER_PAGES = [...guidePages(/\.md$/), ...docPages('designs', /\.md$/)].filter((page) => !PAGES.includes(page) && !SCORER_PAGES.includes(page));
 
 interface Example {
   label: string;
@@ -39,23 +45,29 @@ interface Example {
 
 function examplesOf(page: string): Example[] {
   const text = fs.readFileSync(path.join(ROOT, page), 'utf8');
+
   return [...text.matchAll(/^```yaml\n([\s\S]*?)^```/gm)].map((match) => {
     const line = text.slice(0, match.index).split('\n').length + 1;
     const source = match[1] ?? '';
+
     return { label: `${page}:${line} (${source.split('\n')[0]?.trim()})`, source };
   });
 }
 
-function isWorkflow(value: unknown): value is { name?: unknown } {
-  return !!value && typeof value === 'object' && !Array.isArray(value) && 'steps' in value;
+function isWorkflow(value: JsonValue): value is JsonObject {
+  return isJsonObject(value) && 'steps' in value;
 }
 
-function promptFiles(value: unknown): string[] {
+function promptFiles(value: JsonValue): string[] {
   if (Array.isArray(value)) return value.flatMap(promptFiles);
-  if (!value || typeof value !== 'object') return [];
-  return Object.entries(value).flatMap(([key, field]) =>
-    key === 'prompt_file' && typeof field === 'string' ? [field] : promptFiles(field),
-  );
+
+  if (!isJsonObject(value)) return [];
+
+  return Object.entries(value).flatMap(([key, field]) => {
+    const file = key === 'prompt_file' ? z.string().safeParse(field).data : undefined;
+
+    return file === undefined ? promptFiles(field) : [file];
+  });
 }
 
 /** Workflows a start line names that its page declares only in prose, as `inputs: { … }` in the same paragraph. */
@@ -70,9 +82,10 @@ interface Start {
 }
 
 /** Each `teamai workflow start <name> … --inputs '<json>'` on `page`, and each `--inputs` with a value it could not read as one. */
-function startsOf(page: string): { starts: Start[]; unread: string[] } {
+function startsOf(page: string) {
   const text = fs.readFileSync(path.join(ROOT, page), 'utf8');
   const lineOf = (index: number): number => text.slice(0, index).split('\n').length;
+
   const starts = [
     ...text.matchAll(/teamai workflow start ([A-Za-z0-9][A-Za-z0-9._-]*)[^\n`']*--inputs '([^'\n]*)'/g),
   ].map((match) => ({
@@ -82,18 +95,25 @@ function startsOf(page: string): { starts: Start[]; unread: string[] } {
     json: match[2] ?? '',
     paragraph: text.split(/\n\s*\n/).find((block) => block.includes(match[0])) ?? '',
   }));
-  const unread = [...text.matchAll(/--inputs[ =]['"{]/g)]
-    .map((match) => lineOf(match.index))
-    .filter((line) => !starts.some((start) => start.line === line))
+
+  const unread = [...text.matchAll(/--inputs[ =]['"{]/g)].flatMap((match) => {
+    const line = lineOf(match.index);
+
+    if (starts.some((start) => start.line === line)) return [];
+
     // Actions expressions become JSON only inside the job; the documented CLI path has its own real-CLI E2E.
-    .filter((line) => !text.split('\n')[line - 1]?.includes('${{'))
-    .map((line) => `${page}:${line}: --inputs is not part of a teamai workflow start line`);
+    if (text.split('\n')[line - 1]?.includes('${{')) return [];
+
+    return [`${page}:${line}: --inputs is not part of a teamai workflow start line`];
+  });
+
   return { starts, unread };
 }
 
 /** Each scorer file a page shows: a `scorers/<name>.md` line, then the file in a markdown fence. */
 function scorerExamplesOf(page: string): Array<{ label: string; file: string; source: string }> {
   const text = fs.readFileSync(path.join(ROOT, page), 'utf8');
+
   return [...text.matchAll(/^`(scorers\/[^`\n]+\.md)`[:：]\n\n```markdown\n([\s\S]*?)^```/gm)].map((match) => ({
     label: `${page}:${text.slice(0, match.index).split('\n').length}`,
     file: match[1] ?? '',
@@ -108,6 +128,10 @@ function teamRepo(): LocalConfig {
   dirs.push(root);
   const knowledge = path.join(root, 'knowledge');
   fs.mkdirSync(path.join(knowledge, 'workflows'), { recursive: true });
+  // The roles the pages' examples run steps as.
+  fs.mkdirSync(path.join(knowledge, 'manifest'));
+  fs.writeFileSync(path.join(knowledge, 'manifest', 'roles.yaml'), `version: 1\nroles:\n${['review', 'spec'].map((id) => `  - id: ${id}\n    resources: { knowledge: [${id}], skills: [${id}] }\n`).join('')}`);
+
   return {
     repo: { localPath: knowledge, remote: 'local', kind: 'self' },
     username: 'tester',
@@ -122,27 +146,38 @@ function teamRepo(): LocalConfig {
 const driver: DriverIdentity = { kind: 'local', machine: 'docs', workspace: '/work' };
 
 /** Writes each complete workflow example on `page` into the team repo, and the prompt files they name. */
-function writeExamples(page: string, config: LocalConfig): { byFile: Map<string, string>; failures: string[] } {
+function writeExamples(page: string, config: LocalConfig) {
   const failures: string[] = [];
   const byFile = new Map<string, string>();
+
   for (const example of examplesOf(page)) {
     const document = parseDocument(example.source);
+
     if (document.errors.length > 0) {
       failures.push(`${example.label}: ${document.errors[0]?.message}`);
       continue;
     }
-    const value: unknown = document.toJS();
+
+    const value: JsonValue = document.toJS();
+
     if (!isWorkflow(value)) continue;
+
+    // Beside the workflow pages, a page may show the `steps:` of a workflow, unnamed, to show where a key goes; only
+    // whole files are pulled.
+    if (!PAGES.includes(page) && value.name === undefined) continue;
     const file = `workflows/${String(value.name)}.yaml`;
     const twin = byFile.get(file);
+
     if (twin) failures.push(`${example.label}: ${file} is also ${twin}`);
     byFile.set(file, example.label);
     fs.writeFileSync(path.join(config.repo.localPath, file), example.source);
+
     for (const prompt of promptFiles(value).filter((promptFile) => promptFile.startsWith('prompts/'))) {
       fs.mkdirSync(path.dirname(path.join(config.repo.localPath, prompt)), { recursive: true });
       fs.writeFileSync(path.join(config.repo.localPath, prompt), 'Review the change.\n');
     }
   }
+
   return { byFile, failures };
 }
 
@@ -151,22 +186,25 @@ const cleanup = () => {
 };
 
 const ADVANCED = PAGES.filter((page) => path.posix.basename(page) === 'workflow-advanced.md');
+
 /** The driver the advanced page's `next` table sends. */
 const scriptDriver: DriverIdentity = { kind: 'script', machine: 'host', workspace: '/work' };
 
 const ExampleLeaseSchema = LeaseWireSchema.safeExtend({ pass: z.number() });
+
 type Lease = z.infer<typeof ExampleLeaseSchema>;
-const ExampleEnvelopeSchema = z.object({ data: z.record(z.string(), z.unknown()) });
+
+const ExampleEnvelopeSchema = z.object({ data: JsonObjectSchema });
 
 /** Each first group of `pattern` on `page`, parsed as JSON. */
-function jsonOn(page: string, pattern: RegExp): unknown[] {
+function jsonOn(page: string, pattern: RegExp): JsonValue[] {
   return [...fs.readFileSync(path.join(ROOT, page), 'utf8').matchAll(pattern)].map((match) =>
     JSON.parse(match[1] ?? ''),
   );
 }
 
 /** `value` with its run and attempt ids masked, which differ in every run. */
-function withoutIds(value: unknown): unknown {
+function withoutIds(value: WorkflowEnvelope | JsonValue | undefined): JsonValue {
   return JSON.parse(
     JSON.stringify(value)
       .replace(/"run":"r[0-9a-f]+"/g, '"run":"<run>"')
@@ -182,13 +220,15 @@ function leaseOf(answer: WorkflowEnvelope): Lease | undefined {
 async function startExample(
   page: string,
   name: string,
-  inputs: unknown = {},
+  inputs: JsonValue = {},
 ): Promise<{ config: LocalConfig; runId: string }> {
   const config = teamRepo();
   writeExamples(page, config);
   await syncWorkflowDefinitions(config);
   const started = await startRun(config, name, inputs, { secrets: await knownSecrets(config) });
+
   if ('error' in started) throw new Error(`${page}: ${started.error.message}`);
+
   return { config, runId: String(started.data.run) };
 }
 
@@ -199,9 +239,11 @@ async function driveExample(
   outcome: (lease: Lease) => 'success' | 'failed',
 ): Promise<WorkflowEnvelope[]> {
   const answers: WorkflowEnvelope[] = [];
+
   for (let turn = 0; turn < 50; turn += 1) {
     const answer = await leaseNext(config, runId, scriptDriver);
     const lease = leaseOf(answer);
+
     if (!lease) return answers;
     answers.push(answer);
     await reportAttempt(config, runId, {
@@ -211,6 +253,7 @@ async function driveExample(
       driver: scriptDriver,
     });
   }
+
   throw new Error(`run ${runId} still leases steps after 50 reports`);
 }
 
@@ -224,13 +267,23 @@ await check(
   cleanup,
 );
 
-for (const page of PAGES) {
+await check(
+  'checks the workflow examples of the other guide pages and the design notes',
+  () => {
+    assert.ok(OTHER_PAGES.includes('docs/guide/benchmarks.md'));
+    assert.ok(OTHER_PAGES.includes('docs/designs/workflow-step-roles.md'));
+  },
+  cleanup,
+);
+
+for (const page of [...PAGES, ...SCORER_PAGES, ...OTHER_PAGES]) {
   await check(
     `${page}: each yaml block parses, and its complete workflows pass pull unless the page shows their failure`,
     async () => {
       const config = teamRepo();
       const { byFile, failures } = writeExamples(page, config);
-      assert.ok((byFile.size ?? 0) > 0, `${page} has no complete workflow example`);
+
+      if (!OTHER_PAGES.includes(page)) assert.ok((byFile.size ?? 0) > 0, `${page} has no complete workflow example`);
 
       // An example may be invalid only to show a failure: the page prints its exact diagnostic as review output.
       const shown = new Set(
@@ -238,25 +291,32 @@ for (const page of PAGES) {
           (match) => match[1] ?? '',
         ),
       );
+
       // The scorers a workflow example lists are the ones the scorer pages show.
       for (const example of SCORER_PAGES.flatMap(scorerExamplesOf)) {
         fs.mkdirSync(path.join(config.repo.localPath, 'scorers'), { recursive: true });
         fs.writeFileSync(path.join(config.repo.localPath, example.file), example.source);
       }
+
       const result = await syncWorkflowDefinitions(config, { dryRun: true });
+
       for (const unknown of result.unknownScorers)
         failures.push(`${byFile.get(unknown.file) ?? page}: ${formatUnknownScorer(unknown)}`);
       const reported = new Set(result.invalid.map(formatDiagnostic));
+
       const shownInvalid = new Set(
         result.invalid
           .filter((diagnostic) => shown.has(formatDiagnostic(diagnostic)))
           .map((diagnostic) => diagnostic.file),
       );
+
       for (const diagnostic of result.invalid.filter((candidate) => !shown.has(formatDiagnostic(candidate)))) {
         failures.push(`${byFile.get(diagnostic.file) ?? page}: ${formatDiagnostic(diagnostic)}`);
       }
+
       for (const line of [...shown].filter((shownLine) => !reported.has(shownLine)))
         failures.push(`${page}: shows "${line}", which no example produces`);
+
       for (const file of result.unrunnable.filter((unrunnableFile) => !shownInvalid.has(unrunnableFile)))
         failures.push(`${byFile.get(file) ?? page}: ${file} has no runnable version`);
       assert.deepEqual(failures, []);
@@ -283,11 +343,13 @@ await check(
     const inProse = new Set(
       PAGES.flatMap((page) => {
         const { byFile } = writeExamples(page, teamRepo());
+
         return startsOf(page)
           .starts.filter((start) => !byFile.has(`workflows/${start.name}.yaml`))
           .map((start) => start.name);
       }),
     );
+
     assert.deepEqual(
       [...DECLARED_IN_PROSE].filter((name) => !inProse.has(name)),
       [],
@@ -305,44 +367,58 @@ for (const page of PAGES) {
       const { starts, unread } = startsOf(page);
       const failures = [...unread];
       const declared: Start[] = [];
+
       for (const start of starts) {
         if (!byFile.has(`workflows/${start.name}.yaml`)) {
           const inputs = DECLARED_IN_PROSE.has(start.name)
             ? /`inputs: (\{[^`]*\})`/.exec(start.paragraph)?.[1]
             : undefined;
+
           if (inputs === undefined) {
             failures.push(`${start.label}: workflow "${start.name}" is not an example on the page`);
             continue;
           }
+
           fs.writeFileSync(
             path.join(config.repo.localPath, 'workflows', `${start.name}.yaml`),
             `schemaVersion: v1alpha1\nname: ${start.name}\ndescription: Declared in prose.\ninputs: ${inputs}\nsteps:\n  - id: run\n    command: node run.js\n`,
           );
         }
+
         declared.push(start);
       }
+
       await syncWorkflowDefinitions(config);
+
       for (const start of declared) {
         let inputs: unknown;
+
         try {
           inputs = JSON.parse(start.json);
         } catch {
           failures.push(`${start.label}: --inputs is not JSON`);
           continue;
         }
+
         const started = await startRun(config, start.name, inputs, { secrets: await knownSecrets(config) });
+
         if ('error' in started) {
           failures.push(`${start.label}: ${started.error.code}: ${started.error.message}`);
           continue;
         }
-        // Some inputs, such as the `after` of a for_each item, are read only when the first step is leased.
+
+        // Some inputs, such as the `after` of a for_each item, are read only when the first step is leased. It asks as
+        // the local driver does, offering every workspace and taking a step's role, so an example whose first step has a role leases.
         const next = await leaseNext(config, String(started.data.run), driver, {
-          can: { workspace: ['read-only', 'new', 'continue'] },
+          can: { workspace: [...WORKSPACE_MODES], role: true },
           base: { ref: 'main', commit: 'fixture-base' },
+          prepare: true,
         });
+
         if (!('data' in next) || !next.data.lease)
           failures.push(`${start.label}: the first next leases nothing: ${JSON.stringify(next)}`);
       }
+
       assert.deepEqual(failures, []);
     },
     cleanup,
@@ -354,16 +430,20 @@ for (const page of ADVANCED) {
     `${page}: the next table answers what the engine answers`,
     async () => {
       const { config, runId } = await startExample(page, 'checks');
+
       const rows = [
         ...fs
           .readFileSync(path.join(ROOT, page), 'utf8')
           .matchAll(/^\| (.*) \| `(\{"data":\{"(?:lease|wait)".*\})` \|$/gm),
       ];
+
       assert.equal(rows.length, 3);
       // The table's own attempt ids, in the `running` it sends, stand for the ones this run leased.
       const attempts = new Map<string, string>();
+
       for (const [, fields = '', shown = ''] of rows) {
         const running = /`"running":(\[[^`]*\])`/.exec(fields)?.[1];
+
         const options =
           running === undefined
             ? {}
@@ -373,9 +453,11 @@ for (const page of ADVANCED) {
                   .parse(JSON.parse(running))
                   .map((attempt) => attempts.get(attempt) ?? attempt),
               };
+
         const answer = await leaseNext(config, runId, scriptDriver, options);
         const expected = ExampleEnvelopeSchema.parse(JSON.parse(shown));
         const [shownLease, lease] = [leaseOf(expected), leaseOf(answer)];
+
         if (shownLease && lease) attempts.set(shownLease.attempt, lease.attempt);
         assert.deepEqual(withoutIds(answer), withoutIds(expected), fields);
       }
@@ -410,8 +492,9 @@ for (const page of ADVANCED) {
     `${page}: the for_each results are what fan-build renders, in item order`,
     async () => {
       const [shown] = z
-        .array(z.array(z.object({ item: z.unknown(), outcome: z.enum(['success', 'failed']) })))
+        .array(z.array(z.object({ item: JsonValueSchema, outcome: z.enum(['success', 'failed']) })))
         .parse(jsonOn(page, /^```json\n(\[.*\])\n```/gm));
+
       if (!shown) throw new Error(`${page} shows no results`);
       const { config, runId } = await startExample(page, 'fan-build', { packages: shown.map((entry) => entry.item) });
 
@@ -428,7 +511,7 @@ for (const page of ADVANCED) {
   );
 }
 
-for (const page of PAGES) {
+for (const page of [...PAGES, ...BENCHMARK_PAGES]) {
   await check(
     `${page}: every job of a GitHub Actions workflow it shows says what it runs on`,
     () => {
@@ -449,24 +532,28 @@ await check(
       page,
       commands: ciRecipesOf(path.join(ROOT, page)).map(runCommandsOf),
     }));
+
     assert.deepEqual(
       recipes.map(({ page }) => page),
       ['docs/guide/workflow.md', 'docs/guide/zh-CN/workflow.md'],
     );
     assert.ok((recipes[0]?.commands.flat().length ?? 0) > 0, 'the English guide shows a CI recipe with run commands');
+
     for (const { page, commands } of recipes.slice(1)) assert.deepEqual(commands, recipes[0]?.commands, page);
   },
   cleanup,
 );
 
-for (const page of [...PAGES, ...SCORER_PAGES]) {
+for (const page of [...PAGES, ...SCORER_PAGES, ...BENCHMARK_PAGES]) {
   await check(
     `${page}: every relative link to a .md file resolves`,
     () => {
       const text = fs.readFileSync(path.join(ROOT, page), 'utf8');
+
       const missing = [...text.matchAll(/\]\(([^)#\s:]+\.md)(?:#[^)]*)?\)/g)]
         .flatMap((match) => match[1] ?? [])
         .filter((target) => !fs.existsSync(path.join(ROOT, path.dirname(page), target)));
+
       assert.deepEqual(missing, []);
     },
     cleanup,
@@ -488,6 +575,7 @@ for (const page of SCORER_PAGES) {
       const config = teamRepo();
       const examples = scorerExamplesOf(page);
       assert.ok((examples.length ?? 0) > 0, `${page} has no scorer example`);
+
       for (const example of examples) {
         fs.mkdirSync(path.join(config.repo.localPath, 'scorers'), { recursive: true });
         fs.writeFileSync(path.join(config.repo.localPath, example.file), example.source);
@@ -501,3 +589,74 @@ for (const page of SCORER_PAGES) {
     cleanup,
   );
 }
+
+/** Each team file a page shows: a yaml fence whose first line is `# benchmarks/<path>.yaml`. */
+function benchmarkFilesOf(page: string): SourceFile[] {
+  return examplesOf(page).flatMap(({ source }) => {
+    const relativePath = /^# (benchmarks\/\S+\.yaml)\n/.exec(source)?.[1];
+
+    return relativePath === undefined ? [] : [{ relativePath, content: source }];
+  });
+}
+
+/** The `npx teamai-cli` commands of the GitLab CI jobs a page shows: a yaml fence whose top-level job has a `script`. */
+function gitlabCommandsOf(page: string): string[] {
+  const JobsSchema = z.record(z.string(), z.unknown()).transform((jobs) =>
+    Object.values(jobs).flatMap((job) => {
+      const script = z.object({ script: z.array(z.string()) }).safeParse(job);
+
+      return script.success ? [script.data.script] : [];
+    }),
+  );
+
+  return examplesOf(page).flatMap(({ source }) => JobsSchema.parse(parseDocument(source).toJS() ?? {}).flat());
+}
+
+const teamaiCommands = (commands: string[]): string[] => commands.filter((command) => command.startsWith('npx teamai-cli '));
+
+await check('finds the English and Chinese benchmark pages', () => {
+  assert.deepEqual(BENCHMARK_PAGES, ['docs/guide/benchmarks.md', 'docs/guide/zh-CN/benchmarks.md']);
+});
+
+for (const page of BENCHMARK_PAGES) {
+  await check(`${page}: each yaml block parses, and its suite and task files pass pull`, () => {
+    for (const example of examplesOf(page)) assert.deepEqual(parseDocument(example.source).errors, [], example.label);
+    const files = benchmarkFilesOf(page);
+    const [suite, ...others] = files.filter((file) => file.relativePath.endsWith('/suite.yaml'));
+
+    if (!suite || others.length > 0) throw new Error(`${page} shows ${others.length + (suite ? 1 : 0)} suite files, not one`);
+    const tasks = files.filter((file) => file !== suite);
+    assert.deepEqual(
+      tasks.map((task) => path.posix.dirname(task.relativePath)),
+      tasks.map(() => `${path.posix.dirname(suite.relativePath)}/tasks`),
+      page,
+    );
+
+    const parsed = parseSuite({ suite, tasks });
+
+    assert.deepEqual(parsed.diagnostics.map(formatDiagnostic), []);
+    assert.deepEqual(parsed.ok && parsed.warnings.map(formatDiagnostic), []);
+    assert.equal(parsed.ok && parsed.suite.tasks.length, tasks.length);
+  });
+
+  await check(`${page}: the GitLab CI job runs the teamai commands of the GitHub Actions job`, () => {
+    const github = teamaiCommands(ciRecipesOf(path.join(ROOT, page)).flatMap(runCommandsOf));
+    assert.ok(github.length > 0, `${page} shows a GitHub Actions job that runs teamai`);
+    assert.deepEqual(teamaiCommands(gitlabCommandsOf(page)), github);
+  });
+}
+
+await check('shows the same benchmark files and CI commands in every language', () => {
+  const [english, ...others] = BENCHMARK_PAGES.map((page) => ({
+    page,
+    files: benchmarkFilesOf(page),
+    commands: ciRecipesOf(path.join(ROOT, page)).map(runCommandsOf),
+    gitlab: gitlabCommandsOf(page),
+  }));
+
+  for (const other of others) {
+    assert.deepEqual(other.files, english?.files, other.page);
+    assert.deepEqual(other.commands, english?.commands, other.page);
+    assert.deepEqual(other.gitlab, english?.gitlab, other.page);
+  }
+});

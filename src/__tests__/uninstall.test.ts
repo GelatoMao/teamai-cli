@@ -1658,6 +1658,31 @@ describe('uninstall', () => {
     expect(await fse.pathExists(bridgedTeamHookFile('opencode'))).toBe(true);
   });
 
+  it('removes a local agent rule recorded after a null scope entry in its manifest', async () => {
+    const { homeDir, repoPath } = await setupFixture(tmpDir);
+    vi.stubEnv('HOME', homeDir);
+    const agentHome = path.join(homeDir, '.teamai', 'local-agent');
+    await fse.outputJson(path.join(agentHome, 'config.json'), {
+      endpoint: 'https://test.example.com/api',
+      token: 'test-token',
+      localAgentId: 'test-agent-id',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      workspaceBindings: {},
+    });
+    await fse.outputJson(path.join(agentHome, 'manifest.json'), {
+      scopes: { instance: null, user: { rules: { 'agent-rule': { slug: 'agent-rule', installed_at: '2026-01-01T00:00:00.000Z' } } } },
+    });
+    await fse.outputFile(path.join(agentHome, 'resources', 'user', 'rules', 'agent-rule.md'), '# Agent rule\n');
+    const copy = path.join(homeDir, '.claude', 'rules', 'agent-rule.md');
+    await fse.outputFile(copy, '# Agent rule\n');
+    mockAutoDetectInit.mockResolvedValue({ localConfig: makeLocalConfig(homeDir, repoPath), teamConfig: makeTeamConfig() });
+    commitTeamRepo(repoPath);
+
+    await uninstall({ force: true });
+
+    expect(await fse.pathExists(copy)).toBe(false);
+  });
+
   it('uninstalling Kiro with an agent hook recorded for it leaves none of teamai\'s Kiro hooks', async () => {
     const { homeDir, repoPath } = await setupFixture(tmpDir);
     vi.stubEnv('HOME', homeDir);
@@ -3392,6 +3417,93 @@ describe('uninstall', () => {
       (c) => String(c[0]).startsWith(path.join(projectRoot, '.claude')),
     );
     expect(targetedProjectRoot).toBe(false);
+  });
+
+  it('a workspace uninstall leaves the user scope\'s Claude hooks in HOME and removes its own', async () => {
+    const homeDir = path.join(tmpDir, 'home');
+    const userRepo = path.join(homeDir, '.teamai', 'team-repo');
+    const projectRoot = path.join(tmpDir, 'workspace');
+    const projectRepo = path.join(projectRoot, '.teamai', 'team-repo');
+    const settings = path.join(homeDir, '.claude', 'settings.json');
+    vi.stubEnv('HOME', homeDir);
+    vi.stubEnv('SHELL', '/bin/bash');
+    execFileSync('git', ['init', '-q', projectRoot]);
+    await fse.outputFile(path.join(projectRepo, 'hooks', 'hooks.yaml'),
+      'hooks:\n  - id: workspace-hook\n    description: Workspace hook\n    event: Stop\n    tools: [claude]\n    command: echo workspace-hook\n');
+    await fse.ensureDir(userRepo);
+    await fse.ensureDir(path.join(homeDir, '.claude'));
+    const teamConfig = makeTeamConfig({
+      sharing: { ...makeTeamConfig().sharing, hooks: { autoApply: true, requireTeamScripts: false } },
+    });
+    const userConfig = makeLocalConfig(homeDir, userRepo, { enabledAgents: ['claude'] });
+    await fse.outputFile(path.join(homeDir, '.teamai', 'config.yaml'), YAML.stringify(userConfig));
+    const workspaceConfig = makeLocalConfig(projectRoot, projectRepo, { scope: 'project', projectRoot, enabledAgents: ['claude'] });
+    await fse.outputFile(path.join(projectRoot, '.teamai', 'config.yaml'), YAML.stringify(workspaceConfig));
+    const actual = await vi.importActual<typeof import('../hooks.js')>('../hooks.js');
+    mockReconcileHooks.mockImplementation(actual.reconcileHooks);
+    await actual.reconcileTeamHooksForConfig(teamConfig, userConfig, { silent: true });
+    const userInstall = await fse.readJson(settings);
+    expect(JSON.stringify(userInstall)).toContain('teamai hook-dispatch session-start');
+    await actual.reconcileTeamHooksForConfig(teamConfig, workspaceConfig, { silent: true });
+    const checkoutSettings = path.join(projectRoot, '.claude', 'settings.local.json');
+    expect(JSON.stringify(await fse.readJson(checkoutSettings))).toContain('echo workspace-hook');
+    mockAutoDetectInit.mockResolvedValue({ localConfig: workspaceConfig, teamConfig });
+
+    await uninstall({ force: true });
+
+    expect(await fse.readJson(settings)).toEqual(userInstall);
+    expect(JSON.stringify(await fse.readJson(checkoutSettings))).not.toContain('echo workspace-hook');
+  });
+
+  describe('with two workspaces and no user scope', () => {
+    async function setupWorkspace(homeDir: string, name: string, enabledAgents: string[]) {
+      const projectRoot = path.join(tmpDir, name);
+      const projectRepo = path.join(projectRoot, '.teamai', 'team-repo');
+      execFileSync('git', ['init', '-q', projectRoot]);
+      await fse.outputFile(path.join(projectRepo, 'hooks', 'hooks.yaml'),
+        `hooks:\n  - id: ${name}-hook\n    description: ${name} hook\n    event: Stop\n    tools: [claude]\n    command: echo ${name}-hook\n`);
+      const dataHome = path.join(homeDir, '.teamai', 'projects', name);
+      const persisted = makeLocalConfig(projectRoot, projectRepo, { scope: 'project', projectRoot, enabledAgents });
+      await fse.outputFile(path.join(dataHome, 'config.yaml'), YAML.stringify(persisted));
+      await writeAnchorFile(dataHome, projectRoot);
+      return { ...persisted, dataHome };
+    }
+
+    async function installBoth(otherAgents: string[]) {
+      const homeDir = path.join(tmpDir, 'home');
+      vi.stubEnv('HOME', homeDir);
+      vi.stubEnv('SHELL', '/bin/bash');
+      await fse.ensureDir(path.join(homeDir, '.claude'));
+      const teamConfig = makeTeamConfig({
+        sharing: { ...makeTeamConfig().sharing, hooks: { autoApply: true, requireTeamScripts: false } },
+      });
+      const uninstalled = await setupWorkspace(homeDir, 'api', ['claude']);
+      const other = await setupWorkspace(homeDir, 'web', otherAgents);
+      const actual = await vi.importActual<typeof import('../hooks.js')>('../hooks.js');
+      mockReconcileHooks.mockImplementation(actual.reconcileHooks);
+      await actual.reconcileTeamHooksForConfig(teamConfig, other, { silent: true });
+      await actual.reconcileTeamHooksForConfig(teamConfig, uninstalled, { silent: true });
+      mockAutoDetectInit.mockResolvedValue({ localConfig: uninstalled, teamConfig });
+      return { settings: path.join(homeDir, '.claude', 'settings.json') };
+    }
+
+    it('a workspace uninstall leaves HOME\'s Claude hooks another workspace still runs', async () => {
+      const { settings } = await installBoth(['claude']);
+      const installed = await fse.readJson(settings);
+      expect(JSON.stringify(installed)).toContain('teamai hook-dispatch session-start');
+
+      await uninstall({ force: true });
+
+      expect(await fse.readJson(settings)).toEqual(installed);
+    });
+
+    it('a workspace uninstall removes HOME\'s Claude hooks when the other workspace does not enable Claude', async () => {
+      const { settings } = await installBoth(['codex']);
+
+      await uninstall({ force: true });
+
+      expect(JSON.stringify(await fse.readJson(settings).catch(() => ({})))).not.toContain('teamai hook-dispatch');
+    });
   });
 
   it('non-self project scope removes the Claude and Codex team hooks kept in the main checkout (#955)', async () => {

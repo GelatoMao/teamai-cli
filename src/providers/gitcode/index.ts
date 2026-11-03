@@ -7,6 +7,7 @@ import {
   gitcodeCreateRepo,
   gitcodePullCreate,
   gitcodeFindOpenPull,
+  gitcodePullHistory,
   writeNetrcToken,
   GitCodeRepoNotFoundError,
 } from './gitcode-api.js';
@@ -27,7 +28,7 @@ import { askQuestion, isInteractive } from '../../utils/prompt.js';
  */
 export class GitCodeProvider implements GitProvider {
   readonly name = 'gitcode';
-  readonly pullRequests: PullRequestLookup = { findOpen: gitcodeFindOpenPull };
+  readonly pullRequests: PullRequestLookup = { findOpen: gitcodeFindOpenPull, history: gitcodePullHistory };
 
   parseRepoInput(input: string): RepoInfo {
     return parseGitCodeRepoInput(input);
@@ -48,6 +49,7 @@ export class GitCodeProvider implements GitProvider {
   async authenticate(): Promise<string> {
     if (this.isAuthenticated()) {
       const username = await gitcodeWhoami();
+
       if (username) return username;
       throw new Error(
         'GitCode token is set but was rejected by the API. Check GITCODE_TOKEN / GC_TOKEN, ' +
@@ -68,6 +70,7 @@ export class GitCodeProvider implements GitProvider {
         '设置 / Settings → Access Tokens, then paste it below.',
     );
     const token = (await askQuestion('Paste your GitCode Personal Access Token: ')).trim();
+
     if (!token) {
       throw new Error('No token provided. GitCode authentication cancelled.');
     }
@@ -77,12 +80,15 @@ export class GitCodeProvider implements GitProvider {
     // it) before persisting.
     process.env.GITCODE_TOKEN = token;
     const username = await gitcodeWhoami();
+
     if (!username) {
       delete process.env.GITCODE_TOKEN;
       throw new Error('GitCode authentication failed: the pasted token was rejected. Please try again.');
     }
+
     writeNetrcToken(token);
     log.success('Saved GitCode credentials to ~/.netrc');
+
     return username;
   }
 
@@ -97,6 +103,7 @@ export class GitCodeProvider implements GitProvider {
       if (e instanceof GitCodeRepoNotFoundError) {
         throw new RepoNotFoundError(repo);
       }
+
       throw e;
     }
   }

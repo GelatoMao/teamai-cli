@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { getDashboardHtml } from '../dashboard-html.js';
 import { renderDashboardReport } from '../viz-render.js';
 import { dashboardMessages } from '../dashboard/locales.js';
+import { benchmarksClient } from '../dashboard/benchmarks-client.js';
 import { scorersClient } from '../dashboard/scorers-client.js';
 import { summarizeSessionCosts, type DailySessionSnapshot } from '../session-trends.js';
 import type { VizData } from '../viz.js';
@@ -42,6 +43,12 @@ describe('unified dashboard', () => {
     expect(html).toContain('Omitted by tag subscriptions');
   });
 
+  it('groups Distribution with Execution: it decides what this machine installs on pull', () => {
+    const html = getDashboardHtml(3721);
+    expect(html).toContain("['Execution',['execution','tokens','workflows','scorers','benchmarks','distribution']]");
+    expect(html).toContain("['Context',['context','resources']]");
+  });
+
   it('adds a Distribution page that previews before it saves and never runs pull (#1028)', () => {
     const html = getDashboardHtml(3721);
     expect(html).toContain("distribution: 'Distribution'");
@@ -79,6 +86,10 @@ describe('unified dashboard', () => {
       totalEntries: 1, totalRecalls: 0, overallCoveragePct: 0, contributorCount: 1,
       coverage: [{ type: 'docs', total: 1, covered: 0, coveragePct: 0 }], topRecalled: [],
       silent: [{ docId: 'x', title: '<img src=x onerror=alert(1)>', author: '<script>bad</script>', type: 'docs', date: '', tags: [], recalledCount: 0, upvotedCount: 0, lastRecalledAt: null }],
+      relations: {
+        assetCount: 2, relationCount: 1, withoutRelation: ['docs/<script>lonely</script>'],
+        unresolved: ['rules/x.md REFERENCES docs/<script>missing</script>'], silentAndWithoutRelation: [],
+      },
       trend: [], authors: [{ author: '<script>bad</script>', entries: 1, totalRecalled: 0 }],
       maintenance: { promote: [], prune: [], stale: [] },
     };
@@ -98,8 +109,20 @@ describe('unified dashboard', () => {
     const literals = [...scorersClient.matchAll(/\b(?:label|t)\('((?:[^'\\]|\\.)+)'\)/g)].map((match) => (match[1] ?? '').replace(/\\'/g, "'"));
     const dimensions = Object.values(z.record(z.string(), z.string()).parse(JSON.parse(scorersClient.match(/const scorerDimensions=(\{[^}]*\})/)?.[1] ?? 'null')));
     const headings = [...scorersClient.matchAll(/\[((?:'[A-Z][A-Z ,]+',?)+)\]/g)].flatMap((match) => [...(match[1] ?? '').matchAll(/'([^']+)'/g)].map((heading) => heading[1] ?? ''));
-    const all = [...new Set([...literals, ...dimensions, ...headings])];
+    const deciders = Object.values(z.record(z.string(), z.string()).parse(JSON.parse(scorersClient.match(/const deciderNames=(\{[^}]*\})/)?.[1] ?? 'null')));
+    const all = [...new Set([...literals, ...dimensions, ...headings, ...deciders])];
     expect(all.length).toBeGreaterThan(60);
+    expect(all.filter((text) => !Object.hasOwn(dashboardMessages, text))).toEqual([]);
+  });
+
+  it('adds a Benchmarks page that reads /api/benchmarks, whose every label has a zh-CN translation (#1180)', () => {
+    const html = getDashboardHtml(3721);
+    expect(html).toContain("benchmarks: 'Benchmarks'");
+    expect(html).toContain("apiQuery('/api/benchmarks',params)");
+    const literals = [...benchmarksClient.matchAll(/\b(?:label|t)\('((?:[^'\\]|\\.)+)'\)/g)].map((match) => (match[1] ?? '').replace(/\\'/g, "'"));
+    const headings = [...benchmarksClient.matchAll(/\[((?:'[A-Z][A-Z ,×]+',?)+)\]/g)].flatMap((match) => [...(match[1] ?? '').matchAll(/'([^']+)'/g)].map((heading) => heading[1] ?? ''));
+    const all = [...new Set([...literals, ...headings])];
+    expect(all.length).toBeGreaterThan(40);
     expect(all.filter((text) => !Object.hasOwn(dashboardMessages, text))).toEqual([]);
   });
 
@@ -111,6 +134,10 @@ describe('unified dashboard', () => {
       coverage: [{ type: 'docs', total: 3, covered: 2, coveragePct: 60 }],
       topRecalled: [{ docId: 'a', title: 'A', author: 'x', type: 'docs', date: '', tags: [], recalledCount: 5, upvotedCount: 1, lastRecalledAt: null }],
       silent: [{ docId: 'b', title: 'B', author: 'x', type: 'docs', date: '', tags: [], recalledCount: 0, upvotedCount: 0, lastRecalledAt: null }],
+      relations: {
+        assetCount: 3, relationCount: 2, withoutRelation: ['docs/b.md'],
+        unresolved: ['rules/a.md MAPS_TO teamwiki/evidence/code/x/m.md'], silentAndWithoutRelation: ['docs/b.md'],
+      },
       trend: [{ period: '2026-08', count: 1 }, { period: '2026-09', count: 2 }],
       authors: [{ author: 'x', entries: 3, totalRecalled: 5 }],
       maintenance: {

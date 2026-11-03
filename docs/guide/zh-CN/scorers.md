@@ -89,14 +89,78 @@ $ teamai score --next --json '{"driver":{"kind":"local","machine":"m1","workspac
   "evidence":"…/scores/evidence/a91c0d7e0/","prompt":"…/prompt.md","answer":{"schema":{…}},
   "submit":"teamai score --lease s5d1e07c2a9b4a/a91c0d7e0 --submit --stdin"}}}
 $ teamai score --lease s5d1e07c2a9b4a/a91c0d7e0 --json '{"driver":{"kind":"local","machine":"m1","workspace":"/work"}}'
-{"data":{"label":{"scorer":"review-quality","label":"good","score":1,"passed":true,…},"published":true}}
+{"data":{"label":{"scorer":"review-quality","label":"good","score":1,"passed":true,"agent":{"v":1,"tool":{"name":"claude",…},…},…},"published":true}}
 ```
 
-`samplingRate` 决定评判哪些成功的执行轮次，在每台机器上结果相同。`workflow next` 从不分发评审任务。`--lease <ref>` 在本机用租约选定的工具、以[受限配置](#隔离)评判，并像任意 driver 的答案一样结算租约。评审失败时租约保持打开。
+`samplingRate` 决定评判哪些成功的执行轮次，在每台机器上结果相同。`workflow next` 从不分发评审任务。`--lease <ref>` 在本机用租约选定的工具、以[受限配置](#隔离)评判，并像任意 driver 的答案一样结算租约。评审失败时租约保持打开。`scorers` 设置了 `sampling: all` 的步骤是例外：它的评分器评判每个成功的执行轮次，运行会等它们完成后才运行 `finally` 步骤并结束，在此期间 `workflow next` 返回带 `judging`（仍未结算的评判条目）的 `wait`。本地驱动自己评判它们，并立即结算失败的评审；其他驱动的轮次在运行它们的安装上用 `teamai score --next` 评判。[基准测试](benchmarks.md)就是这样评判它的 trial。
 
 标签记录 `used.skills`，即该轮次或其子 agent 加载过的团队技能。判定方式与[会话](#为会话评分)相同，依据该轮次开始时检出目录中由 teamai 交付并未经修改的技能。`workflow:` 步骤的标签列出其子轮次记录的全部技能。若子轮次都未记录，标签没有 `used`。
 
 证据目录包含 `evidence.json`、`prompt.md`、有记录范围时的 `diff.patch`、`repo/`（被评判提交中的跟踪文件，符号链接的目标以文本保存）、`transcripts/`（包含可读取的子代理）和 `outputs.json`。所有文件都经过脱敏，团队在 `env/secrets.yaml` 中声明的密钥值也会被遮蔽。不是文本的跟踪文件不会写入，并列在 `omitted` 里。缺失证据以 gap 代码列出。租约结算或过期后删除证据。
+
+### 标签评判的 Harness
+
+每个标签还记录 `agent`，即被评判的工作运行时的 Harness。下例中修复用你的角色运行，审查以审查者身份运行，同一个评分器评判两者：
+
+```yaml
+# workflows/fix-and-review.yaml
+schemaVersion: v1alpha1
+name: fix-and-review
+description: Fix the issue with your role, then review and finish the fix as a reviewer.
+steps:
+  - id: fix
+    workspace: new
+    prompt: Fix what the issue reports.
+    scorers: [review-quality]
+  - id: review
+    needs: [fix]
+    role: review
+    workspace: new
+    prompt: Review the fix, then fix what is still wrong.
+    scorers: [review-quality]
+```
+
+运行 `teamai workflow start fix-and-review --driver local` 后，审查轮次在 `<dataHome>/scores/labels.jsonl` 中的标签如下（原为一行，此处折行）：
+
+```text
+{"scorer":"review-quality","label":"partial","score":0.5,"passed":false,"source":"workflow",
+ "subject":{"runId":"r3f9…","step":"review","pass":1},
+ "agent":{"v":1,"tool":{"name":"claude","version":"2.1.308"},"model":{"requested":"claude-sonnet-4-6"},
+  "team":{"revision":"62432de…","localChanges":false,
+   "selection":{"scope":"project","primaryRole":"frontend","additionalRoles":[],"stepRole":"review"}},
+  "project":{"commit":"9e1b…","dirty":false},"teamai":"0.22.0","driver":"local","fingerprint":"5c0d…"},
+ "judge":{"kind":"model","tool":"claude",…},"scoredAt":"2026-10-27T10:00:00.000Z"}
+```
+
+`stepRole: review` 是步骤运行时的角色，`primaryRole` 是你的角色。`fix` 的标签没有 `stepRole`。
+
+- prompt 步骤的标签带有运行记录中该轮次的 `agent`，轮次没有记录模型、因而没有 `fingerprint` 时也一样。
+- `workflow:` 步骤的标签在其所有 prompt 轮次的工具、模型、effort、定义和团队都一致时，带有第一个 prompt 轮次的 `agent`。command 轮次不计入。不一致时标签没有 `agent`，例如 `for_each` 的各项以不同角色运行。
+- 会话标签带有其捕获记录一致的 `agent`，比较方式相同。
+- 评审者看不到 `agent`。它不属于标签的键，所以重新评分仍会替换被重评的标签。
+
+在仪表盘的[评分器页面](dashboard.md#评分器scorers)，**分组依据**选`角色`时，轮次带 `stepRole` 的标签计入 `stepRole`，否则计入 `primaryRole`，因此审查步骤和成员步骤并列显示：
+
+```text
+按 角色
+值               标签数  通过  未通过  通过率
+frontend 成员    14      11    3       79%
+review 步骤      12      7     5       58%
+未记录           3       2     1       67%
+```
+
+角色旁的 `步骤` 表示它的标签以步骤的角色运行，`成员` 表示以成员的角色运行，`两者` 表示两种都有。
+
+**未通过的标签**列出每个标签的 Harness，运行仍在列表中时可打开该运行。选择一个分组只列出该组的标签：
+
+```text
+评分时间    作者  标签     HARNESS                                                     平台        技能  打开
+10/27/2026  bob   partial  claude · claude-sonnet-4-6 · review 步骤角色 · 62432de      工作流运行  —     r3f9… ↗  review #1
+10/26/2026  ana   bad      codex · gpt-5 · frontend 成员角色 · 62432de                 工作流运行  —     r1a2… 未找到运行  fix #1
+10/20/2026  ana   bad      未记录 Harness                                              工作流运行  —     r0c7… 未找到运行  fix #1
+```
+
+Harness 来自标签本身，所以运行文件删除后仍然保留。`未记录 Harness` 表示标签和运行记录都没有 `agent`：旧版 teamai 写入、且运行已不存在的标签，prompt 轮次不一致的 `workflow:` 步骤，或捕获记录不一致的会话。在**按 角色**中，这类标签计入`未记录`，`agent` 没有团队信息的标签也一样。
 
 ## 任意 driver
 
@@ -108,7 +172,7 @@ $ teamai score --lease s5d1e07c2a9b4a/a91c0d7e0 --submit --stdin <<'JSON'
 {"driver":{"kind":"t3","machine":"m1","workspace":"/work"},"outcome":"success",
  "answer":{"label":"good","reasoning":"…"},"judge":{"tool":"claude"}}
 JSON
-{"data":{"label":{"scorer":"review-quality","label":"good","score":1,"passed":true,…},"published":true}}
+{"data":{"label":{"scorer":"review-quality","label":"good","score":1,"passed":true,"agent":{"v":1,"tool":{"name":"claude",…},…},…},"published":true}}
 ```
 
 带 `run` 时，`score --next` 按运行 id 找到运行的 scope，所以 driver 可以在运行的工作树里或运行起始检出目录之外请求，并在那里评审和提交租约。要按 id 评审一个会话，用 [`score --session`](#用自己的评审者) 租出它。
@@ -119,7 +183,7 @@ JSON
 | `access` | 评审者能做什么：`answer`（不用工具）、`read`（读取证据）或 `full`（任意工具，默认值）。标签会记录该值。 |
 | `tools` | 按你的偏好排序。首个能解析评分器模型的工具胜出。 |
 
-评分器未列出的标签会被拒绝，租约保持打开。`running` 列出你仍在评判的租约，从而续期；租约在领取或续期 30 分钟后过期。不要把评审租约放进 `workflow next` 的 `running`：它会回答 `judge_lease`，且不做任何改动。`run` 是一个运行 id，只领取该运行的工作流 pass，从不领取会话。`canTakeLease: false` 只续期 `running`，不领取任何租约。所有字段见 `teamai score --help`。
+回答中的 `decided` 列出在查找租约时，某个阶段为[交付的合并请求](#为交付的工作评分)给出的标签；它们不需要评审者。评分器未列出的标签会被拒绝，租约保持打开。`running` 列出你仍在评判的租约，从而续期；租约在领取或续期 30 分钟后过期。不要把评审租约放进 `workflow next` 的 `running`：它会回答 `judge_lease`，且不做任何改动。`run` 是一个运行 id，只领取该运行的工作流 pass，从不领取会话。`canTakeLease: false` 只续期 `running`，不领取任何租约。所有字段见 `teamai score --help`。
 
 你的 driver 在上报一个轮次时写明它加载过的团队技能，该轮次的标签会带上它们：
 
@@ -132,11 +196,87 @@ $ teamai workflow report r3f9… --json '{"attempt":"…","revision":3,"outcome"
 ## 按需评分
 
 ```console
-$ teamai score --run r3f9… --step review --scorer review-quality                     # 在本机评判最近一次成功的执行
+$ teamai score --run r3f9… --scorer review-quality                                   # 唯一列出它的步骤，最近一次成功的执行
 $ teamai score --run r3f9… --step review --pass 2 --scorer review-quality --queue     # 交给任意 driver 的 --next
 ```
 
-不应用抽样，失败或过期的评审任务会重新打开。运行固定过的评分器使用固定的评分标准；`teamai pull` 缓存的其他评分器使用当前版本。不加 `--queue` 时，运行 PATH 上首个可用的评审工具，优先使用执行该轮的工具。未知的运行、步骤、执行轮次或评分器会失败，并列出存在的值。若本机没有评审工具能运行某个评分器的模型，该评分器以 `judge_model_unavailable` 失败并保持打开。错误的 `labels` 列出其他评分器已生成的标签。
+运行中只有一个有成功执行的步骤列出该评分器时，`--step` 可以省略；否则错误会列出可选的步骤。不应用抽样，失败或过期的评审任务会重新打开。运行固定过的评分器使用固定的评分标准；`teamai pull` 缓存的其他评分器使用当前版本。不加 `--queue` 时，运行 PATH 上首个可用的评审工具，优先使用执行该轮的工具。未知的运行、步骤、执行轮次或评分器会失败，并列出存在的值。若本机没有评审工具能运行某个评分器的模型，该评分器以 `judge_model_unavailable` 失败并保持打开。错误的 `labels` 列出其他评分器已生成的标签。
+
+某轮执行的提交或记录的会话已不在本机时，评审前就会失败，不写入任何标签：
+
+```console
+$ teamai score --run r3f9… --scorer delivered
+{"error":{"code":"evidence_missing","message":"Pass 1 of step change in run r3f9… cannot be scored: no longer on this machine: claude-code session 6f1c2a0e-… of change#1. Restore what is missing, or score another pass. No label was written."}}
+```
+
+## 为交付的工作评分
+
+带 `deliver: pr` 的步骤以合并请求的形式把工作交给评审。该步骤上的评分器评判这个合并请求，并且在任何评审者运行之前，有三个阶段可以直接判定标签。
+
+```yaml
+# workflows/ship-issue.yaml
+inputs: { issue: number }
+steps:
+  - id: read-issue
+    prompt: Read issue {{ inputs.issue }} and return its title and body.
+    output: { title: string, body: string }
+  - id: change
+    needs: [read-issue]
+    prompt: Make the change the issue asks for.
+    workspace: new
+    deliver: pr
+    scorers: [delivered]
+```
+
+`scorers/delivered.md`：
+
+```markdown
+---
+labels:
+  - { value: complete, score: 1, description: Delivers what the issue asked and nothing else. }
+  - { value: partial, score: 0.5, description: Delivers part of what was asked. }
+  - { value: off-target, score: 0, description: Delivers something other than what was asked. }
+passingScore: 1
+check:
+  run: npm test
+  protect: [test/**, package.json]
+---
+Judge whether the pull request delivers what the issue asked, and only that.
+```
+
+各阶段按以下顺序运行，第一个未通过的阶段做出判定：
+
+| 阶段 | 何时未通过 | `decidedBy` |
+|---|---|---|
+| 评分器检查 | 在交付提交的全新克隆中，先把 `protect` 路径恢复为工作开始时的样子，再运行 `check.run`，退出码非零。为了通过而修改 `test/` 的代理无法以这种方式通过。 | `check` |
+| 合并请求 CI | 交付提交的 CI 已结束且失败。GitHub：任一检查运行失败、超时或需要操作，或提交状态为失败。GitLab：最新的流水线失败。 | `ci` |
+| 受保护路径 | 该轮修改了运行保护的路径，步骤以 `protected_path` 失败，没有交付任何内容。 | `protected` |
+
+未通过时的标签是低于 `passingScore` 的最高标签，此例中为 `partial`。不启动评审者，不消耗 token。所有阶段都通过时，或者仍有 CI 检查在运行、没有任何检查、源仓库不在 GitHub 或 GitLab 上时，由评审者判定，标签记为 `"decidedBy":"judge"`。没有 `check` 的评分器跳过该阶段。未做任何修改的执行没有交付提交，因此同样跳过检查和 CI。
+
+交付步骤的评审者还会读取运行的输入（`inputs.json`）和每个步骤的输出，从而把合并请求与 `read-issue` 返回的 issue 进行对比。
+
+`teamai score --run r3f9… --scorer delivered` 发布的一个 CI 失败标签：
+
+```json
+{"scorer":"delivered","label":"partial","score":0.5,"passed":false,"source":"workflow",
+ "subject":{"runId":"r3f9…","step":"change","pass":1},"decidedBy":"ci",
+ "evidenceHash":"sha256:8ddbddc64a7180bc866ce3fc0da3e5ad940854e7855a51b0318851f932737ba1",
+ "judge":{"kind":"model","tool":"claude",…},…}
+```
+
+`evidenceHash` 标识标签读取的证据。同一轮执行的两个标签哈希相同，说明读取的是同一份工作；如果标签不同，变化的是评分标准或评审者，而不是工作。阶段发现的内容（检查的退出码、CI 结果）只保存在命令输出中指明的本地 reasoning 文件里。由于没有评审者运行，标签没有 `usage`。
+
+无法运行的检查（例如本机没有该命令，或运行超时）不写入标签。修复检查后，再次为该轮评分：
+
+```console
+$ teamai score --run r3f9… --scorer delivered
+{"error":{"code":"check_could_not_run","message":"The check of scorer delivered, `npm test`, could not run on commit 4be1c0d… (not_found). Fix the check, then run this command again. No label was written."}}
+```
+
+`score --next` 以 `check_could_not_run` 关闭该条目，并附上同样的原因。带 `check` 的评分器从不与其他评分器[批量评审](#批量评审)，因为它的检查单独运行。同一步骤交付了两个合并请求的两轮执行各得一个标签，以 `subject.pass` 区分。
+
+[评分器页面](dashboard.md#评分器scorers)显示每个阶段判定了多少标签。
 
 ## 为会话评分
 
@@ -289,6 +429,15 @@ daily_limit: 10                                  # 按数据目录计数：在�
 | `ask` | 摩擦提醒提供 [`teamai-share-learnings`](workflow.md#teamai-share-learnings-和-teamai-share-session) 时，它提议抽样选中该会话的评分器，成员确认后由它们评判。 | 等同于 `off`，因为没有人回答。 |
 | `auto` | 会话六小时没有任何活动后，由后台评审评判。 | 在任务结束前运行 `teamai score --drain` 时评判。默认值。 |
 
+`skill_routing` 为 `sessions` 已经在评判的会话开启 #1469 的路由问题，默认关闭：
+
+```yaml
+# scorers/scoring.yaml，或 scorers/<namespace>/scoring.yaml
+skill_routing: true
+```
+
+每个完结的会话随后按它自己的 captures 交付过的团队技能各生成一个问题——根技能是 `teamai:routing:<skill>`，带命名空间的是 `teamai:routing:<namespace>:<skill>`——无论技能描述写什么，都由同一份评分规则评判：fit（加载了，且会话需要它）和 idle（没加载，且会话不需要）通过，extra（加载了但不需要）和 missed（需要但没加载）不通过。交付记录说不出命名空间的技能没有问题：评判它可能评到同名的另一个技能。这些问题从不抽样，无论多少个都共用一次评审调用，计入同一个 `daily_limit`；开着 `batch` 时一个会话仍只花一次调用。这些名字也可以按需解析，不受 `skill_routing` 影响——`teamai score --session <id> --scorer teamai:routing:<namespace>:<skill>`——但只对出现在该会话 `skills.available` 里的技能有效，否则 `scorer_not_found`。
+
 每种模式单独解析，取下面第一个设置了它的位置：成员 `config.yaml` 中的 `scoring.sessions`、生效命名空间的 `scoring.yaml`、根目录的 `scorers/scoring.yaml`、默认值。两个生效命名空间不一致时，最严格的策略生效（`off`，其次 `ask`，最后 `auto`），`daily_limit` 也取最低值。只写一种模式的映射（例如 `{ attended: ask }`）会把另一种模式留给下一级：
 
 ```yaml
@@ -319,7 +468,7 @@ Session judging: attended auto, set by scorers/scoring.yaml sessions; unattended
 
 | 评判对象 | 由谁决定 |
 |---|---|
-| 工作流步骤的 pass | 步骤的 `scorers`，按每个评分器的 `samplingRate` 抽样。与 `sessions` 无关。 |
+| 工作流步骤的 pass | 步骤的 `scorers`，按每个评分器的 `samplingRate` 抽样，或在 `sampling: all` 下评判每个 pass。与 `sessions` 无关。 |
 | 已捕获的会话：你的会话，或 `CI`、`TEAMAI_MODE` 任务中不是由 teamai 启动的会话 | 该会话运行模式对应的 `sessions`，由每个设置了 `sessions: true` 的评分器按其 `samplingRate` 抽样评判。 |
 | teamai 启动的会话，例如工作流步骤或评审 | 不评判。它不写捕获记录，它的步骤按 pass 评判。 |
 | teamai 读不到会话的工具（例如 Pi）的会话 | 不评判。对发布或评判策略不是 `off` 的每种模式，`teamai doctor` 会列出团队启用的每个这类工具。按默认值，两种模式都会列出。 |
@@ -350,7 +499,7 @@ $ teamai score --drain
 1. 在无人值守模式下，本数据目录记录为无人值守的每个已捕获会话都算已结束，包括调用它的会话。有人值守的会话仍按六小时规则。
 2. 评判本机能评判的每个未完成的评审项：抽样的步骤 pass，以及策略允许的抽样会话，受 `daily_limit` 限制。本机有另一个评审过程（例如后台评审）正在运行时，它不评判任何评审项，并会说明这一点。等那个过程结束后再运行一次 drain。
 3. 像 `score --push` 一样发布每个待发布的标签，并像 `teamai pull` 一样发布运行当时没能发布的工作流运行记录。
-4. 当前模式的 `publish` 为 `auto` 时，把该模式下已结束、尚未归档的已捕获会话，以及在这里驱动的运行中尚未归档的步骤会话，脱敏后归档到 `teamai-reports`。无法从这里归档的步骤会话（teamai 读不到其工具的会话，或本机读不到这个会话）只列出一次已跳过及原因，之后不再重试。该运行的其他步骤会话照常归档。
+4. 当前模式的 `publish` 为 `auto` 时，把该模式下已结束、尚未归档的已捕获会话，以及在这里驱动的运行中尚未归档的步骤会话，脱敏后归档到 `teamai-reports`。无法从这里归档的步骤会话（teamai 读不到其工具的会话，或本机读不到这个会话）只列出一次已跳过及原因，之后不再重试。该运行的其他步骤会话照常归档。[基准测试](benchmarks.md)运行的 trial 会话留在运行它的机器上。
 5. 像 `teamai pull` 一样把用量上报到 `stats/<member>.yaml`，让临时 runner 的计数到达团队。
 6. 输出剩下的工作：评分器固定的模型本机没有评审工具能运行（`judge_model_unavailable`），或本机达不到其隔离要求的评审项；本机没有安装评审工具时，是所有未完成的评审项。它们等待其他 driver 的 `score --next`。
 
@@ -428,6 +577,6 @@ Judge tools here: claude 2.1.308 (Claude Code) is verified, codebuddy 2.3.0 is b
 | `<dataHome>/scores/reasoning/` | 评审者的理由，每个标签一个文件。从不发布。 |
 | `<dataHome>/scores/raw/` | 本机评审失败时的输出，保留到之后的评审尝试取代它。 |
 | `<dataHome>/sessions/captures/` | 每个会话启动时的运行配置，由会话启动 hook 写入。会话文件消失一天后删除。 |
-| `teamai-reports` 上的 `scores/<member>/<YYYY-MM>.jsonl` | 已发布的标签，每个评分器、评分标准、评分对象和评审类型只保留最新一条。推送成功前标签留在 `<dataHome>/scores/pending/`；关闭用量上报时一直留在那里。 |
+| `teamai-reports` 上的 `scores/<member>/<YYYY-MM>.jsonl` | 已发布的标签，每个评分器、评分标准、评分对象和评审者只保留最新一条：人，或每个模型评审者的工具和模型。推送成功前标签留在 `<dataHome>/scores/pending/`；关闭用量上报时一直留在那里。 |
 
-标签从不进入运行或它的记录。工作流运行页面显示每一轮的标签，以及评审开销，与运行本身的 token 分开统计。本机的运行统计每一次评审尝试；成员发布的运行只统计产生了标签的评审。仪表盘的[评分器页面](dashboard.md#评分器scorers)按时间和配置显示每个评分器的通过率。
+标签从不进入工作流运行或它的记录。基准测试运行在结束时冻结每个 trial 的评判结果，其记录携带 trial 的结果，而不是标签。工作流运行页面显示每一轮的标签，以及评审开销，与运行本身的 token 分开统计。本机的运行统计每一次评审尝试；成员发布的运行只统计产生了标签的评审。仪表盘的[评分器页面](dashboard.md#评分器scorers)按时间和配置显示每个评分器的通过率。`teamai digest --json` 输出同样的度量，以及每个失败的标签和它的工作开始时的 commit，[`teamai self-improvement run`](self-improvement.md) 把它们变成一个 PR。

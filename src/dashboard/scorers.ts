@@ -1,8 +1,8 @@
 /**
  * The dashboard's Scorers page (#1182): pass rates of the score labels on `teamai-reports` and on this machine, through
  * `ScorerResults`. This module reads what the counting needs and nothing else: labels, the `agent` of the pass a
- * workflow label judges from its run record, the name of an archived session, this team clone's ancestry for a commit
- * split, and this machine's friction reminder state. It never reads a judge's reasoning, a prompt, a transcript or a
+ * workflow label judges from its run record when the label carries none, the name of an archived session, this team
+ * clone's ancestry for a commit split, and this machine's friction reminder state. It never reads a judge's reasoning, a prompt, a transcript or a
  * diff, and its answer carries no native session id.
  */
 import fs from 'node:fs/promises';
@@ -15,6 +15,7 @@ import type { ScoreLabel } from '../scorers/label.js';
 import { LabelStore } from '../scorers/label-store.js';
 import { cachedScorerNames, loadCachedScorer, scorerSourceHash } from '../scorers/cache.js';
 import { parseScorer } from '../scorers/definition.js';
+import { FailureLinks } from '../scorers/failure-links.js';
 import { DIMENSIONS_OFFERED, FAILING_MAX, SCORER_WINDOWS, ScorerResults, type ReminderInput, type RubricLabels, type ScorerResultsQuery, type ScorerResultsView, type Side, type ViewedLabel } from '../scorers/results.js';
 import { sessionArchiveRoot } from '../session-flow/session-cmd-shared.js';
 import { SyncManager } from '../session-flow/sync.js';
@@ -41,29 +42,46 @@ const QuerySchema = z.object({
 export function parseScorerQuery(params: URLSearchParams): ScorerQuery {
   const parsed = QuerySchema.safeParse(Object.fromEntries(['window', 'scorer', 'cohort', 'groupBy', 'commit', 'group', 'failing'].flatMap((key) => {
     const value = params.get(key);
+
     return value ? [[key, value]] : [];
   })));
+
   if (!parsed.success) {
     throw new HttpError(400, `Scorer results take window ${SCORER_WINDOWS.join(', ')}, a grouping the page offers, a commit as hex digits, and up to ${FAILING_MAX} failing labels.`);
   }
+
   const { window, scorer, cohort, groupBy, commit, group, failing } = parsed.data;
-  return {
-    windowDays: window ?? 30,
-    ...(scorer ? { scorer } : {}),
-    ...(cohort ? { cohort } : {}),
-    ...(groupBy ? { groupBy } : {}),
-    ...(commit ? { commit: commit.toLowerCase() } : {}),
-    ...(group || failing ? { failing: { ...(group ? { group } : {}), ...(failing ? { limit: failing } : {}) } } : {}),
-  };
+
+  const query: ScorerQuery = { windowDays: window ?? 30 };
+
+  if (scorer) query.scorer = scorer;
+
+  if (cohort) query.cohort = cohort;
+
+  if (groupBy) query.groupBy = groupBy;
+
+  if (commit) query.commit = commit.toLowerCase();
+
+  if (group || failing) {
+    const listed: NonNullable<ScorerQuery['failing']> = {};
+
+    if (group) listed.group = group;
+
+    if (failing) listed.limit = failing;
+    query.failing = listed;
+  }
+
+  return query;
 }
 
-/** What a run record holds that the view reads: each pass's agent, and whether the run was a benchmark (#1180). */
+/** What a run record holds that the view reads: each pass's agent, and whether the run was isolated (#1180). */
 const RecordSchema = z.object({
   steps: z.array(z.object({ step: z.string(), pass: z.number(), agent: z.unknown().optional() })).optional(),
-  benchmark: z.unknown().optional(),
+  isolated: z.literal(true).optional(),
 });
 
-type RunAgents = { source: 'local' | 'reported'; isBenchmark: boolean; agents: Map<string, RecordedAgent> };
+type RunAgents = { source: 'local' | 'reported'; isIsolated: boolean; agents: Map<string, RecordedAgent> };
+
 type PublishedRecord = z.infer<typeof RecordSchema>;
 
 const passKey = (step: string, pass: number) => `${step}#${pass}`;
@@ -72,6 +90,7 @@ const sessionKey = (platform: string, sessionId: string) => `${platform}\0${sess
 async function publishedRecord(config: LocalConfig, runId: string): Promise<PublishedRecord | undefined> {
   try {
     const parsed = RecordSchema.safeParse(JSON.parse(await fs.readFile(path.join(getReportsDir(config), RECORDS_DIR, `${runId}.json`), 'utf8')));
+
     return parsed.success ? parsed.data : undefined;
   } catch {
     return undefined;
@@ -84,14 +103,23 @@ async function publishedRecord(config: LocalConfig, runId: string): Promise<Publ
  */
 async function runAgents(config: LocalConfig, runId: string, { isLocal, team }: { isLocal: boolean; team: TeamReads }): Promise<RunAgents | undefined> {
   if (!isRunId(runId)) return undefined;
+
   const read = (steps: PublishedRecord['steps']) => new Map((steps ?? []).flatMap(({ step, pass, agent }) => {
     const recorded = readRecordedAgent(agent);
+
     return recorded ? [[passKey(step, pass), recorded] as const] : [];
   }));
+
   const [local, published] = await Promise.all([isLocal ? readRun(config, runId) : undefined, team.record(runId)]);
-  const isBenchmark = published?.benchmark !== undefined;
-  if (typeof local === 'object') return { source: 'local', isBenchmark, agents: read(buildEndRecord(local, local.driver, '').steps) };
-  return published ? { source: 'reported', isBenchmark, agents: read(published.steps) } : undefined;
+  const isolatedRecord = (record: PublishedRecord): boolean => record.isolated === true;
+
+  if (local !== undefined && local !== 'missing' && local !== 'corrupt') {
+    const record = buildEndRecord(local, local.driver, '');
+
+    return { source: 'local', isIsolated: isolatedRecord(record) || (published !== undefined && isolatedRecord(published)), agents: read(record.steps) };
+  }
+
+  return published ? { source: 'reported', isIsolated: isolatedRecord(published), agents: read(published.steps) } : undefined;
 }
 
 /**
@@ -100,9 +128,12 @@ async function runAgents(config: LocalConfig, runId: string, { isLocal, team }: 
  */
 function archivedNames(config: LocalConfig): Map<string, string> {
   const root = sessionArchiveRoot(config);
+
   if (!root) return new Map();
+
   const entries = (isSelfMode(config) ? [root] : [root, config.repo.localPath]).flatMap((dir) => new SyncManager(dir).listAllSessions())
     .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
+
   return new Map(entries.flatMap((entry) => (entry.sessionId ? [[sessionKey(entry.platform, entry.sessionId), entry.sessionName] as const] : [])));
 }
 
@@ -125,17 +156,20 @@ const teamReadsCache = new Map<string, { at: string; reads: Promise<TeamReads> }
 /** The commit checked out in `dir`, or undefined when it has none or is gone: then nothing read from it is kept. */
 async function headOf(dir: string): Promise<string | undefined> {
   const head = await execCommand('git', ['rev-parse', '--verify', '--quiet', 'HEAD'], { cwd: dir, timeoutMs: 10_000 }).catch(() => undefined);
+
   return head?.code === 0 ? head.stdout.trim() : undefined;
 }
 
 async function readTeam(config: LocalConfig): Promise<TeamReads> {
   const records = new Map<string, Promise<PublishedRecord | undefined>>();
+
   return {
     labels: await LabelStore.published(config),
     names: archivedNames(config),
     record: (runId) => {
       const record = records.get(runId) ?? publishedRecord(config, runId);
       records.set(runId, record);
+
       return record;
     },
   };
@@ -150,10 +184,13 @@ async function teamReads(config: LocalConfig): Promise<TeamReads> {
   const [reportsHead, teamHead] = usesBranchWorktree(config) ? await Promise.all([headOf(dir), headOf(config.repo.localPath)]) : [];
   const at = reportsHead && teamHead ? `${reportsHead} ${teamHead}` : undefined;
   const kept = teamReadsCache.get(dir);
+
   if (at && kept?.at === at) return kept.reads;
   const reads = readTeam(config);
+
   if (at) teamReadsCache.set(dir, { at, reads });
   else teamReadsCache.delete(dir);
+
   try {
     return await reads;
   } catch (e) {
@@ -172,14 +209,19 @@ const committedRubrics = new Map<string, Promise<readonly string[] | undefined>>
  */
 async function committedRubric(config: LocalConfig, { scorer, sourceHash, teamRevision }: { scorer: string; sourceHash: string; teamRevision: string }): Promise<readonly string[] | undefined> {
   const listed = await teamGit(config, ['ls-tree', '-r', '--name-only', teamRevision, '--', 'scorers']);
+
   if (listed.code !== 0) return undefined;
   const files = listed.stdout.split('\n').filter((file) => path.posix.basename(file) === `${scorer}.md` && [path.posix.dirname(file), path.posix.dirname(path.posix.dirname(file))].includes('scorers'));
+
   for (const file of files) {
     const shown = await teamGit(config, ['show', `${teamRevision}:${file}`]);
+
     if (shown.code !== 0 || scorerSourceHash(shown.stdout) !== sourceHash) continue;
     const parsed = parseScorer(file, shown.stdout);
+
     return parsed.ok ? parsed.definition.labels.map((label) => label.value) : undefined;
   }
+
   return undefined;
 }
 
@@ -188,11 +230,12 @@ async function committedRubric(config: LocalConfig, { scorer, sourceHash, teamRe
  * is read from the cache, and any other rubric of a scorer with a hand label from the team clone at a team revision its
  * labels carry. A rubric neither reads stays out, and the view falls back to the values its labels stored.
  */
-async function rubricLabelsOf(config: LocalConfig, labels: readonly ScoreLabel[]): Promise<RubricLabels> {
+export async function rubricLabelsOf(config: LocalConfig, labels: readonly ScoreLabel[]): Promise<RubricLabels> {
   const cached = await Promise.all((await cachedScorerNames(config)).map((name) => loadCachedScorer(config, name)));
   const known = new Map<string, readonly string[]>(cached.flatMap((scorer) => (scorer ? [[scorer.sourceHash, scorer.definition.labels.map((label) => label.value)] as const] : [])));
   const handLabelled = new Set(labels.flatMap((label) => (label.judge.kind === 'human' ? [label.scorer] : [])));
   const revisions = new Map<string, { scorer: string; sourceHash: string; teamRevisions: Set<string> }>();
+
   for (const { scorer, rubric: { sourceHash, teamRevision } } of labels) {
     if (!handLabelled.has(scorer) || known.has(sourceHash) || !teamRevision || !/^[0-9a-f]{40,64}$/.test(teamRevision)) continue;
     const key = `${scorer}\0${sourceHash}`;
@@ -200,7 +243,9 @@ async function rubricLabelsOf(config: LocalConfig, labels: readonly ScoreLabel[]
     rubric.teamRevisions.add(teamRevision);
     revisions.set(key, rubric);
   }
+
   const pending = [...revisions.values()];
+
   for (let start = 0; start < pending.length; start += SPLIT_GIT_BATCH) {
     await Promise.all(pending.slice(start, start + SPLIT_GIT_BATCH).map(async ({ scorer, sourceHash, teamRevisions }) => {
       for (const teamRevision of teamRevisions) {
@@ -208,21 +253,26 @@ async function rubricLabelsOf(config: LocalConfig, labels: readonly ScoreLabel[]
         const read = committedRubrics.get(key) ?? committedRubric(config, { scorer, sourceHash, teamRevision });
         committedRubrics.set(key, read);
         const values = await read;
+
         if (values) {
           known.set(sourceHash, values);
+
           return;
         }
+
         // A commit this clone lacks may arrive with the next pull, so only an answer is kept.
         committedRubrics.delete(key);
       }
     }));
   }
+
   return known;
 }
 
 /** The runs this machine has a run file for. */
 async function localRunIds(config: LocalConfig): Promise<Set<string>> {
   const entries = await fs.readdir(runsDir(config)).catch(() => []);
+
   return new Set(entries.flatMap((entry) => (entry.endsWith('.json') ? [entry.slice(0, -'.json'.length)] : [])));
 }
 
@@ -233,9 +283,11 @@ async function teamGit(config: LocalConfig, args: string[]) {
 /** The full commit `commit` names in this machine's team clone. Throws an HttpError the page shows when it has none. */
 async function resolveCommit(config: LocalConfig, commit: string): Promise<string> {
   const resolved = await teamGit(config, ['rev-parse', '--verify', '--quiet', '--end-of-options', `${commit}^{commit}`]);
+
   if (resolved.code !== 0) {
     throw new HttpError(400, `Commit ${commit} is not in this machine's team clone. Run teamai pull, or give a commit of the team repo.`);
   }
+
   return resolved.stdout.trim();
 }
 
@@ -243,16 +295,19 @@ async function resolveCommit(config: LocalConfig, commit: string): Promise<strin
 const SPLIT_GIT_BATCH = 8;
 
 /** Which side of `commit` each revision is on: after when the revision contains it. A revision this clone lacks has none. */
-async function sidesOf(config: LocalConfig, commit: string, revisions: ReadonlySet<string>): Promise<Map<string, Side>> {
+export async function sidesOf(config: LocalConfig, commit: string, revisions: ReadonlySet<string>): Promise<Map<string, Side>> {
   const sides = new Map<string, Side>();
   const pending = [...revisions];
+
   for (let start = 0; start < pending.length; start += SPLIT_GIT_BATCH) {
     await Promise.all(pending.slice(start, start + SPLIT_GIT_BATCH).map(async (revision) => {
       const { code } = await teamGit(config, ['merge-base', '--is-ancestor', commit, revision]);
+
       if (code === 0) sides.set(revision, 'after');
       else if (code === 1) sides.set(revision, 'before');
     }));
   }
+
   return sides;
 }
 
@@ -263,15 +318,71 @@ async function sidesOf(config: LocalConfig, commit: string, revisions: ReadonlyS
 async function reminderInput({ events, windowDays, now }: { events: readonly DashboardEvent[]; windowDays: number; now: Date }): Promise<ReminderInput> {
   const days = Math.min(windowDays, REMINDER_RECORD_DAYS);
   const { from, to } = ScorerResults.window(days, now);
+
   const sessions = [...new Set(memberEvents([...events])
     .filter((event) => event.type === 'session_start' && event.timestamp >= from && event.timestamp <= to)
     .map((event) => event.sessionId))];
+
   const decisions = await readReminderDecisions();
+
   const hinted = new Map(sessions.flatMap((session) => {
     const decision = decisions.get(sanitizeSessionId(session));
+
     return decision === undefined ? [] : [[session, decision] as const];
   }));
+
   return { days, sessions, hinted };
+}
+
+/**
+ * Every label the scorer views count, as they read it: this machine's and the team's, with what the judged work ran as
+ * and the name of an archived session, and without the labels of an isolated run, such as a benchmark's.
+ * `refresh` refreshes the reports checkout from origin first, as every reader of it.
+ */
+export async function readScorerLabels(config: LocalConfig, { refresh = true }: { refresh?: boolean } = {}): Promise<ViewedLabel[]> {
+  if (usesBranchWorktree(config)) {
+    const { readableReportsWorktree } = await import('../utils/reports-branch.js');
+    await readableReportsWorktree(config, { dryRun: !refresh });
+  }
+
+  const [local, team, localRuns] = await Promise.all([LabelStore.local(config), teamReads(config), localRunIds(config)]);
+
+  const labels = [
+    ...local.map((label) => ({ label, author: config.username ?? 'unknown' })),
+    ...team.labels.map(({ member, label }) => ({ label, author: member })),
+  ];
+
+  const runIds = new Set(labels.flatMap(({ label }) => (label.source === 'workflow' ? [label.subject.runId] : [])));
+  const runs = new Map(await Promise.all([...runIds].map(async (runId) => [runId, await runAgents(config, runId, { isLocal: localRuns.has(runId), team })] as const)));
+  const { names } = team;
+
+  return labels.flatMap(({ label, author }): ViewedLabel[] => {
+    if (label.source === 'session') {
+      const sessionName = names.get(sessionKey(label.subject.platform, label.subject.sessionId));
+
+      const entry: ViewedLabel = { label, author };
+
+      if (label.agent) entry.agent = label.agent;
+
+      if (sessionName) entry.sessionName = sessionName;
+
+      return [entry];
+    }
+
+    const run = runs.get(label.subject.runId);
+
+    if (run?.isIsolated) return [];
+    // The label's own agent outlives the run file; a label written before labels carried one reads the run's.
+    const agent = label.agent ?? run?.agents.get(passKey(label.subject.step, label.subject.pass));
+
+    const entry: ViewedLabel = { label, author };
+
+    if (agent) entry.agent = agent;
+
+    if (run) entry.runSource = run.source;
+
+    return [entry];
+  });
 }
 
 /**
@@ -285,38 +396,23 @@ export async function scorerResults({ config, query, now = new Date(), events, r
   events?: readonly DashboardEvent[];
   refresh?: boolean;
 }): Promise<ScorerResultsView> {
-  if (usesBranchWorktree(config)) {
-    const { readableReportsWorktree } = await import('../utils/reports-branch.js');
-    await readableReportsWorktree(config, { dryRun: !refresh });
-  }
-  const [local, team, localRuns] = await Promise.all([LabelStore.local(config), teamReads(config), localRunIds(config)]);
-  const labels = [
-    ...local.map((label) => ({ label, author: config.username ?? 'unknown' })),
-    ...team.labels.map(({ member, label }) => ({ label, author: member })),
-  ];
-
-  const runIds = new Set(labels.flatMap(({ label }) => (label.source === 'workflow' ? [label.subject.runId] : [])));
-  const runs = new Map(await Promise.all([...runIds].map(async (runId) => [runId, await runAgents(config, runId, { isLocal: localRuns.has(runId), team })] as const)));
-  const { names } = team;
-  const viewed: ViewedLabel[] = labels.flatMap(({ label, author }): ViewedLabel[] => {
-    if (label.source === 'session') {
-      const sessionName = names.get(sessionKey(label.subject.platform, label.subject.sessionId));
-      return [{ label, author, ...label.agent ? { agent: label.agent } : {}, ...sessionName ? { sessionName } : {} }];
-    }
-    const run = runs.get(label.subject.runId);
-    if (run?.isBenchmark) return [];
-    const agent = run?.agents.get(passKey(label.subject.step, label.subject.pass));
-    return [{ label, author, ...agent ? { agent } : {}, ...run ? { runSource: run.source } : {} }];
-  });
-
+  const viewed = await readScorerLabels(config, { refresh });
   const { commit, ...rest } = query;
-  const [split, reminders, rubricLabels] = await Promise.all([
+
+  const [split, reminders, rubricLabels, links] = await Promise.all([
     commit ? (async () => {
       const full = await resolveCommit(config, commit);
+
       return { commit: full, sideOf: await sidesOf(config, full, ScorerResults.revisions(viewed)) };
     })() : undefined,
     events ? reminderInput({ events, windowDays: query.windowDays, now }) : undefined,
     rubricLabelsOf(config, viewed.map(({ label }) => label)),
+    FailureLinks.read(config),
   ]);
-  return ScorerResults.of({ labels: viewed, query: { ...rest, ...split ? { split } : {} }, now, rubricLabels, ...reminders ? { reminders } : {} });
+
+  const resultsQuery: ScorerResultsQuery = { ...rest };
+
+  if (split) resultsQuery.split = split;
+
+  return ScorerResults.of({ labels: viewed, query: resultsQuery, now, rubricLabels, reminders, links });
 }

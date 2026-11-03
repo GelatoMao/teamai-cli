@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,15 +12,16 @@ import { LabelStore } from '../scorers/label-store.js';
 import { getReportsDir, type LocalConfig } from '../types.js';
 import { log } from '../utils/logger.js';
 import { syncWorkflowDefinitions } from '../workflow/cache.js';
-import { leaseNext, parseNextPayload, parseReport, reportAttempt, startRun, type NextOptions } from '../workflow/engine.js';
+import { createRun, leaseNext, parseNextPayload, parseReport, reportAttempt, startRun, type NextOptions } from '../workflow/engine.js';
 import { workflowRunDetail } from '../dashboard/workflow-runs.js';
 import { buildEndRecord } from '../workflow/records.js';
 import { projectRun } from '../workflow/snapshot.js';
-import { nextJudgeLease, parseJudgeRequest, parseJudgeSubmission, runJudgeLease, scoreOnDemand, scoredPasses, submitJudgeLease, type JudgeRequest } from '../workflow/scoring.js';
+import { nextJudgeLease, parseJudgeRequest, parseJudgeSubmission, runJudgeLease, scoreOnDemand, submitJudgeLease, type JudgeRequest } from '../workflow/scoring.js';
+import { scoredPasses } from '../workflow/scoring-entries.js';
 import { cancelRun, retryStep } from '../workflow/run-controls.js';
 import { installOwner, readRun, updateRun } from '../workflow/store.js';
 import type { StepState } from '../workflow/step-state.js';
-import type { DriverIdentity, RunState, WorkflowEnvelope } from '../workflow/types.js';
+import type { DriverIdentity, RunState, WorkflowDefinition, WorkflowEnvelope } from '../workflow/types.js';
 import { knownSecrets } from '../env-resolution.js';
 import * as cliPaths from '../utils/cli-path.js';
 
@@ -518,6 +520,11 @@ process.stdin.resume(); process.stdin.on('end', () => console.log(JSON.stringify
     const payload: unknown = JSON.parse('{"driver":{"kind":"t3","machine":"m1","workspace":"/w"},"outcome":"success","answer":{"label":"good","reasoning":"r"},"judge":{"usage":{"inputTokens":1e309}}}');
     expect(parseJudgeSubmission(payload)).toMatch(/^judge\.usage\.inputTokens: /);
   });
+
+  it('takes no failure code from a submitted failure: only the local judge states its own', () => {
+    const payload: unknown = JSON.parse('{"driver":{"kind":"t3","machine":"m1","workspace":"/w"},"outcome":"failed","code":"evidence_empty"}');
+    expect(parseJudgeSubmission(payload)).toEqual({ driver: { kind: 't3', machine: 'm1', workspace: '/w' }, outcome: 'failed' });
+  });
 });
 
 describe('judge work and a work budget', () => {
@@ -595,7 +602,7 @@ describe('scoring totals', () => {
     expect(sampled.totals).toEqual(unsampled.totals);
 
     const detail = await workflowRunDetail(sampled.config, 'local', sampled.runId);
-    expect(detail?.steps).toEqual([expect.objectContaining({ step: 'review', pass: 1, scores: [{ scorer: 'quality', label: 'good', passed: true }] })]);
+    expect(detail?.steps).toEqual([expect.objectContaining({ step: 'review', pass: 1, scores: [{ scorer: 'quality', label: 'good', passed: true, decidedBy: 'judge' }] })]);
     expect(detail?.scoring).toEqual({ judged: 2, inputTokens: 2000, outputTokens: 100 });
     expect(JSON.stringify(detail)).not.toContain('Quokka-marmalade');
     expect((await workflowRunDetail(unsampled.config, 'local', unsampled.runId))?.scoring).toEqual({ judged: 0, inputTokens: 0, outputTokens: 0 });
@@ -710,6 +717,131 @@ describe('scoredPasses', () => {
   });
 });
 
+describe('scoring entries', () => {
+  it('imports neither the engine nor the local driver, so the engine can import it', () => {
+    const source = fs.readFileSync('src/workflow/scoring-entries.ts', 'utf8');
+    // Every relative module it names, in a static or a dynamic import.
+    const specifiers = [...source.matchAll(/'(\.\.?\/[^']+\.js)'/g)].map(([, specifier]) => specifier);
+    expect(specifiers).not.toEqual([]);
+    expect(specifiers).not.toContain('./engine.js');
+    expect(specifiers).not.toContain('./local-driver.js');
+  });
+});
+
+/**
+ * A run of `steps` prompt steps whose scorer `quality` judges every pass (`sampling: all`), each settled with outputs
+ * through workflow next and report, and the run still running. With `tidy`, a `finally` step of that id runs a command.
+ */
+async function allSampledRun(config: LocalConfig, scorerText: string, steps = 1, { tidy = false } = {}): Promise<string> {
+  const definition: WorkflowDefinition = {
+    schemaVersion: 'v1alpha1', name: 'judged', description: 'Steps every pass of which is judged.',
+    steps: Array.from({ length: steps }, (_, index) => ({ id: `s${index + 1}`, prompt: 'Review the change.', ...(index > 0 ? { needs: [] } : {}), scorers: { names: ['quality'], sampling: 'all' } })),
+    ...(tidy ? { finally: [{ id: 'tidy', command: 'echo tidy' }] } : {}),
+  };
+  const pin = { sourceHash: createHash('sha256').update(scorerText).digest('hex'), relativePath: 'scorers/quality.md', content: scorerText };
+  const runId = String(data(await createRun(config, { name: 'judged', sourceHash: 'h', origin: { source: 'team' }, definition, scorers: { quality: pin }, secrets: {} })).run);
+  for (let step = 0; step < steps; step += 1) {
+    const lease = z.object({ attempt: z.string(), revision: z.number() }).parse(data(await leaseNext(config, runId, workDriver)).lease);
+    data(await reportAttempt(config, runId, { attempt: lease.attempt, revision: lease.revision, outcome: 'success', driver: workDriver, outputs: { reviewed: true } }));
+  }
+  return runId;
+}
+
+describe('judge work of sampling: all', () => {
+  it('offers every pass of a step with sampling: all, whatever the scorer samples', async () => {
+    const config = fixture(scorer(25));
+    const runId = await allSampledRun(config, scorer(25), 8);
+
+    const refs: string[] = [];
+    const steps: string[] = [];
+    for (;;) {
+      const answer = data(await nextJudgeLease(config, request({ running: refs })));
+      if (!('lease' in answer)) break;
+      const lease = LeaseSchema.extend({ subject: z.object({ runId: z.string(), step: z.string() }) }).parse(answer.lease);
+      refs.push(lease.ref);
+      steps.push(lease.subject.step);
+    }
+
+    expect(steps.sort()).toEqual(['s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8']);
+    expect((await runOf(config, runId)).status).toBe('running');
+  });
+
+  it('offers no sampling: all pass once its run ended, which froze it unscored', async () => {
+    const config = fixture(scorer(100));
+    const runId = await allSampledRun(config, scorer(100));
+
+    await cancelRun(config, runId, await knownSecrets(config));
+    const answer = data(await nextJudgeLease(config, request()));
+
+    expect(answer).not.toHaveProperty('lease');
+    expect((await runOf(config, runId)).verdicts).toEqual([{ scorer: 'quality', step: 's1', pass: 1, outcome: { kind: 'unscored', because: 'run_ended' } }]);
+  });
+
+  it('refuses an answer for a sampling: all pass after its run ended, records no label, and releases the lease', async () => {
+    const config = fixture(scorer(100));
+    const runId = await allSampledRun(config, scorer(100));
+    const lease = leaseOf(await nextJudgeLease(config, request()));
+    await cancelRun(config, runId, await knownSecrets(config));
+
+    const late = await submitJudgeLease(config, lease.ref, { driver: judgeDriver, outcome: 'success', answer: { label: 'good', reasoning: 'r' } });
+
+    const [entry = '', attempt = ''] = lease.ref.split('/');
+    expect(late).toEqual({ error: { code: 'entry_closed', message: `Run ${runId} froze this entry's verdict when its steps ended, so the answer was not recorded.` } });
+    expect(await LabelStore.local(config)).toEqual([]);
+    expect(await AttemptStore.get(config, entry, attempt)).toMatchObject({ status: 'released' });
+  });
+});
+
+describe('verdicts and finally steps', () => {
+  const failure = { code: 'command_failed', message: 'command exited with status 1' };
+  const leased = async (config: LocalConfig, runId: string) => z.object({ step: z.string(), attempt: z.string(), revision: z.number() })
+    .parse(data(await leaseNext(config, runId, workDriver)).lease);
+
+  it('freezes the verdicts once the judges settle, before the finally steps run, and a failed finally step leaves them', async () => {
+    const config = fixture(scorer(100));
+    const runId = await allSampledRun(config, scorer(100), 1, { tidy: true });
+    expect(data(await leaseNext(config, runId, workDriver))).toMatchObject({ wait: { judging: 1 } });
+    const lease = leaseOf(await nextJudgeLease(config, request()));
+    data(await submitJudgeLease(config, lease.ref, { driver: judgeDriver, outcome: 'success', answer: { label: 'missed', reasoning: 'r' } }));
+    const verdicts = [{ scorer: 'quality', step: 's1', pass: 1, outcome: { kind: 'labelled', label: 'missed', passed: false } }];
+
+    const tidy = await leased(config, runId);
+
+    expect(tidy.step).toBe('tidy');
+    expect(await runOf(config, runId)).toMatchObject({ status: 'running', finalizing: { outcome: 'succeeded' }, verdicts });
+    data(await reportAttempt(config, runId, { attempt: tidy.attempt, revision: tidy.revision, outcome: 'failed', driver: workDriver, message: failure.message, failure }));
+    expect(data(await leaseNext(config, runId, workDriver))).toMatchObject({ done: { outcome: 'succeeded', finally: [{ id: 'tidy', outcome: 'failed' }] } });
+    expect((await runOf(config, runId)).verdicts).toEqual(verdicts);
+  });
+
+  it('freezes an open entry unscored when a cancel ends the steps, and offers it to no judge while the finally steps run', async () => {
+    const config = fixture(scorer(100));
+    const runId = await allSampledRun(config, scorer(100), 1, { tidy: true });
+    const verdicts = [{ scorer: 'quality', step: 's1', pass: 1, outcome: { kind: 'unscored', because: 'run_ended' } }];
+
+    expect(data(await cancelRun(config, runId, await knownSecrets(config)))).toMatchObject({ run: { status: 'running', finalizing: { outcome: 'cancelled' } } });
+
+    expect((await runOf(config, runId)).verdicts).toEqual(verdicts);
+    expect(data(await nextJudgeLease(config, request()))).not.toHaveProperty('lease');
+    const tidy = await leased(config, runId);
+    data(await reportAttempt(config, runId, { attempt: tidy.attempt, revision: tidy.revision, outcome: 'success', driver: workDriver }));
+    expect(data(await leaseNext(config, runId, workDriver))).toMatchObject({ done: { outcome: 'cancelled' } });
+    expect((await runOf(config, runId)).verdicts).toEqual(verdicts);
+  });
+
+  it('refuses an answer leased before the steps ended once the finally steps run, and records no label', async () => {
+    const config = fixture(scorer(100));
+    const runId = await allSampledRun(config, scorer(100), 1, { tidy: true });
+    const lease = leaseOf(await nextJudgeLease(config, request()));
+    data(await cancelRun(config, runId, await knownSecrets(config)));
+
+    const late = await submitJudgeLease(config, lease.ref, { driver: judgeDriver, outcome: 'success', answer: { label: 'good', reasoning: 'r' } });
+
+    expect(late).toEqual({ error: { code: 'entry_closed', message: `Run ${runId} froze this entry's verdict when its steps ended, so the answer was not recorded.` } });
+    expect(await LabelStore.local(config)).toEqual([]);
+  });
+});
+
 describe('team skills a pass used', () => {
   const labelled = async (config: LocalConfig): Promise<unknown> => {
     const lease = leaseOf(await nextJudgeLease(config, request()));
@@ -806,6 +938,125 @@ describe('the run mode of a judged pass (#1384)', () => {
     data(await cancelRun(config, runId, await knownSecrets(config)));
 
     expect(await runOf(config, runId)).toMatchObject({ steps: [{ status: 'cancelled', runMode: 'unattended' }] });
+  });
+});
+
+describe('the harness a judged pass ran with', () => {
+  const labelled = async (config: LocalConfig): Promise<Record<string, unknown>> => {
+    const lease = leaseOf(await nextJudgeLease(config, request()));
+    data(await submitJudgeLease(config, lease.ref, { driver: judgeDriver, outcome: 'success', answer: { label: 'good', reasoning: 'r' } }));
+    return z.object({}).passthrough().parse((await LabelStore.local(config))[0]);
+  };
+  const team = { revision: 'a'.repeat(40), localChanges: false, selection: { scope: 'project' as const, primaryRole: 'frontend', additionalRoles: [] } };
+  const agentOfStep = (run: RunState, id: string) => {
+    const step = run.steps.find((each) => each.id === id);
+    return step && 'agent' in step ? step.agent : undefined;
+  };
+
+  it('labels a prompt pass with the agent its pass recorded, also when it recorded no model and so no fingerprint', async () => {
+    const config = fixture(scorer(100));
+    const runId = await settledRun(config, { tool: 'claude', agent: { tool: { version: '2.1.308' }, effort: { requested: 'high' }, team } });
+    const recorded = agentOfStep(await runOf(config, runId), 'review');
+
+    const label = await labelled(config);
+
+    expect(recorded).toMatchObject({ tool: { name: 'claude', version: '2.1.308' }, effort: { requested: 'high' }, team, driver: 'external' });
+    expect(recorded).not.toHaveProperty('fingerprint');
+    expect(label.agent).toEqual(recorded);
+  });
+
+  it('names the judged harness in the submit answer, also when the same lease is submitted again', async () => {
+    const config = fixture(scorer(100));
+    const runId = await settledRun(config, { tool: 'claude', model: 'claude-review-1', agent: { effort: { requested: 'high' }, team } });
+    const recorded = agentOfStep(await runOf(config, runId), 'review');
+    const lease = leaseOf(await nextJudgeLease(config, request()));
+    const success = { driver: judgeDriver, outcome: 'success', answer: { label: 'good', reasoning: 'r' } } as const;
+
+    const first = data(await submitJudgeLease(config, lease.ref, success));
+    const again = data(await submitJudgeLease(config, lease.ref, success));
+
+    expect(recorded).toMatchObject({ model: { reported: 'claude-review-1' }, team });
+    expect(first).toMatchObject({ label: { label: 'good', agent: recorded } });
+    expect(again).toMatchObject({ label: { label: 'good', agent: recorded } });
+  });
+
+  it('shows the judge nothing of the harness: its prompt and evidence name no tool version, model, role or team revision of the pass', async () => {
+    const config = fixture(scorer(100));
+    const stepTeam = { ...team, revision: 'e'.repeat(40), selection: { ...team.selection, primaryRole: 'harness-only-role' } };
+    await settledRun(config, { tool: 'claude', model: 'harness-only-model', agent: { tool: { version: '9.8.7' }, team: stepTeam } });
+
+    const lease = leaseOf(await nextJudgeLease(config, request()));
+    const read = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const file = path.join(dir, entry.name);
+      return entry.isDirectory() ? read(file) : [fs.readFileSync(file, 'utf8')];
+    });
+    const shown = [fs.readFileSync(lease.prompt, 'utf8'), ...read(lease.evidence)].join('\n');
+
+    expect(shown).toContain('Judge the review.');
+    for (const harness of ['9.8.7', 'harness-only-model', 'harness-only-role', 'e'.repeat(40)]) expect(shown).not.toContain(harness);
+    data(await submitJudgeLease(config, lease.ref, { driver: judgeDriver, outcome: 'success', answer: { label: 'good', reasoning: 'r' } }));
+    expect((await LabelStore.local(config))[0]).toMatchObject({ agent: { model: { reported: 'harness-only-model' }, team: stepTeam } });
+  });
+
+  describe('of a workflow step', () => {
+    const subWorkflow = (reviewKeys: string) => `schemaVersion: v1alpha1
+name: review
+description: A drafted, checked and reviewed change, judged as one.
+steps:
+  - id: check
+    scorers: [quality]
+    workflow:
+      steps:
+        - id: draft
+          prompt: Draft the change.
+        - id: lint
+          needs: [draft]
+          command: npm run lint
+        - id: review
+          needs: [lint]
+          prompt: Review the change.${reviewKeys}
+`;
+    const ran = { tool: 'claude', model: 'claude-review-1', agent: { effort: { requested: 'high' }, team } };
+    const project = (commit: string) => ({ project: { commit: commit.repeat(40), dirty: false } });
+
+    /** Runs the workflow with `reviewKeys` on its review step, reporting each step as `reports` gives, and labels `check`. */
+    async function labelledCheck(reviewKeys: string, reports: Record<'draft' | 'lint' | 'review', Record<string, unknown>>) {
+      const config = fixture(scorer(100));
+      fs.writeFileSync(path.join(config.repo.localPath, 'workflows', 'review.yaml'), subWorkflow(reviewKeys));
+      await syncWorkflowDefinitions(config);
+      const runId = String(data(await startRun(config, 'review', {}, { secrets: await knownSecrets(config) })).run);
+      for (const step of ['draft', 'lint', 'review'] as const) {
+        const lease = z.object({ attempt: z.string(), revision: z.number(), step: z.string() }).parse(data(await leaseNext(config, runId, workDriver)).lease);
+        expect(lease.step).toBe(`check.${step}`);
+        await reportAttempt(config, runId, { attempt: lease.attempt, revision: lease.revision, outcome: 'success', driver: workDriver, outputs: { done: true }, ...reports[step] });
+      }
+      expect(data(await leaseNext(config, runId, workDriver))).toMatchObject({ done: { outcome: 'succeeded' } });
+      const run = await runOf(config, runId);
+      const label = z.object({ subject: z.object({ step: z.literal('check') }) }).passthrough().parse(await labelled(config));
+      return { label, run };
+    }
+
+    it('takes the agent of its first prompt pass when every prompt pass agrees on it, whatever its command passes recorded', async () => {
+      const { label, run } = await labelledCheck('', {
+        draft: { ...ran, agent: { ...ran.agent, ...project('c') } },
+        lint: {},
+        review: { ...ran, agent: { ...ran.agent, ...project('d') } },
+      });
+
+      const draft = agentOfStep(run, 'check.draft');
+      expect(draft).toMatchObject({ tool: { name: 'claude' }, model: { reported: 'claude-review-1' }, project: { commit: 'c'.repeat(40) } });
+      expect(label.agent).toEqual(draft);
+    });
+
+    it.each([
+      ['their definitions differ', '\n          agent: reviewer', { review: ran }],
+      ['one ran with a role of its own', '', { review: { ...ran, agent: { ...ran.agent, team: { ...team, selection: { ...team.selection, stepRole: 'review' } } } } }],
+      ['one recorded no agent', '', { review: {} }],
+    ])('records no agent when its prompt passes do not agree because %s', async (_, reviewKeys, reports) => {
+      const { label } = await labelledCheck(reviewKeys, { draft: ran, lint: {}, ...reports });
+
+      expect(label).not.toHaveProperty('agent');
+    });
   });
 });
 

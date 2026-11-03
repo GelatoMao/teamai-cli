@@ -10,7 +10,7 @@ import path from 'node:path';
 import { simpleGit } from 'simple-git';
 
 import { getDataHome, getReportsDir, getVotesDir, REPORTS_WORKTREE_DIRNAME, type LocalConfig } from '../types.js';
-import { commitAndPushReports, ensureReportsWorktree, refreshReportsWorktree, updateReports } from '../utils/reports-branch.js';
+import { commitAndPushReports, ensureReportsWorktree, readReportsOriginFiles, refreshReportsWorktree, updateReports } from '../utils/reports-branch.js';
 import { isPublished } from '../utils/branch-worktree.js';
 import { pushRepoDirectly } from '../utils/git.js';
 import { reportUsage } from '../team-push.js';
@@ -377,6 +377,30 @@ describe('git-kind reports: read-only cold start (#558)', () => {
   });
 });
 
+describe('git-kind reports: reading what origin holds', () => {
+  it('reads several files as origin holds them, and null for one origin does not have', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const alice = gitConfig(clone, origin);
+    expect(await publish(alice, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+    expect(await publish(alice, 'stats/Alice Smith.yaml', 'name: Zoë\n')).toBe(true);
+    const wt = await ensureReportsWorktree(alice);
+    // Committed here but never pushed: not what origin holds.
+    fs.mkdirSync(path.join(wt, 'votes'), { recursive: true });
+    fs.writeFileSync(path.join(wt, 'votes', 'alice.yaml'), 'version: 2\n');
+    await simpleGit(wt).add(['votes/alice.yaml']);
+    await simpleGit(wt).commit('local only');
+
+    const read = await readReportsOriginFiles(wt, ['stats/Alice Smith.yaml', 'votes/alice.yaml', 'members/alice.yaml', 'members/nobody.yaml']);
+
+    expect(Object.fromEntries(read)).toEqual({
+      'stats/Alice Smith.yaml': 'name: Zoë\n',
+      'votes/alice.yaml': null,
+      'members/alice.yaml': 'username: alice\n',
+      'members/nobody.yaml': null,
+    });
+  });
+});
+
 describe('git-kind reports: refresh before reading (#557)', () => {
   it('picks up report data another member pushed', async () => {
     const { origin, clone } = await seedBareOrigin();
@@ -413,6 +437,20 @@ describe('git-kind reports: refresh before reading (#557)', () => {
     expect(fs.readFileSync(path.join(wt, 'stats', 'alice.yaml'), 'utf-8')).toBe('n: 1\n');
 
     expect(await publish(alice, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+    expect(await originReportsFile(origin, 'stats/alice.yaml')).toBe('n: 1\n');
+    expect(await originReportsFile(origin, 'votes/bob.yaml')).toBe('version: 2\n');
+  });
+
+  it('delivers a report whose first push lost the race to another member, on top of theirs', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const alice = gitConfig(clone, origin);
+    expect(await publish(alice, 'members/alice.yaml', 'username: alice\n')).toBe(true);
+
+    const bob = await cloneCheckout(origin, 'bob', 'bob');
+    expect(await publish(bob, 'votes/bob.yaml', 'version: 2\n')).toBe(true);
+
+    // Alice's checkout has not seen Bob's push, so origin rejects her first push.
+    expect(await publish(alice, 'stats/alice.yaml', 'n: 1\n')).toBe(true);
     expect(await originReportsFile(origin, 'stats/alice.yaml')).toBe('n: 1\n');
     expect(await originReportsFile(origin, 'votes/bob.yaml')).toBe('version: 2\n');
   });
@@ -986,4 +1024,36 @@ describe('git-kind reports: a stalled origin', () => {
     // body chunk, so its stall limit lands that long after the kill.
     await vi.waitFor(async () => expect(await openConnections()).toBe(0), { timeout: 20_000, interval: 100 });
   }, 30_000);
+});
+
+describe('git-kind reports: an origin that answers every request with an error', () => {
+  let server: http.Server;
+  let failingUrl: string;
+  const requests: string[] = [];
+
+  beforeEach(async () => {
+    requests.length = 0;
+    server = http.createServer((req, res) => {
+      requests.push(req.url ?? '');
+      res.writeHead(503).end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === 'string') throw new Error('failed to bind test server');
+    failingUrl = `http://127.0.0.1:${addr.port}/team.git`;
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('asks origin once per write, since no fetch or rebase makes it answer', async () => {
+    const { origin, clone } = await seedBareOrigin();
+    const cfg = gitConfig(clone, origin);
+    await ensureReportsWorktree(cfg);
+    await simpleGit(clone).remote(['set-url', 'origin', failingUrl]);
+
+    expect(await publish(cfg, 'stats/alice.yaml', 'n: 1\n')).toBe(false);
+    expect(requests).toEqual(['/team.git/info/refs?service=git-receive-pack']);
+  });
 });

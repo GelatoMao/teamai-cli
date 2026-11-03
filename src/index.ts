@@ -7,6 +7,8 @@ import type { GlobalOptions, LocalConfig } from './types.js';
 import type { MaintenancePaths } from './maintenance/paths.js';
 import type { ScoreOptions } from './score-commands.js';
 import { GLOBAL_OPTIONS } from './global-options.js';
+import { ATTEMPT_ENV } from './launch-context.js';
+import { useInstallHome } from './utils/home.js';
 import { TEAMAI_HOOK_SUBCOMMANDS } from './hooks.js';
 import { dryRunRefusal } from './dry-run-guard.js';
 import { registerPackagesCommand } from './pkg/register-command.js';
@@ -28,6 +30,7 @@ const MIGRATION_TRIGGER_COMMANDS = new Set(['init', 'pull', 'push']);
 function queuesLearnings(command: Command): boolean {
   const name = command.name();
   const opts = command.opts();
+
   return (
     (name === 'contribute' && opts.scope !== 'user') ||
     (name === 'import' && opts.fromMr !== undefined && opts.output === undefined)
@@ -42,6 +45,7 @@ function queuesLearnings(command: Command): boolean {
  */
 function needsQueueOutOfCheckout(command: Command): boolean {
   const projectInit = command.name() === 'init' && command.parent?.parent === null && command.opts().scope !== 'user';
+
   return queuesLearnings(command) || projectInit;
 }
 
@@ -56,6 +60,7 @@ const { version } = require('../package.json');
 /** A command that needs a team says so in one line instead of a stack trace, as `env list` does. */
 async function reportNotInitialized(run: () => Promise<void>): Promise<void> {
   const { NotInitializedError } = await import('./config.js');
+
   try {
     await run();
   } catch (e) {
@@ -78,9 +83,10 @@ async function reportNotInitialized(run: () => Promise<void>): Promise<void> {
  * The trace is not lost: `log.debug` always appends it to ~/.teamai/debug.log,
  * and prints it on the console only under `--verbose`.
  */
-export async function reportCommandError(e: unknown): Promise<void> {
-  const error = e instanceof Error ? e : undefined;
-  log.error(error?.message || error?.name || String(e));
+export async function reportCommandError(cause: unknown): Promise<void> {
+  const error = cause instanceof Error ? cause : undefined;
+  log.error(error?.message || error?.name || String(cause));
+
   if (error?.stack) log.debug(error.stack);
   process.exitCode = 1;
 }
@@ -112,16 +118,29 @@ program
   .name('teamai')
   .description('TeamAI — Make Every Team AI Native')
   .version(version);
+
 for (const [flags, description] of GLOBAL_OPTIONS) program.option(flags, description);
+
 program
   .hook('preAction', async (thisCommand, actionCommand) => {
+    // A command a step starts in its clone reads and writes under that clone's own install, as the install's pull did,
+    // so nothing it writes reaches the member's home. First, so every path resolved below is the install's.
+    if (process.env[ATTEMPT_ENV] !== undefined) {
+      const { attemptCloneHome } = await import('./workflow/place/place.js');
+      const home = await attemptCloneHome(process.cwd(), process.env);
+
+      if (home) useInstallHome(home);
+    }
+
     const opts = thisCommand.opts();
+
     if (opts.verbose) setVerbose(true);
 
     // A command with no --dry-run preview refuses the flag rather than run for
     // real (#900). First, so neither migration nor a hook command slips past.
     if (opts.dryRun) {
       const refusal = dryRunRefusal(actionCommand);
+
       if (refusal) thisCommand.error(refusal, { exitCode: 1 });
     }
 
@@ -131,15 +150,20 @@ program
     // silent path that must never move 12MB, and only write commands trigger a
     // move (read-only commands use the double-read fallback). Dry-run previews.
     const name = actionCommand.name();
-    if (TEAMAI_HOOK_SUBCOMMANDS.includes(name as (typeof TEAMAI_HOOK_SUBCOMMANDS)[number])) return;
+
+    if (TEAMAI_HOOK_SUBCOMMANDS.some((subcommand) => subcommand === name)) return;
+
     if (!triggersMigration(actionCommand)) return;
+
     try {
       process.cwd();
     } catch {
       thisCommand.error('Current working directory is unavailable. Change to an existing directory and retry.', { exitCode: 1 });
     }
+
     const { maybeMigrate, queueKeptInCheckout } = await import('./migrate.js');
     let migration;
+
     try {
       migration = await maybeMigrate({ dryRun: !!opts.dryRun });
     } catch (e) {
@@ -147,10 +171,11 @@ program
       // state. Surface a clean message and exit — the copy→verify→rename design
       // leaves the source intact, so a rerun retries safely. (Without this the
       // async-hook rejection would surface as a raw unhandled-rejection stack.)
-      log.error(`Auto-migration failed: ${(e as Error).message}`);
+      log.error(`Auto-migration failed: ${e instanceof Error ? e.message : String(e)}`);
       log.error('Your original .teamai data is unchanged. Re-run the command to retry.');
       process.exit(1);
     }
+
     // A learning queued in this checkout would go with it when the worktree is
     // removed (#808).
     if (needsQueueOutOfCheckout(actionCommand)) {
@@ -158,6 +183,7 @@ program
       // self-heal here would enable every tool in HOME before `--agent`
       // could choose them (#993).
       const kept = await queueKeptInCheckout(migration, { dryRun: !!opts.dryRun, selfHeal: name !== 'init' });
+
       if (kept) {
         log.error(kept);
         process.exit(1);
@@ -183,10 +209,10 @@ program
   // comma-separated (`--agent a,b`, split later by normalizeAgentList) both work,
   // WITHOUT the greedy `<name...>` variadic that would swallow the `[repo]`
   // positional (e.g. `init --agent claude .` must keep `.` as the repo arg).
-  .option('--agent <name>', 'AI tools to set up (e.g. claude, codex, cursor, codebuddy, workbuddy, dsh). Repeatable or comma-separated. In single-repo mode, selects which tool dirs to create; a custom agent defined only in teamai.yaml\'s toolPaths also gets its root created here (git-backed init only — an HTTP init has no local teamai.yaml to read custom paths from). Omit for an interactive picker. Additive on repeated runs.', (val: string, acc: string[]) => acc.concat(val), [] as string[])
+  .option('--agent <name>', 'AI tools to set up (e.g. claude, codex, cursor, codebuddy, workbuddy, dsh). Repeatable or comma-separated. In single-repo mode, selects which tool dirs to create; a custom agent defined only in teamai.yaml\'s toolPaths also gets its root created here (git-backed init only — an HTTP init has no local teamai.yaml to read custom paths from). Omit for an interactive picker. Additive on repeated runs.', (val: string, acc: string[]) => acc.concat(val), [])
   .option('--force', 'Rewrite the existing config without confirmation, keeping the settings init does not set')
   .action(async (repoArg, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { init } = await import('./init.js');
     await init({ ...globalOpts, ...cmdOpts, repoPositional: repoArg });
   });
@@ -203,16 +229,24 @@ program
     + '— skills, knowledge for rules, agents, learnings, docs, env, hooks, mcp, models, and more (from manifest/projects.yaml)')
   .option('--shared', 'Place new resources at the shared root for all roles; cannot combine with --role or --project')
   .option('--branch <name>', 'Push to this destination branch instead of a generated teamai/push branch')
+  .option('--file <local file>', 'Push exactly this local file, byte for byte, to the team path --path names, as a pull request. '
+    + 'No other change in the team clone joins it; requires --path')
+  .option('--path <team path>', 'Where --file goes in the team repo, such as benchmarks/frontend/tasks/pod-startup.yaml or scorers/review.md. '
+    + 'Placed exactly there, never relocated; cannot combine with --skill, --role, --project, --shared, --all or --carried')
   .option('--carried <path@blob>', 'Override the stop for a push that would overwrite or delete a placed agent file a teammate changed. '
     + 'Use it only after carrying that change into your root copy, with the value the stop printed; '
-    + 'a later team edit stops the push again. Repeatable', (val: string, acc: string[]) => acc.concat(val), [] as string[])
+    + 'a later team edit stops the push again. Repeatable', (val: string, acc: string[]) => acc.concat(val), [])
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
+    // --file and --path name one file and its destination: no scan, no placement.
+    const { isFilePush, pushFile } = await import('./push-file.js');
     const { push } = await import('./push.js');
     // Only notify when a real push actually happened — not on dry-run, cancel,
     // no-change, or a handled failure (#702 follow-up).
     const outcome = { completed: false };
-    await reportNotInitialized(() => push({ ...globalOpts, ...cmdOpts }, outcome));
+    const options = { ...globalOpts, ...cmdOpts };
+    await reportNotInitialized(() => (isFilePush(options) ? pushFile(options, outcome) : push(options, outcome)));
+
     if (outcome.completed) await notifyWebhook('push');
   });
 
@@ -223,7 +257,8 @@ program
   .option('--force', 'Force full sync even if repo is unchanged')
   .option('--team-ref <ref>', 'Pin this workspace to a branch, tag or commit of the team repo; the default branch unpins it')
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
+
     if (cmdOpts.silent) setSilent(true);
     const { pull } = await import('./pull.js');
     // Only notify when a real (non-dry-run) sync completed. The SessionStart hook
@@ -231,6 +266,7 @@ program
     // the `pull` command event (#702 follow-up).
     const outcome = { completed: false };
     await pull({ ...globalOpts, ...cmdOpts, interactive: !cmdOpts.silent }, outcome);
+
     if (!cmdOpts.silent && outcome.completed) await notifyWebhook('pull');
   });
 
@@ -239,7 +275,7 @@ program
   .description('Show local vs team repo diff')
   .option('--all', 'List every project data partition under ~/.teamai/projects (flags stale/orphan ones)')
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { status } = await import('./status.js');
     await reportNotInitialized(() => status({ ...globalOpts, ...cmdOpts }));
   });
@@ -251,7 +287,7 @@ program
   .option('--agent <name>', 'Filter local agents by id (only applies to skills)')
   .option('--reveal', 'Show env values in plaintext (default: masked)')
   .action(async (type, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { list } = await import('./status.js');
     await reportNotInitialized(() => list(type, { ...globalOpts, ...cmdOpts }));
   });
@@ -260,7 +296,7 @@ const skillCmd = program
   .command('skill')
   .description('List and inspect skills (default: repo + installed agents, then the CLI-served catalog)')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { skillList } = await import('./skill-cmd.js');
     await skillList(globalOpts);
   });
@@ -270,7 +306,7 @@ skillCmd
   .description('List team and installed skills, then the built-in catalog the CLI serves')
   .option('--json', 'Output the CLI-served built-in skill catalog as JSON')
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { skillList } = await import('./skill-cmd.js');
     await skillList({ ...globalOpts, ...cmdOpts });
   });
@@ -301,7 +337,7 @@ skillCmd
   .command('show <name>')
   .description('Show skill metadata: source / contributors / installed agents / description')
   .action(async (name: string, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { skillShow } = await import('./skill-cmd.js');
     await skillShow(name, { ...globalOpts, ...cmdOpts });
   });
@@ -310,7 +346,7 @@ const excludeCmd = skillCmd
   .command('exclude')
   .description('Manage per-user skill exclusion (skip sync without affecting team repo)')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { excludeList } = await import('./exclude.js');
     await excludeList(globalOpts);
   });
@@ -319,7 +355,7 @@ excludeCmd
   .command('list')
   .description('List excluded skills')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { excludeList } = await import('./exclude.js');
     await excludeList(globalOpts);
   });
@@ -328,7 +364,7 @@ excludeCmd
   .command('add <skills...>')
   .description('Add skill(s) to the exclude list')
   .action(async (skills: string[]) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { excludeAdd } = await import('./exclude.js');
     await excludeAdd(skills, globalOpts);
   });
@@ -337,7 +373,7 @@ excludeCmd
   .command('remove <skills...>')
   .description('Remove skill(s) from the exclude list')
   .action(async (skills: string[]) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { excludeRemove } = await import('./exclude.js');
     await excludeRemove(skills, globalOpts);
   });
@@ -347,7 +383,7 @@ const membersCmd = program
   .description('Manage team members')
   .action(async () => {
     // Default action: list members (backward compatible)
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { listMembers } = await import('./members.js');
     await listMembers(globalOpts);
   });
@@ -356,7 +392,7 @@ membersCmd
   .command('list')
   .description('List team members')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { listMembers } = await import('./members.js');
     await listMembers(globalOpts);
   });
@@ -368,7 +404,7 @@ program
   .option('--role <ns>', 'mcp: remove the server from mcp/<ns>/mcp.yaml instead of the root mcp/mcp.yaml')
   .option('--project <id>', "mcp: remove the server from the project's mcp namespace instead of the root mcp/mcp.yaml")
   .action(async (type, names, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { remove } = await import('./remove.js');
     await remove(type, names, { ...globalOpts, ...cmdOpts });
   });
@@ -381,9 +417,10 @@ program
   .option('--json', 'Output the report as JSON (suitable for CI)')
   .option('--fix', 'Remove lock files left behind by dead processes')
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { doctor } = await import('./doctor.js');
     const allPassed = await doctor({ ...globalOpts, ...cmdOpts });
+
     if (!allPassed) process.exitCode = 1;
   });
 
@@ -402,7 +439,7 @@ rolesCmd
   .command('init')
   .description('Create a roles manifest for the team repo (admin)')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { rolesInit } = await import('./roles-cmd.js');
     await rolesInit(globalOpts);
   });
@@ -421,7 +458,7 @@ rolesCmd
   .description('Set your primary role (updates local config; refused when manifest/members.yaml assigns roles)')
   .option('--add <roles...>', 'Additional roles to include')
   .action(async (primary: string, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { rolesSet } = await import('./roles-cmd.js');
     await rolesSet(primary, { ...globalOpts, ...cmdOpts });
   });
@@ -432,7 +469,7 @@ rolesCmd
   .requiredOption('--namespaces <ns>', 'Comma-separated resource namespaces (e.g. common,hai)')
   .option('-d, --description <desc>', 'Description for the role')
   .action(async (id: string, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { rolesAdd } = await import('./roles-cmd.js');
     await rolesAdd(id, { ...globalOpts, ...cmdOpts });
   });
@@ -441,7 +478,7 @@ rolesCmd
   .command('remove <id>')
   .description('Remove a role from the manifest (admin)')
   .action(async (id: string) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { rolesRemove } = await import('./roles-cmd.js');
     await rolesRemove(id, globalOpts);
   });
@@ -453,7 +490,7 @@ rolesCmd
   .option('--remove-namespaces <ns>', 'Comma-separated namespaces to remove')
   .option('-d, --description <desc>', 'New description for the role')
   .action(async (id: string, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { rolesUpdate } = await import('./roles-cmd.js');
     await rolesUpdate(id, { ...globalOpts, ...cmdOpts });
   });
@@ -465,7 +502,7 @@ const projectsCmd = program
   .description('Manage multi-project resource distribution (orthogonal to roles)')
   .action(async () => {
     // Default action: list projects
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { projectsList } = await import('./projects-cmd.js');
     await projectsList(globalOpts);
   });
@@ -474,7 +511,7 @@ projectsCmd
   .command('list')
   .description('List defined projects and the ones active in this directory')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { projectsList } = await import('./projects-cmd.js');
     await projectsList(globalOpts);
   });
@@ -483,7 +520,7 @@ projectsCmd
   .command('set [ids...]')
   .description('Set the projects active in this directory (comma-separated or repeated; empty to clear)')
   .action(async (ids: string[] = [], _cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { projectsSet } = await import('./projects-cmd.js');
     await projectsSet(ids, globalOpts);
   });
@@ -495,7 +532,7 @@ projectsCmd
   .option('--name <name>', 'Display name for the project')
   .option('-d, --description <desc>', 'Description for the project')
   .action(async (id: string, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { projectsAdd } = await import('./projects-cmd.js');
     await projectsAdd(id, { ...globalOpts, ...cmdOpts });
   });
@@ -508,7 +545,7 @@ projectsCmd
   .option('--name <name>', 'New display name for the project')
   .option('-d, --description <desc>', 'New description for the project')
   .action(async (id: string, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { projectsUpdate } = await import('./projects-cmd.js');
     await projectsUpdate(id, { ...globalOpts, ...cmdOpts });
   });
@@ -517,7 +554,7 @@ projectsCmd
   .command('remove <id>')
   .description('Remove a project from manifest/projects.yaml (admin)')
   .action(async (id: string) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { projectsRemove } = await import('./projects-cmd.js');
     await projectsRemove(id, globalOpts);
   });
@@ -526,7 +563,7 @@ projectsCmd
   .command('members <id>')
   .description('List members registered for a project')
   .action(async (id: string) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { projectsMembers } = await import('./projects-cmd.js');
     await projectsMembers(id, globalOpts);
   });
@@ -554,7 +591,7 @@ tagsCmd
   .command('subscribe <tags...>')
   .description('Subscribe to tags (only matching skills/rules will be synced)')
   .action(async (tags: string[]) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { tagsSubscribe } = await import('./tags.js');
     await tagsSubscribe(tags, globalOpts);
   });
@@ -563,7 +600,7 @@ tagsCmd
   .command('unsubscribe <tags...>')
   .description('Unsubscribe from tags')
   .action(async (tags: string[]) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { tagsUnsubscribe } = await import('./tags.js');
     await tagsUnsubscribe(tags, globalOpts);
   });
@@ -580,11 +617,13 @@ tagsCmd
       '    $ teamai tags add rules common-coding-style coding best-practices\n',
   )
   .action(async (type: string, name: string, tags: string[]) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
+
     if (type !== 'skills' && type !== 'rules') {
       console.error('Type must be "skills" or "rules"');
       process.exit(1);
     }
+
     const { tagsAdd } = await import('./tags.js');
     await tagsAdd(type, name, tags, globalOpts);
   });
@@ -601,11 +640,13 @@ tagsCmd
       '    $ teamai tags remove rules common-coding-style best-practices\n',
   )
   .action(async (type: string, name: string, tags: string[]) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
+
     if (type !== 'skills' && type !== 'rules') {
       console.error('Type must be "skills" or "rules"');
       process.exit(1);
     }
+
     const { tagsRemove } = await import('./tags.js');
     await tagsRemove(type, name, tags, globalOpts);
   });
@@ -625,7 +666,7 @@ sourceCmd
   .description('Add a cross-team source repo')
   .option('--name <name>', 'Alias for this source')
   .action(async (repo: string, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { sourceAdd } = await import('./source.js');
     await sourceAdd(repo, { ...globalOpts, ...cmdOpts });
   });
@@ -634,7 +675,7 @@ sourceCmd
   .command('remove <name>')
   .description('Remove a source and clean up its skills')
   .action(async (name: string) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { sourceRemove } = await import('./source.js');
     await sourceRemove(name, globalOpts);
   });
@@ -646,7 +687,7 @@ sourceCmd
   .option('--agent <name>', 'The AI tool this token is for (e.g. codebuddy, claude); hooks are injected into that tool only. An agent access token (sk-) works for one agent only, so each agent keeps its own; while that agent\'s current token still works it is kept and the new one is not used.')
   .option('--force', 'Overwrite an existing HTTP source config')
   .action(async (endpoint: string, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { sourceAddHttp } = await import('./source.js');
     await sourceAddHttp(endpoint, { ...globalOpts, ...cmdOpts });
   });
@@ -655,7 +696,7 @@ sourceCmd
   .command('remove-http')
   .description('Remove the HTTP source and clean up its resources')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { sourceRemoveHttp } = await import('./source.js');
     await sourceRemoveHttp(globalOpts);
   });
@@ -680,7 +721,7 @@ sourceCmd
   .command('browse <name>')
   .description('Browse public skills from a source')
   .action(async (name: string) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { sourceBrowse } = await import('./source.js');
     await sourceBrowse(name, globalOpts);
   });
@@ -692,7 +733,7 @@ program
   .description('Check for updates and upgrade teamai CLI')
   .option('--check', 'Only check if an update is available, do not install')
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { update } = await import('./update.js');
     await update({ ...globalOpts, ...cmdOpts });
   });
@@ -703,7 +744,7 @@ program
   .option('--force', 'Skip confirmation prompt')
   .option('--agent <name>', 'Only uninstall this agent\'s resources in this checkout; shared resources, and the project\'s other checkouts, go only if it is the last tool')
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { uninstall } = await import('./uninstall.js');
     await uninstall({ ...globalOpts, ...cmdOpts });
   });
@@ -726,7 +767,7 @@ const envCmd = program
   .option('--reveal', 'Show env variable values in plaintext (default: masked)')
   .action(async (cmdOpts) => {
     // Default action: list env vars (backward compatible)
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { envList } = await import('./env-commands.js');
     await envList({ ...globalOpts, ...cmdOpts });
   });
@@ -737,7 +778,7 @@ envCmd
   .option('--reveal', 'Show env variable values in plaintext (default: masked)')
   .action(async (_cmdOpts, command: Command) => {
     const { envList } = await import('./env-commands.js');
-    await envList(command.optsWithGlobals() as GlobalOptions & { reveal?: boolean });
+    await envList(command.optsWithGlobals<GlobalOptions & { reveal?: boolean }>());
   });
 
 envCmd
@@ -749,7 +790,7 @@ envCmd
   .option('--role <ns>', 'Write to env/<ns>/ instead of env/ (env.yaml, or secrets.yaml with --secret)')
   .option('--project <id>', "Write to the project's env namespace (resources.env in manifest/projects.yaml)")
   .action(async (key, value, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { envAdd } = await import('./env-commands.js');
     await envAdd(key, value, { ...globalOpts, ...cmdOpts });
   });
@@ -761,7 +802,7 @@ envCmd
   .option('--role <ns>', 'Remove from env/<ns>/ instead of env/')
   .option('--project <id>', "Remove from the project's env namespace (resources.env in manifest/projects.yaml)")
   .action(async (key, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { envRemove } = await import('./env-commands.js');
     await envRemove(key, { ...globalOpts, ...cmdOpts });
   });
@@ -773,7 +814,7 @@ envCmd
   .option('--from-env <var>', 'Read the value from this environment variable each time it is used; no copy is stored')
   .option('--global', 'Set a secret for every team on this machine; a value set for a team still wins')
   .action(async (key, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { envSet } = await import('./env-commands.js');
     await envSet(key, { ...globalOpts, ...cmdOpts });
   });
@@ -783,7 +824,7 @@ envCmd
   .description("Remove your value for a secret or env variable, for this directory's team, from this machine")
   .option('--global', 'Remove the value set for every team on this machine instead')
   .action(async (key, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { envUnset } = await import('./env-commands.js');
     await envUnset(key, { ...globalOpts, ...cmdOpts });
   });
@@ -792,7 +833,7 @@ envCmd
   .command('exec <command...>')
   .description("Run a command with this directory's team env variables and secrets (put -- before the command)")
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { envExec, exitLike } = await import('./env-exec.js');
     // What was typed after `exec`, `--` included: Commander drops it.
     const argv = process.argv.slice(2);
@@ -815,7 +856,9 @@ workflowCmd
   .option('--tools <list>', 'Override local prompt tools for this run, as comma-separated name=tool pairs. With --driver skill: only default=<tool>, the tool this coding session works in, which judges its scored steps and which its steps\' models resolve for when teamai installs agents for it. Pass it when the describe reply says the session names no tool')
   .option('--auto-approve', 'Answer optional approve HITL requests yes and choose requests with their default: with --driver local in this process, with --driver skill for this run. A required approval still goes to the person')
   .option('--inputs <json>', 'Values for the inputs the workflow declares, as a JSON object, for example {"issue":42}. Every declared input is required.')
-  .action(async (name: string, cmdOpts: { driver?: string; tools?: string; inputs?: string; autoApprove?: boolean; describe?: boolean; parallel?: string; confirmed?: boolean; hitl?: string; judge?: boolean }) => {
+  .option('--timeout <duration>', 'The longest the run may take, such as 30m or 2h: its steps stop and it fails with timeout once the shorter of this and the workflow\'s own timeout passes. Its finally steps still run after.')
+  .option('--sandbox', 'With --driver local, declare this machine a sandbox for this process: a disposable host such as a CI runner or container, where benchmark trials and steps that need sandbox isolation may run. workflows.sandbox in config declares it for every process.')
+  .action(async (name: string, cmdOpts: { driver?: string; tools?: string; inputs?: string; autoApprove?: boolean; describe?: boolean; parallel?: string; confirmed?: boolean; hitl?: string; judge?: boolean; sandbox?: boolean; timeout?: string }) => {
     const { workflowStart } = await import('./workflow-commands.js');
     await workflowStart(name, cmdOpts);
   });
@@ -823,10 +866,10 @@ workflowCmd
 workflowCmd
   .command('next <run>')
   .description('Get a lease, hitl, wait, or done JSON envelope. Show hitl.message and hitl.respond to a person, who replaces <option> with a choice.')
-  .option('--prepare', 'Prepare the leased workspace in its original checkout; report commits and pushes it automatically')
+  .option('--prepare', 'Prepare the leased workspace in its original checkout; report commits and pushes it automatically. A step in a clone workspace, such as a benchmark trial, is leased only with --prepare: teamai makes the clone on this machine, installs its team assets and runs setup, and answers the lease with cwd, where the driver runs the step. So is a step that runs with a team role (role on its lease): teamai delivers the role into its copy. A step that requires strict sandbox isolation goes only to a driver that declares driver.can.isolation sandbox and driver.can.env true. While a scorer with sampling: all still judges, the run waits for it: wait carries judging, the number of judge entries still open, which teamai score --next on this install judges.')
   .option('--attempt <attempt>', 'With --prepare: prepare this attempt, which an earlier next leased this driver, instead of taking a new lease. wrong_attempt when the run no longer leases it to the driver. With --driver skill: the attempt of a place action, with --adopt')
   .option('--adopt <dir>', 'With --prepare --attempt: prepare the attempt in <dir>, a place the host made: a clean worktree of this repository on the lease\'s workspace branch, or detached at its start. A place that does not fit answers adopt_mismatch and leaves the attempt leased. TeamAI never removes an adopted place. With --driver skill --attempt: adopt <dir> as the place action of that attempt asked, as its adopt prints it')
-  .option('--json <payload>', 'Driver identity, for example {"driver":{"kind":"local","machine":"host","workspace":"/work"}}. Optional: running, the attempt ids of its open leases the driver still runs (an open lease left out is handed back), canTakeLease, false to poll while a tool runs without taking a new lease, and driver.can, what the driver can do on this request: hitl (a person can answer HITL requests and work interactively), workspace, env (true, or "commands" when the driver scopes team env for command steps and setup only), setup, tokens, max_turns, network, isolation. An omitted key is not offered, so a step that needs it waits, and wait.held names what it lacks. Send driver.can on every next request, including busy polls. claim, true to take a run another install published from teamai-reports before leasing; a run this install owns stays as it is. Every answer lists in cancelled the running attempts whose tools the driver must stop.')
+  .option('--json <payload>', 'Driver identity, for example {"driver":{"kind":"local","machine":"host","workspace":"/work"}}. Optional: running, the attempt ids of its open leases the driver still runs (an open lease left out is handed back), canTakeLease, false to poll while a tool runs without taking a new lease, and driver.can, what the driver can do on this request: hitl (a person can answer HITL requests and work interactively), workspace, env (true, or "commands" when the driver scopes team env for command steps and setup only), setup, tokens, max_turns, network, isolation, tools (the tools it launches a prompt step that names its tool on), end_turn (it ends a prompt\'s turn at the lease limits), role (it runs a step whose lease has role, the team role its copy runs with, on what teamai delivered there, with --prepare). An omitted key is not offered, so a step that needs it waits, and wait.held names what it lacks. Send driver.can on every next request, including busy polls. claim, true to take a run another install published from teamai-reports before leasing; a run this install owns stays as it is. Every answer lists in cancelled the running attempts whose tools the driver must stop.')
   .option('--driver <kind>', 'skill: advance a run the current coding session drives, and print its turn: the actions to carry out and the command to run next')
   .option('--wait', 'With --driver skill: wait until the run has something to show, up to 100 s. Run it in the background.')
   .option('--takeover', 'With --driver skill: drive the run from this coding session instead of the one that drives it. Run it only when the person agrees, after an orchestrator_active answer')
@@ -841,7 +884,7 @@ workflowCmd
 workflowCmd
   .command('report <run>')
   .description('Report the outcome of a leased step. Prints a JSON envelope.')
-  .option('--json <payload>', 'attempt, revision, outcome (success, failed, or released), and driver')
+  .option('--json <payload>', 'attempt, revision, outcome (success, failed, or released), and driver. A prompt step\'s report also sends tool, the tool the driver launched, and durationMs (milliseconds around the tool launch) and cost ({"amount":0.12,"unit":"USD"}, only as the tool stated it) when known, and limit (timeout, budget or max_turns) when a limit in its lease\'s limits stopped the tool.')
   .option('--driver <kind>', 'skill: report an attempt of a run the current coding session drives, as its turn printed the command')
   .option('--attempt <id>', 'With --driver skill: the attempt to report')
   .option('--model-unavailable', 'With --driver skill and --attempt: the host cannot run the model the dispatch names, so the step fails model_unavailable')
@@ -864,7 +907,7 @@ workflowCmd
 
 workflowCmd
   .command('retry <run> <step>')
-  .description('Retry a leased or stopped step, or a HITL request to answer it again, with a new pass and revision. A failed pull request delivery is retried in the same pass, without running the step again. Reopen its dependent steps and a settled run; keep earlier passes. After reopening, run resume or let your driver poll next. Prints one JSON envelope.')
+  .description('Retry a leased or stopped step, or a HITL request to answer it again, with a new pass and revision. A failed pull request delivery is retried in the same pass, without running the step again. Reopen its dependent steps and a settled run; keep earlier passes. After reopening, run resume or let your driver poll next. An isolated run, such as a benchmark run, cannot be retried; start a new one. Prints one JSON envelope.')
   .action(async (run: string, step: string) => {
     const { workflowRetry } = await import('./workflow-commands.js');
     await workflowRetry(run, step);
@@ -882,14 +925,15 @@ workflowCmd
   .option('--auto-approve', 'Answer optional approve HITL requests yes and choose requests with their default: with --driver local in this process, with --driver skill for this run. A required approval still goes to the person')
   .option('--claim', 'Take the published run over from the install that owns it, replacing this machine\'s copy and releasing its leases')
   .option('--confirmed', 'The person agreed to continue this run, as the confirm_needed answer asked. From an agent session, a run of an invoke: ask workflow continues only with it, with any driver; teamai takes the agent\'s word for it. In an unattended run (TEAMAI_MODE=unattended or CI) an agent cannot continue a run of an invoke: ask workflow, with or without it')
-  .action(async (run: string | undefined, options: { driver?: string; parallel?: string; hitl?: string; judge?: boolean; tools?: string; autoApprove?: boolean; claim?: boolean; confirmed?: boolean; next?: boolean }) => {
+  .option('--sandbox', 'Declare this machine a sandbox for this process: a disposable host such as a CI runner or container, where benchmark trials and steps that need sandbox isolation may run. workflows.sandbox in config declares it for every process.')
+  .action(async (run: string | undefined, options: { driver?: string; parallel?: string; hitl?: string; judge?: boolean; tools?: string; autoApprove?: boolean; claim?: boolean; confirmed?: boolean; next?: boolean; sandbox?: boolean }) => {
     const { workflowResume } = await import('./workflow-commands.js');
     await workflowResume(run, options);
   });
 
 workflowCmd
   .command('publish <run>')
-  .description("Publish a run's state to teamai-reports so another member or a runner can continue it with workflow resume. A running run published from a checkout of its business repository (origin) is also offered: the first workflow resume --next in a checkout of that repository claims it, and any claim, or the owner's own workflow resume, takes the offer away, so two runners never take one run. Publish once you stop driving the run. The first publish makes this install the run's owner; publishing an unchanged run writes nothing. Refuses a run with records not yet on teamai-reports, or with a value that looks like a secret. Prints one JSON envelope with offered, and listing the leases still in flight.")
+  .description("Publish a run's state to teamai-reports so another member or a runner can continue it with workflow resume. A running run published from a checkout of its business repository (origin) is also offered: the first workflow resume --next in a checkout of that repository claims it, and any claim, or the owner's own workflow resume, takes the offer away, so two runners never take one run. Publish once you stop driving the run. The first publish makes this install the run's owner; publishing an unchanged run writes nothing. Refuses an isolated run, such as a benchmark run, a run with records not yet on teamai-reports, or one with a value that looks like a secret. Prints one JSON envelope with offered, and listing the leases still in flight.")
   .option('--sessions', "Also put the agent sessions that the run's unsettled steps continue (session: continue or session.from) in the team session archive, scrubbed, so whoever continues the run resumes them; listed in the envelope as sessions. Without it, those steps start new sessions on another machine")
   .action(async (run: string, options: { sessions?: boolean }) => {
     const { workflowPublish } = await import('./workflow-commands.js');
@@ -904,23 +948,90 @@ workflowCmd
     await workflowCancel(run, step);
   });
 
+const selfImprovementCmd = program
+  .command('self-improvement')
+  .description('Improve the team\'s harness from a scorer\'s repeated failures: change the assets teamai delivers so that work like the failing one passes, with one regression task per failure, proposed as one pull request on the team repo that the next run updates. run starts the workflow teamai-self-improvement, teamai\'s default or the team\'s file of that name.');
+
+selfImprovementCmd
+  .command('run <scorer>')
+  .description('Start the workflow teamai-self-improvement with --inputs {"scorer":"<scorer>","suite":"<--suite>"} and drive it. A team\'s workflows/teamai-self-improvement.yaml replaces teamai\'s default, and must take inputs scorer and suite. The default reads digest --json --scorer and improves only when it says ready: two failures or more of the scorer in the last 30 days that a task can start from, or one more for a proposal already on origin. Its prompt step needs a sandbox, and runs in a fresh clone of the team repo on teamai/self-improvement/<scorer>, whose pull request it opens or updates. Prints the run\'s done envelope.')
+  .option('--suite <dir>', 'The suite the regression tasks go in, which the team repo\'s default branch must have', 'benchmarks/regressions')
+  .option('--driver <kind>', 'The driver that runs it: local (default), or skill, which only a team workflow with invoke: allow or ask accepts; teamai\'s default denies agents')
+  .option('--tools <list>', 'The tools its prompt steps run on, as workflow start --tools takes them, such as default=claude')
+  .option('--sandbox', 'With --driver local, declare this machine a sandbox for this process, where the prompt step, which edits files without asking, may run. workflows.sandbox in config declares it for every process.')
+  .action(async (scorer: string, cmdOpts: { suite: string; driver?: string; tools?: string; sandbox?: boolean }) => {
+    const { selfImprovementRun } = await import('./workflow-commands.js');
+    await selfImprovementRun(scorer, cmdOpts);
+  });
+
+const benchmarkCmd = program
+  .command('benchmark')
+  .description('Run a benchmark suite, and the commands its run\'s steps run. run starts the workflow teamai-benchmark, teamai\'s default or the team\'s file of that name, whose plan, check and report steps run the other commands; try needs no run.');
+
+benchmarkCmd
+  .command('run <suite>')
+  .description('Plan benchmark suite <suite> without a run first, so a suite that cannot run leaves none, then start the workflow teamai-benchmark with --inputs {"suite":"<suite>","aliases":"team"} ("member" with --member-aliases) and the suite\'s timeout as --timeout, and drive it. A team\'s workflows/teamai-benchmark.yaml replaces teamai\'s default, and must take input suite; it gets aliases only when it declares that input. Prints the run\'s done envelope and, on stderr, the results. Exits 1 when the run failed or was cancelled, or its report failed or was cancelled; a record still pending publication never changes the exit code.')
+  .option('--driver <kind>', 'The driver that runs it: local (default), or skill')
+  .option('--sandbox', 'With --driver local, declare this machine a sandbox for this process, where the trials, which need strict sandbox isolation, may run. workflows.sandbox in config declares it for every process.')
+  .option('--member-aliases', 'Resolve each arm\'s model alias with your own ~/.teamai/models/aliases.yaml over the team\'s models/aliases.yaml, which alone resolves them otherwise: starts the workflow with input aliases member instead of team. The results table and the record show member as the source of a model your file decided.')
+  .option('--fail-on-regression', 'Also exit 1 when an arm\'s pass rate dropped by more than chance against the newest earlier succeeded run of the suite published on teamai-reports with the same tasks and arms, trials paired by task and repetition as the dashboard\'s Compare pairs them. With no such run, print a notice and leave the exit code alone. Needs --driver local.')
+  .action(async (suite: string, cmdOpts: { driver?: string; sandbox?: boolean; memberAliases?: boolean; failOnRegression?: boolean }) => {
+    const { benchmarkRun } = await import('./workflow-commands.js');
+    await benchmarkRun(suite, cmdOpts);
+  });
+
+benchmarkCmd
+  .command('try <task-file>')
+  .description('Try one task file before it joins a suite, in a checkout of the suite\'s repo: setup and the check run at startingCommit, where the check must fail, and at solutionCommit, if set, with the protected paths as startingCommit has them, where it must pass. Reads the task file, the suite.yaml two directories up from it and the files its check.add entries name in that suite directory, needs no teamai init, and creates no run. Exits non-zero naming the commit and the cause when either goes the wrong way.')
+  .action(async (file: string) => {
+    const { benchmarkTry } = await import('./workflow-commands.js');
+    await benchmarkTry(file);
+  });
+
+benchmarkCmd
+  .command('plan <suite>')
+  .description('The first step of a benchmark run: freeze the team revision this checkout last pulled, fetch every commit a trial reads into the commit cache, and print {"definition":{"definition","workflows","scorers","teamRevision"},"plan"}, the workflow the run\'s trials step runs and the plan its check and report steps read. Refuses a run with no timeout, or a longer one than the suite\'s: start it with workflow start --timeout.')
+  .option('--aliases <whose>', 'Whose aliases resolve the arms\' model aliases: team (default), the team\'s models/aliases.yaml, or member, your ~/.teamai/models/aliases.yaml over the team\'s')
+  .action(async (suite: string, cmdOpts: { aliases?: string }) => {
+    const { benchmarkPlan } = await import('./workflow-commands.js');
+    await benchmarkPlan(suite, cmdOpts);
+  });
+
+benchmarkCmd
+  .command('report')
+  .description('The finally step of a benchmark run: classify the trials of the plan the run measured, write the run\'s benchmark record into its run directory and, when usage reporting allows, publish it to teamai-reports, and print {"text","table"}. The text ends with record: pending while the record waits for publication. Refuses a run whose plan this teamai cannot read.')
+  .action(async () => {
+    const { benchmarkReport } = await import('./workflow-commands.js');
+    await benchmarkReport();
+  });
+
+benchmarkCmd
+  .command('check')
+  .description('Run the check of the benchmark step this process runs as, in its clone: the files check.add names, then the task\'s check. Prints {"result":"passed"|"failed"|"could_not_run"} and exits 0 once the check ran; exits 1 when it could not set the check up. Refuses a run whose plan this teamai cannot read.')
+  .option('--baseline', 'The check of a task\'s baseline, on its starting commit')
+  .option('--trial', 'The check of a trial, after its prompt, with the protected paths put back as the starting commit has them first')
+  .action(async (cmdOpts: { baseline?: boolean; trial?: boolean }) => {
+    const { benchmarkCheck } = await import('./workflow-commands.js');
+    await benchmarkCheck(cmdOpts);
+  });
+
 program
   .command('score')
-  .description('Judge workflow passes with team scorers (scorers/<name>.md). Any driver takes judge work with --next, runs its own judge on the lease prompt with the lease evidence directory as its only readable root and settles it with --lease <ref> --submit, or judges it here with --lease <ref>. --run <id> --step <path> --scorer <name> judges a pass on demand. --scorer <name> [--session <id>] judges a finished agent session here: the one --session names, or, inside a session, the one its agent session variable names; it never guesses. --team-session <name> judges a session a member pushed instead. --label <value> labels the session by hand instead of judging it. With --json, it leases that session to the driver\'s own judge instead. workflow next never hands out judge work, and a driver never lists a judge ref in workflow next running. Prints one JSON envelope; --drain prints lines.')
+  .description('Judge workflow passes with team scorers (scorers/<name>.md). Any driver takes judge work with --next, runs its own judge on the lease prompt with the lease evidence directory as its only readable root and settles it with --lease <ref> --submit, or judges it here with --lease <ref>. --run <id> --scorer <name> judges a pass on demand. A pass of a deliver: pr step is decided before any judge by the scorer\'s check, a failed CI on its pull request, or a protected-path refusal, and its label says which in decidedBy. --scorer <name> [--session <id>] judges a finished agent session here: the one --session names, or, inside a session, the one its agent session variable names; it never guesses. --team-session <name> judges a session a member pushed instead. --label <value> labels the session by hand instead of judging it. With --json, it leases that session to the driver\'s own judge instead. workflow next never hands out judge work, and a driver never lists a judge ref in workflow next running. Prints one JSON envelope; --drain prints lines.')
   .option('--next', 'Take judge work: workflow passes first, then finished sessions of each run mode whose scoring.sessions policy is auto (config.yaml, else scorers/scoring.yaml, which ~/.teamai/config.yaml can only make stricter; by default off attended, auto unattended). An attended session is finished 6 hours after its last activity, an unattended one once a score --drain reached it. A lease has ref, source (workflow or session), scorer, subject, evidence, prompt, answer.schema, expiresAt, the cwd to submit from and a submit command line; else idle with counts. A batch lease, for scorers of one pass that share a judge call, has scorers and batched: true instead of scorer. --json {"driver":{"kind":"t3","machine":"host","workspace":"/work","can":{"judge":{"isolation":"verified","access":"read","tools":["claude"]}}},"running":["<ref>"]}. isolation is verified or best-effort; access is what your judge can do, answer (no tools), read (reads the evidence) or full (any tool), default full, and its labels record it; tools in your order of preference. running lists the judge refs you still run, which renews them; a live workflow lease of yours left out is handed back, and a session lease left out lapses: a session is judged once. A lease lapses 30 minutes after it was taken or renewed. Optional: run, a run id, to take only that run\'s workflow passes and never a session, from any directory, since the run\'s scope is found by its id; canTakeLease, false to renew running and take nothing, not even a lease handed back.')
   .option('--lease <ref>', 'The judge lease, as --next printed it (s<13 hex>/a<8 hex>). Without --submit, judge it here with the tool the lease names, in a confined profile, and settle it through the submit path: --json {"driver":{…same as --next…}}.')
   .option('--submit', 'Settle --lease <ref> with the payload {"driver":{…same as --next…},"outcome":"success","answer":{"label":"<one of answer.schema>","reasoning":"…"},"judge":{"tool":"claude","model":"…","usage":{"inputTokens":0,"outputTokens":0}}}. For a batch lease, answer is {"<scorer>":{"label":"…","reasoning":"…"},…} with one entry per scorer. outcome is success, failed, or released. A label a scorer does not list is refused, the whole answer with it, and the lease stays open; teamai computes score and passed.')
   .option('--json <payload>', 'The payload as a JSON string')
   .option('--stdin', 'Read the payload from stdin')
-  .option('--run <id>', 'Judge a pass of this run on demand, whatever sampling says, with --step and --scorer; this also reopens judge work that failed or expired. Without --queue, judges it here with the local judge and prints the label.')
-  .option('--step <path>', 'With --run: the step path, such as review or check.review')
+  .option('--run <id>', 'Judge a pass of this run on demand, whatever sampling says, with --scorer; this also reopens judge work that failed or expired. It fails with evidence_missing, naming each, when a commit or a session the pass recorded is no longer on this machine, and writes no label. Without --queue, judges it here with the local judge and prints the label.')
+  .option('--step <path>', 'With --run: the step path, such as review or check.review; optional when the run lists the scorers on one step only')
   .option('--pass <n>', 'With --run: the pass to judge; default the step\'s latest succeeded pass')
-  .option('--session <id>', 'Judge this finished session of an agent tool on this machine, whatever sampling says, with --scorer. Prints the session\'s first prompt and directory first, then the label; the session and the judge\'s reasoning are never published. With --json {"driver":{…same as --next…}}, prints a lease for your own judge, as --next does, instead of judging here; several --scorer need --batch. The lease is taken whatever sampling, the six idle hours, scoring.sessions, the scorer\'s sessions, an earlier label or daily_limit say, and counts toward the day\'s daily_limit. Nothing is taken when a scorer asks for more isolation than can.judge offers (isolation_unmet), when none of its tools runs a scorer\'s model (judge_model_unavailable), or while a live lease holds the work (busy).')
+  .option('--session <id>', 'Judge this finished session of an agent tool on this machine, whatever sampling says, with --scorer. Prints the session\'s first prompt and directory first, then the label; the session and the judge\'s reasoning are never published. With --json {"driver":{…same as --next…}}, prints a lease for your own judge, as --next does, instead of judging here; several --scorer need --batch, except for the session\'s teamai:routing:… questions, which always share one call. The lease is taken whatever sampling, the six idle hours, scoring.sessions, the scorer\'s sessions, an earlier label or daily_limit say, and counts toward the day\'s daily_limit. Nothing is taken when a scorer asks for more isolation than can.judge offers (isolation_unmet), when none of its tools runs a scorer\'s model (judge_model_unavailable), or while a live lease holds the work (busy).')
   .option('--source <platform>', 'With --session: the tool that holds it, as session migrate --source names it (claude-code, codex, opencode, …); needed unless the agent session variable names that session, or the captures its session-start hook wrote here name one platform for it')
   .option('--team-session <name>', 'Judge a session a member pushed with session push instead of one on this machine, by the name session list prints for this directory\'s repository: read from teamai-reports, else from the archive the team kept on its default branch before, and redacted before a judge reads it. Run session pull first for the newest. Its label is about the session where it ran, so it pairs with that session\'s labels from the machine that ran it, and records no agent. Not with --session, --source or --json')
   .option('--author <name>', 'With --team-session: who pushed it, when two members pushed a session with that name')
   .option('--label <value>', 'Label the session by hand with this value of the one --scorer: no judge runs, score and passed come from the scorer, and no reasoning is kept. A value the scorer does not list fails and lists the ones it does. A hand label and a model label of a session are kept side by side, so rescoring with the model never replaces yours; the dashboard Scorers page shows how often the model judge agrees with hand labels. Not with a scorer file, --batch or --json')
-  .option('--scorer <name>', 'With --run: a scorer the run pinned or one teamai pull cached. With --session, or alone inside a session: a scorer teamai pull cached, or a scorer file to try before pushing it: a path with / or ending in .md. A file\'s label is never stored, so it takes no --push; the output adds the labels stored for its scorer (stored) and its verdict on the session\'s first prompt alone (control). Repeatable.', (value: string, previous: string[]) => previous.concat(value), [] as string[])
+  .option('--scorer <name>', 'With --run: a scorer the run pinned or one teamai pull cached. With --session, or alone inside a session: a scorer teamai pull cached, or a scorer file to try before pushing it: a path with / or ending in .md. A file\'s label is never stored, so it takes no --push; the output adds the labels stored for its scorer (stored) and its verdict on the session\'s first prompt alone (control). Repeatable.', (value: string, previous: string[]) => previous.concat(value), [])
   .option('--queue', 'With --run: leave the work to any driver\'s score --next instead of judging it here')
   .option('--batch', 'With --run or --session: the scorers share one judge call when they resolve to the same tool and model')
   .option('--push', 'Publish every pending label of this machine to scores/<member>/<YYYY-MM>.jsonl on teamai-reports, alone or after --session. Labels only: never the session, the prompt or the judge\'s reasoning. With usage reporting off, or when the push fails, they stay pending for the next --push.')
@@ -940,7 +1051,7 @@ hooksCmd
   .command('list')
   .description('List hook install status + effective built-in (A) and team (B) hooks')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { hooksList } = await import('./hooks-cmd.js');
     await hooksList(globalOpts);
   });
@@ -950,7 +1061,8 @@ hooksCmd
   .description('Inject teamai hooks into all AI tool settings')
   .option('--silent', 'Silent mode (suppress success message)')
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
+
     if (cmdOpts.silent) setSilent(true);
     const { hooksInject } = await import('./hooks-cmd.js');
     await hooksInject({ ...globalOpts, ...cmdOpts });
@@ -960,7 +1072,7 @@ hooksCmd
   .command('remove')
   .description('Remove teamai hooks from all AI tool settings')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { hooksRemove } = await import('./hooks-cmd.js');
     await hooksRemove(globalOpts);
   });
@@ -975,7 +1087,7 @@ mcpCmd
   .command('list')
   .description('List team MCP servers and their per-tool install status')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { mcpList } = await import('./mcp-cmd.js');
     await mcpList(globalOpts);
   });
@@ -986,7 +1098,7 @@ mcpCmd
   .option('--dry-run', 'Show what would change without writing')
   .option('--force', 'Overwrite servers that collide with user-owned entries')
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { mcpInject } = await import('./mcp-cmd.js');
     await mcpInject({ ...globalOpts, ...cmdOpts });
   });
@@ -995,7 +1107,7 @@ mcpCmd
   .command('remove')
   .description('Remove all teamai-managed MCP servers from AI tool configs')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { mcpRemove } = await import('./mcp-cmd.js');
     await mcpRemove(globalOpts);
   });
@@ -1012,11 +1124,15 @@ webhookCmd
   .action(async () => {
     const { listWebhooks } = await import('./webhook.js');
     const endpoints = await listWebhooks();
+
     if (endpoints.length === 0) {
       console.log('No webhook endpoints configured.');
+
       return;
     }
+
     console.log('Configured webhook endpoints:\n');
+
     for (const ep of endpoints) {
       console.log(`  URL: ${ep.url}`);
       console.log(`  Type: ${ep.type}`);
@@ -1030,7 +1146,7 @@ webhookCmd
   .description('Send test event to webhook endpoints')
   .option('--url <url>', 'Test specific endpoint URL')
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { testWebhook } = await import('./webhook.js');
     await testWebhook(cmdOpts.url, { dryRun: globalOpts.dryRun });
   });
@@ -1042,7 +1158,7 @@ async function runModelsCommand(run: (commands: typeof import('./models-cmd.js')
   try {
     await run(await import('./models-cmd.js'));
   } catch (error) {
-    log.error((error as Error).message);
+    log.error((error instanceof Error ? error.message : String(error)));
     process.exitCode = 1;
   }
 }
@@ -1083,21 +1199,23 @@ modelsCmd
 modelsCmd
   .command('switch [profile]')
   .description('Point agents at a model profile (every compatible agent by default); omit the profile to pick one')
-  .option('--agent <name>', 'Only switch this agent. Repeatable or comma-separated.', collectRepeatable, [] as string[])
+  .option('--agent <name>', 'Only switch this agent. Repeatable or comma-separated.', collectRepeatable, [])
   .option('--model <id>', 'Default model to select (defaults to the first in the profile)')
   .option('--dry-run', 'Show what would change without writing')
   .action((profile: string | undefined, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
+
     return runModelsCommand((m) => m.modelsSwitch(profile, { ...globalOpts, ...cmdOpts }));
   });
 
 modelsCmd
   .command('restore')
   .description('Restore agent model settings captured before the first TeamAI switch')
-  .option('--agent <name>', 'Only restore this agent. Repeatable or comma-separated.', collectRepeatable, [] as string[])
+  .option('--agent <name>', 'Only restore this agent. Repeatable or comma-separated.', collectRepeatable, [])
   .option('--dry-run', 'Show what would change without writing')
   .action((cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
+
     return runModelsCommand((m) => m.modelsRestore({ ...globalOpts, ...cmdOpts }));
   });
 
@@ -1143,7 +1261,7 @@ program
   .option('--by-repo', 'Break the local event log down per repository')
   .option('--by-time', 'Show local event log activity by hour of day')
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { showStats } = await import('./stats.js');
     await showStats({ byRepo: cmdOpts.byRepo, byTime: cmdOpts.byTime, dryRun: globalOpts.dryRun });
   });
@@ -1162,7 +1280,7 @@ sessionCmd
   .option('--include-prompt', 'Include the redacted first-prompt line in the pushed summary (default: off)')
   .option('--scope <scope>', 'Config scope for --push: user | workspace (default: auto-detect)')
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { saveSession } = await import('./save-session.js');
     await saveSession({ ...globalOpts, ...cmdOpts });
   });
@@ -1176,14 +1294,32 @@ if (shouldRegisterSessionFlowCommands()) {
     const { registerSessionFlowCommands } = await import('./session-flow/session-cmd.js');
     registerSessionFlowCommands(sessionCmd);
   } catch (e) {
-    log.warn(`Session commands unavailable: ${(e as Error).message}`);
+    log.warn(`Session commands unavailable: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
 program
   .command('digest')
   .description('Generate weekly team activity digest')
-  .action(async () => {
+  .option('--json', 'Print what an improvement starts from instead, as one JSON envelope: the failing score labels of the last 30 days, each with its subject and the commit its work started at, and each scorer\'s cohorts with the agreement of its model judge with hand labels. Never a judge\'s reasoning; a benchmark\'s labels are left out')
+  .option('--scorer <name>', 'With --json, also print data.improvement for this scorer: failures, its failures a regression task can start from (a recorded start commit this checkout has, and no task of --suite on the team repo\'s default branch or on an open --proposal names its subject), each subject once, newest first; covered, the tasks that name its other failures; refused, each failure no task can start from, with why: tracked_changes, not_recorded or not_in_checkout; and hasProposal, whether --proposal is open: origin has it, and its default branch neither merged it nor has each regression task it adds. The workflow\'s if decides from these whether it runs')
+  .option('--suite <dir>', 'With --scorer, the suite whose tasks cover a failure', 'benchmarks/regressions')
+  .option('--proposal <branch>', 'With --scorer, the team repo branch an open proposal is on, whose tasks cover failures too')
+  .action(async (cmdOpts: { json?: boolean; scorer?: string; suite: string; proposal?: string }) => {
+    if (cmdOpts.json) {
+      const { DigestFailures } = await import('./digest-failures.js');
+      await DigestFailures.print(cmdOpts.scorer === undefined ? {} : { improvement: { scorer: cmdOpts.scorer, suite: cmdOpts.suite, proposal: cmdOpts.proposal } });
+
+      return;
+    }
+
+    if (cmdOpts.scorer !== undefined || cmdOpts.proposal !== undefined) {
+      log.error('invalid_arguments: --scorer and --proposal print with --json. Add --json.');
+      process.exitCode = 1;
+
+      return;
+    }
+
     const { generateDigest } = await import('./digest.js');
     await generateDigest();
   });
@@ -1242,8 +1378,10 @@ program
     // entry by the largest of them, and exit 2 is a hook's blocking decision.
     if (cmdOpts.teamHooks) {
       let code = 0;
+
       try {
         const bridged = await import('./bridged-team-hooks.js');
+
         if (tool === 'codex') {
           const { runCodexDispatcher } = await import('./codex-team-hooks.js');
           code = await runCodexDispatcher(event);
@@ -1251,24 +1389,30 @@ program
           const { runBridgedTeamHooks } = bridged;
           const { readStdin } = await import('./hook-dispatch-cli.js');
           const reply = await runBridgedTeamHooks(tool, event, await readStdin());
+
           if (reply.stderr) process.stderr.write(reply.stderr);
+
           if (reply.stdout) await new Promise<void>((resolve) => process.stdout.write(reply.stdout, () => resolve()));
           code = reply.code;
         } else if (tool === 'codebuddy' && cmdOpts.teamHookGate && cmdOpts.teamHookCommand) {
           const parsedTimeout = cmdOpts.teamHookTimeout === undefined ? undefined : Number(cmdOpts.teamHookTimeout);
+
           if (parsedTimeout !== undefined && (!Number.isFinite(parsedTimeout) || parsedTimeout <= 0)) {
             throw new Error(`invalid CodeBuddy team hook timeout ${JSON.stringify(cmdOpts.teamHookTimeout)}`);
           }
+
           const { runCodebuddyTeamHook } = await import('./codebuddy-team-hooks.js');
           code = await runCodebuddyTeamHook(cmdOpts.teamHookGate, cmdOpts.teamHookCommand, parsedTimeout);
         }
       } catch (e) {
-        process.stderr.write(`teamai: team hooks did not run: ${(e as Error).message}\n`);
+        process.stderr.write(`teamai: team hooks did not run: ${e instanceof Error ? e.message : String(e)}\n`);
+
         // CodeBuddy must report dispatcher failures to its host. Codex keeps
         // its historical fail-open wrapper: its hook runner reports the
         // diagnostic but the shared `--team-hooks` command remains successful.
         if (tool === 'codebuddy') code = 1;
       }
+
       process.exit(code);
     }
 
@@ -1286,12 +1430,14 @@ program
     // Git (`--tool git`) has no hook timeout to stay under, and a cut here
     // would stop the inline delivery mid-write; its handler bounds itself.
     let hardExit: NodeJS.Timeout | undefined;
+
     if (!bgOnly && tool !== 'git') {
       hardExit = setTimeout(() => process.exit(0), HOOK_HARD_EXIT_MS);
       hardExit.unref();
     }
 
     const { hookDispatchCli } = await import('./hook-dispatch-cli.js');
+
     try {
       await hookDispatchCli(event, tool, cmdOpts.matcher ?? '*', { ...cmdOpts, hookArgs });
     } finally {
@@ -1343,7 +1489,7 @@ program
   .option('--session-id <id>', 'Session the learning came from (default: the agent\'s session, e.g. $CLAUDE_CODE_SESSION_ID). Recorded as `session` in the learning and counted as that session\'s outcome. Inside a workflow attempt, the learning is also recorded on the step')
   .option('--scope <scope>', 'Target scope: user or workspace')
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { contribute } = await import('./contribute.js');
     await contribute({ ...globalOpts, ...cmdOpts });
   });
@@ -1356,9 +1502,9 @@ const recallCmd = program
   .option('--depth <level>', 'Recall depth: route (entry-points only) | context (module-level, default) | lookup (full graph traversal)', 'context')
   .option('--check', 'Relevance precheck only: print RELEVANT/NOT_RELEVANT + top score; no file reads, no upvote')
   .addOption(new Option('--caller <name>', 'Internal, set by the teamai-recall subagent to mark its own runs; do not pass it yourself').hideHelp())
-  .action(async (queryParts, cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
-    const query = (queryParts as string[]).join(' ');
+  .action(async (queryParts: string[], cmdOpts) => {
+    const globalOpts = program.opts<GlobalOptions>();
+    const query = queryParts.join(' ');
     const { recall } = await import('./recall.js');
     await recall(query, { ...globalOpts, depth: cmdOpts.depth, check: cmdOpts.check, caller: cmdOpts.caller });
   });
@@ -1367,7 +1513,7 @@ recallCmd
   .command('disable')
   .description('Disable automatic knowledge-base recall')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { recallDisable } = await import('./recall-toggle.js');
     await recallDisable(globalOpts);
   });
@@ -1376,7 +1522,7 @@ recallCmd
   .command('enable')
   .description('Enable automatic knowledge-base recall')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { recallEnable } = await import('./recall-toggle.js');
     await recallEnable(globalOpts);
   });
@@ -1385,7 +1531,7 @@ recallCmd
   .command('status')
   .description('Show recall feature status')
   .action(async () => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { recallStatus } = await import('./recall-toggle.js');
     await recallStatus(globalOpts);
   });
@@ -1436,7 +1582,8 @@ program
   .addOption(new Option('--max-bytes <n>', 'Override capacity cap for --cache-gc').hideHelp())
   .addOption(new Option('--stale-days <n>', 'Threshold for stale-eviction in days (default 30)').default('30').hideHelp())
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
+
     if (cmdOpts.cacheStatus || cmdOpts.cacheGc) {
       const { cacheCmd } = await import('./cache-cmd.js');
       await cacheCmd({
@@ -1447,8 +1594,10 @@ program
         staleDays: cmdOpts.staleDays,
         json: cmdOpts.json,
       });
+
       return;
     }
+
     const { importCmd } = await import('./import.js');
     await importCmd({ ...globalOpts, ...cmdOpts });
   });
@@ -1471,7 +1620,7 @@ program
   .description('Inspect and maintain the teamwiki that `teamai import` writes')
   .addOption(new Option('--project <name>', 'Codebase slug under teamwiki/evidence/code/, required for --deep-enrich').hideHelp())
   .addOption(new Option('--upgrade-wiki', 'Migrate docs/team-codebase/ to teamwiki/ graph format').hideHelp())
-  .option('--lint', 'Run global consistency lint over the teamwiki knowledge graph')
+  .option('--lint', 'Run global consistency lint over the teamwiki knowledge graph, and count the member\'s asset relations (assets, relations, without a relation, unresolved)')
   .option('--reconcile', 'Reconcile product and code knowledge in teamwiki')
   .option('--deep-enrich', 'Generate deep knowledge docs from extracted evidence')
   .addOption(new Option('--fix', 'Deprecated: teamwiki lint has no autofix; runs lint in report-only mode').hideHelp())
@@ -1480,7 +1629,7 @@ program
   .option('--json', 'Output report as JSON (suitable for CI)')
   .addOption(new Option('--output <path>', 'Use <path>/teamwiki, as written by `teamai import --output <path>`, instead of the team repo\'s').hideHelp())
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { codebaseCmd } = await import('./codebase-cmd.js');
     await codebaseCmd({ ...globalOpts, ...cmdOpts });
   });
@@ -1497,12 +1646,15 @@ program
     .option('--branch <name>', 'Run read-only health checks on this team repo branch (e.g. teamai/push/<user>/<timestamp>) and report fail/warn/info findings')
     .option('--json', 'Machine-readable output (dry-run decisions include dryRun: true; ok reports validation only; --branch prints the findings object)')
     .action(async (idArg, cmdOpts) => {
-        const globalOpts = program.opts() as GlobalOptions;
+        const globalOpts = program.opts<GlobalOptions>();
+
         if (cmdOpts.branch) {
             const { reviewBranchCmd } = await import('./review-branch.js');
             await reviewBranchCmd({ ...globalOpts, ...cmdOpts, branch: cmdOpts.branch });
+
             return;
         }
+
         const { reviewCmd } = await import('./review-cmd.js');
         await reviewCmd({ ...globalOpts, ...cmdOpts, idArg });
     });
@@ -1527,7 +1679,7 @@ ciCmd
   .option('--individual-comments', 'Post each suggestion as separate comment with reaction/resolve support')
   .option('--no-discussions', 'Leave the MR\'s review threads out of the extraction')
   .action(async (cmdOpts) => {
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     const { ciExtractMr } = await import('./ci/extract-mr.js');
     await ciExtractMr({ ...globalOpts, ...cmdOpts });
   });
@@ -1541,6 +1693,7 @@ program
   .action(async (cmdOpts: { project: string; wikiRoot?: string; maxModules?: number }) => {
     const { runHiddenDeepEnrich } = await import('./deep-enrich.js');
     const { DetachedTeamRepoError } = await import('./utils/git.js');
+
     try {
       await runHiddenDeepEnrich({
         project: cmdOpts.project,
@@ -1561,7 +1714,7 @@ recallCmd
   .option('--negative <docId>', 'Record negative signal for a document')
   .action(async (cmdOpts) => {
     const { recallFeedback } = await import('./votes.js');
-    const globalOpts = program.opts() as GlobalOptions;
+    const globalOpts = program.opts<GlobalOptions>();
     await recallFeedback({ positive: cmdOpts.positive, negative: cmdOpts.negative, dryRun: globalOpts.dryRun });
   });
 
@@ -1578,53 +1731,68 @@ recallCmd
     // The root program takes `--dry-run` wherever it is written, so this
     // command's own declaration never sets it: read it merged, as the other
     // actions do (#900).
-    const cmdOpts = { ...(program.opts() as GlobalOptions), ...localOpts };
+    const cmdOpts = { ...program.opts<GlobalOptions>(), ...localOpts };
+
     if (!cmdOpts.confidenceWriteback && !cmdOpts.prune && !cmdOpts.updateQuality) {
       log.info('Usage: teamai recall maintenance --prune | --confidence-writeback | --update-quality');
+
       return;
     }
 
     const { autoDetectInit } = await import('./config.js');
     const { localConfig } = await autoDetectInit(undefined, { dryRun: cmdOpts.dryRun });
     const paths = await maintenancePathsOrExit(localConfig, { dryRun: cmdOpts.dryRun });
+
     if (!paths) return;
+
     const {
       repoPath, votesDir, learningsReadDirs, learningsWriteDir,
     } = paths;
+
     const { safeDeliveredLearningsNamespaces } = await import('./workspace-children.js');
     const learningsNamespaces = await safeDeliveredLearningsNamespaces(localConfig, 'recall maintenance');
 
     if (cmdOpts.confidenceWriteback) {
       const { computeAllConfidence, writeBackConfidence } = await import('./maintenance/index.js');
       const map = await computeAllConfidence(votesDir);
+
       const written = await writeBackConfidence(learningsReadDirs, map, learningsWriteDir, {
         dryRun: cmdOpts.dryRun,
         namespaces: learningsNamespaces,
       });
+
       if (written.length > 0 && !cmdOpts.dryRun) {
         await publishMaintenance(localConfig, `[teamai] Update confidence for ${written.length} learning(s)`, written);
       }
+
       return;
     }
 
     if (cmdOpts.prune) {
       const { findPruneCandidates, executePrune } = await import('./maintenance/index.js');
+
       const candidates = await findPruneCandidates(learningsReadDirs, votesDir, {
         threshold: cmdOpts.threshold,
         namespaces: learningsNamespaces,
       });
+
       if (candidates.length === 0) {
         log.info('No learnings below threshold. Knowledge base is healthy.');
+
         return;
       }
+
       log.info(`Found ${candidates.length} candidate(s) for pruning:`);
+
       for (const c of candidates) {
         log.info(`  - ${c.filename} (confidence: ${c.confidence.toFixed(2)}, reason: ${c.reason})`);
       }
+
       const pruned = await executePrune(learningsWriteDir, candidates, {
         dryRun: cmdOpts.dryRun,
         archive: cmdOpts.archive,
       });
+
       if (pruned.archived + pruned.removed > 0) {
         await publishMaintenance(
           localConfig,
@@ -1632,34 +1800,42 @@ recallCmd
           pruned.changed,
         );
       }
+
       return;
     }
 
     if (cmdOpts.updateQuality) {
       const { findStaleEntries, reportStaleEntries, findRelatedAdoptedLearnings, generateUpdateDraft } = await import('./maintenance/index.js');
       const { writeFile } = await import('./utils/fs.js');
+
       const entries = await findStaleEntries(votesDir, {
         docs: `${repoPath}/docs`,
         rules: `${repoPath}/rules`,
         skills: `${repoPath}/skills`,
       });
+
       reportStaleEntries(entries);
 
       if (entries.length === 0 || cmdOpts.dryRun) return;
 
       log.info('\nGenerating AI-powered update drafts...');
+
       for (const entry of entries) {
         const related = await findRelatedAdoptedLearnings(entry, votesDir, learningsReadDirs, {
           namespaces: learningsNamespaces,
         });
+
         const draft = await generateUpdateDraft(entry, related);
+
         if (draft) {
           const draftPath = `${entry.path}.draft.md`;
           await writeFile(draftPath, draft);
           log.success(`  Draft written: ${draftPath}`);
         }
       }
+
       log.info('\nReview drafts, then rename .draft.md -> .md to apply updates.');
+
       return;
     }
   });
@@ -1671,19 +1847,22 @@ recallCmd
   .option('--dry-run', 'Show what would be done without making changes')
   .action(async (learningId, localOpts) => {
     // As in `recall maintenance`: `--dry-run` reaches the root's options only (#900).
-    const cmdOpts = { ...(program.opts() as GlobalOptions), ...localOpts };
+    const cmdOpts = { ...program.opts<GlobalOptions>(), ...localOpts };
     const { autoDetectInit } = await import('./config.js');
     const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: cmdOpts.dryRun });
     const { safeDeliveredLearningsNamespaces } = await import('./workspace-children.js');
     const learningsNamespaces = await safeDeliveredLearningsNamespaces(localConfig, 'recall promote');
+
     if (learningId && !cmdOpts.dryRun) {
       const { promoteAndPublish } = await import('./maintenance/promotion-publish.js');
       await promoteAndPublish(learningId, localConfig, teamConfig, {
         category: cmdOpts.category,
         namespaces: learningsNamespaces,
       });
+
       return;
     }
+
     const {
       findPromotionCandidates,
       executePromotion,
@@ -1694,24 +1873,30 @@ recallCmd
     const { usesBranchWorktree, getKnowledgeDir } = await import('./types.js');
     const knowledgeCheckout = usesBranchWorktree(localConfig) ? getKnowledgeDir(localConfig) : undefined;
     let paths: MaintenancePaths | undefined;
+
     if (knowledgeCheckout && !cmdOpts.dryRun) {
       // A fetch beside a pull in the same clone pushes the pull into its reset
       // fallback, so the checkouts and the review branches share one hold of the sync lock.
       const refreshForListing = async () => {
         const refreshed = await maintenancePathsOrExit(localConfig, { holdsSyncLock: true });
+
         if (refreshed) {
-          await fetchPromotionRefs(knowledgeCheckout).catch((e: unknown) => {
-            log.warn(`Could not fetch the review branches, so candidates follow the last fetch: ${e instanceof Error ? e.message : String(e)}`);
+          await fetchPromotionRefs(knowledgeCheckout).catch((cause: unknown) => {
+            log.warn(`Could not fetch the review branches, so candidates follow the last fetch: ${cause instanceof Error ? cause.message : String(cause)}`);
           });
         }
+
         return refreshed;
       };
+
       const { syncLockPath } = await import('./utils/learnings-publish.js');
       const { withFileLock } = await import('./update.js');
       const lock = syncLockPath(localConfig);
+
       const listed = lock === null
         ? { held: true as const, value: await refreshForListing() }
         : await withFileLock(lock, { attempts: 1, delayMs: 0 }, refreshForListing);
+
       if (listed.held) {
         paths = listed.value;
       } else {
@@ -1722,35 +1907,45 @@ recallCmd
     } else {
       paths = await maintenancePathsOrExit(localConfig, { dryRun: cmdOpts.dryRun });
     }
+
     if (!paths) return;
+
     const {
       repoPath, votesDir, learningsReadDirs, learningsWriteDir,
     } = paths;
+
     const candidates = await findPromotionCandidates(learningsReadDirs, votesDir, knowledgeCheckout, {
       namespaces: learningsNamespaces,
     });
 
     if (candidates.length === 0) {
       log.info('No learnings eligible for promotion yet.');
+
       return;
     }
 
     if (!learningId) {
       log.info(`${candidates.length} learning(s) eligible for promotion:`);
+
       for (const c of candidates) {
         log.info(`  - ${c.docId} (confidence: ${c.confidence.toFixed(2)}, suggested: ${c.suggestedCategory})`);
       }
+
       log.info('\nRun: teamai recall promote <learning-id> [--category <cat>]');
+
       return;
     }
 
     const candidate = candidates.find((c) => c.docId === learningId);
+
     if (!candidate) {
       log.error(`Learning "${learningId}" not found or not eligible for promotion.`);
+
       return;
     }
 
     await executePromotion(candidate, repoPath, {
+      // SAFETY: --category is declared with .choices(['skills', 'rules', 'docs']), so Commander admits nothing else.
       category: cmdOpts.category as 'skills' | 'rules' | 'docs' | undefined,
       dryRun: cmdOpts.dryRun,
       learningsWriteDir,
@@ -1773,6 +1968,7 @@ async function maintenancePathsOrExit(
 ): Promise<MaintenancePaths | undefined> {
   const { CheckoutLockedError, CheckoutUnavailableError, SyncLockedError, resolveMaintenancePaths } = await import('./maintenance/index.js');
   const { CheckoutRefusedError } = await import('./utils/branch-worktree.js');
+
   try {
     return await resolveMaintenancePaths(localConfig, options);
   } catch (e) {
@@ -1781,7 +1977,9 @@ async function maintenancePathsOrExit(
     } else if (!(e instanceof CheckoutRefusedError)) {
       throw e;
     }
+
     process.exitCode = 1;
+
     return undefined;
   }
 }
@@ -1794,6 +1992,7 @@ async function maintenancePathsOrExit(
 async function publishMaintenance(localConfig: LocalConfig, message: string, changed: readonly string[]): Promise<void> {
   const { publishLearningsMaintenance } = await import('./utils/learnings-publish.js');
   const result = await publishLearningsMaintenance(localConfig, message, changed);
+
   if (result.status === 'published') {
     log.success('Published maintenance changes to the learnings branch');
   } else if (result.status === 'failed') {

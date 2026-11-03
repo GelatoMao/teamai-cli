@@ -43,6 +43,77 @@ OpenCode hooks use the Node executable and TeamAI entry recorded by `teamai hook
 
 `doctor` checks the whole Hermes `SOUL.md`, including personal text. An explicit `context_file_max_chars` in Hermes' `config.yaml` is a hard cap. Without it, the cap depends on the selected model; files over the 20,000-character minimum produce an informational warning. Shorten the file or review the cap; `pull` does not truncate your instructions.
 
+In a project, Hermes gets the team instructions from teamai's plugin section, which shares 8,000 characters and 32 sections with every other plugin's. Hermes fills them in section id order and drops a section that does not fit whole. Which sections other plugins add is only known once they run, so `doctor` reads the last outcome Hermes logged in `logs/agent.log`. That log names no project, so a dropped section warns:
+
+```text
+  ⚠ Hermes's last logged session took teamai's instructions section
+    → The Hermes session at 2026-11-01 10:22:03 got none of the team instructions: teamai.instructions exceeded the aggregate session budget (8000 chars) and was skipped. Plugin sections share 8,000 characters and 32 sections, filled in id order, and other plugins' sections sorting before teamai.instructions took them first. Disable a plugin you do not need (plugins.disabled in /home/ana/.hermes/config.yaml) or shorten its section, then start a new Hermes session. /home/ana/.hermes/logs/agent.log lists each section Hermes rendered and its size.
+```
+
 Pi extensions launch the Node executable and TeamAI entry recorded by `teamai pull` or `teamai hooks inject`. After moving or reinstalling either, rerun one of those commands and restart Pi.
 
+Pi reads `AGENTS.override.md` before `AGENTS.md` from 0.84.0 (`@earendil-works/pi-coding-agent`). When you keep an override, pull writes the team instructions there, and an older Pi never sees them:
+
+```text
+  ✖ Pi reads the AGENTS.override.md holding the team instructions
+    → Pi 0.73.1 reads /home/ana/.pi/agent/AGENTS.md, not /home/ana/.pi/agent/AGENTS.override.md, so it never sees the team instructions: Pi reads AGENTS.override.md from 0.84.0. Upgrade Pi (`npm uninstall -g @mariozechner/pi-coding-agent && npm install -g @earendil-works/pi-coding-agent`), or move your text from /home/ana/.pi/agent/AGENTS.override.md into AGENTS.md, delete the override, and run `teamai pull`.
+```
+
 Hermes hooks and its instructions plugin launch the Node executable and TeamAI entry recorded by `teamai hooks inject` or `teamai pull`. After moving or reinstalling either, rerun one of those commands and restart Hermes.
+
+## A tool has not trusted the project yet
+
+Some tools load a project's files only after you trust the project, or start its MCP servers only after you approve them. `pull` writes the files either way. `doctor` reads each tool's own answer:
+
+- `⚠` the tool has not asked yet. It asks the first time you open it in the project. `doctor` still passes, so a tool you do not use today costs you nothing.
+- `✖` the answer is no: you or a setting turned it down, or teamai cannot read the answer. Opening the tool changes nothing, so `doctor` fails.
+
+A new checkout, right after the first pull, with Pi and Claude Code installed:
+
+```text
+$ teamai doctor
+  ⚠ Pi trusts this project, so it loads its team skills
+    → /home/ana/work/web-app/.pi/skills holds team skills (release-notes), but Pi loads a project's skills only in a trusted project, and /home/ana/.pi/agent/trust.json has no entry for /home/ana/work/web-app or a folder above it. Start `pi` in /home/ana/work/web-app and choose Trust, or add "/home/ana/work/web-app": true to /home/ana/.pi/agent/trust.json. Until then a headless run (`pi -p`) skips them.
+  ⚠ Claude Code approves this project's team MCP servers
+    → /home/ana/work/web-app/.mcp.json holds team MCP servers (issues), but Claude Code starts a project's .mcp.json servers in an interactive session only once you approve them, and issues waits for approval. ...
+All checks passed!
+```
+
+When you open a tool in the project, answer its prompt:
+
+```text
+$ cd ~/work/web-app
+$ pi          # choose "Trust"
+$ claude      # trust the folder, then "Use this MCP server"
+$ teamai doctor
+  ✔ Pi trusts this project, so it loads its team skills
+  ✔ Claude Code approves this project's team MCP servers
+```
+
+A server someone turned down once stays off and is never offered again, so that one fails:
+
+```text
+  ✖ Claude Code approves this project's team MCP servers
+    → /home/ana/work/web-app/.mcp.json holds team MCP servers (issues), but ... issues was rejected. Remove the rejected ones from disabledMcpjsonServers in /home/ana/work/web-app/.claude/settings.local.json; `claude mcp reset-project-choices` in /home/ana/work/web-app clears the local settings' choices.
+```
+
+A machine that only runs tools headless (a CI runner, a workflow box) is never asked, so add the entry the fix names:
+
+```bash
+# Pi, for every checkout under ~/work, on a runner with no trust.json yet
+mkdir -p ~/.pi/agent && echo '{ "/home/ci/work": true }' > ~/.pi/agent/trust.json
+```
+
+| Tool | What waits | Where the answer is kept | How to give it |
+|---|---|---|---|
+| Claude Code | `.mcp.json` servers, in an interactive session | `~/.claude/settings.json`, `.claude/settings*.json` of the main checkout, trust in `~/.claude.json` | Trust the folder, then approve the servers |
+| Claude Code | teamai's hooks, while `disableAllHooks` is true | `.claude/settings.local.json`, then `.claude/settings.json`, then `~/.claude/settings.json` | Remove `disableAllHooks`, or set it to `false` |
+| Codex | project agents, `.codex/config.toml` | `[projects."<main checkout>"]` in `~/.codex/config.toml` | Trust the project when Codex asks |
+| Copilot CLI | `.github/mcp.json`, `.github/hooks` | `trustedFolders` in `~/.copilot/config.json` | "Yes, and remember this folder" |
+| Pi, from 0.79.0 | `.pi/skills`, `.pi/mcp.json` | `~/.pi/agent/trust.json` | "Trust" |
+| Muse Code | `.agents/skills`, `.mcp.json`, `.muse/hooks.json` | `~/.config/muse/trust.json`, one entry per worktree | "Trust and continue" |
+| Qoder CLI | `.qoder/settings.json`, in an interactive session | `permissions.trustDirectories` and `mcp.*ProjectMcpServers` in `~/.qoder/settings.json` | Trust the folder, then approve the servers |
+| CodeBuddy Code | `.mcp.json` servers, `-p` too | `.codebuddy/settings.local.json` | "Use this MCP server" |
+| Cursor CLI | `.cursor/mcp.json` servers | `~/.cursor/projects/<project>/` | `cursor-agent mcp enable <name>` |
+
+Oh My Pi has no trust gate.

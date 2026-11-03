@@ -52,6 +52,11 @@ describe('parseScorer', () => {
     expect(parsed.ok && parsed.definition).toMatchObject({ samplingRate: 100, model: 'fast', isolation: 'verified' });
   });
 
+  it('reads a check that decides before the judge, as a benchmark task writes one', () => {
+    const parsed = parseScorer('scorers/q.md', scorerWith(`${LABELS}passingScore: 1\ncheck: { run: npm test, protect: ['test/**', package.json] }\n`));
+    expect(parsed.ok && parsed.definition.check).toEqual({ run: 'npm test', protect: ['test/**', 'package.json'] });
+  });
+
   it('reports an invalid label list once while preserving other diagnostics', () => {
     expect(problems('scorers/q.md', scorerWith('labels: x\npassingScore: nope\n'))).toEqual([
       `scorers/q.md: labels ${COUNT}`,
@@ -77,6 +82,10 @@ describe('parseScorer', () => {
     ['a model with spaces', scorerWith(`${LABELS}passingScore: 1\nmodel: two words\n`), 'scorers/q.md: model must be a non-empty string without spaces'],
     ['a model with a template', scorerWith(`${LABELS}passingScore: 1\nmodel: "{{inputs.judge}}"\n`), 'scorers/q.md: model cannot contain a template; write an alias or a model name as is'],
     ['an unknown isolation', scorerWith(`${LABELS}passingScore: 1\nisolation: strict\n`), 'scorers/q.md: isolation must be verified or best-effort'],
+    ['a check without protected paths', scorerWith(`${LABELS}passingScore: 1\ncheck: { run: npm test, protect: [] }\n`),
+      'scorers/q.md: check.protect lists every path the check reads and the agent must not supply'],
+    ['a check that adds files', scorerWith(`${LABELS}passingScore: 1\ncheck: { run: npm test, protect: [test], add: [test/a.ts] }\n`),
+      'scorers/q.md: check uses `add`, which this teamai does not know. Update teamai.'],
     ['an unknown key', scorerWith(`${LABELS}passingScore: 1\nthreshold: 2\n`),
       'scorers/q.md: uses `threshold`, which this teamai does not know. Update teamai.'],
   ])('rejects %s', (_case, content, problem) => {
@@ -85,6 +94,10 @@ describe('parseScorer', () => {
 
   it('rejects a file name that is not a token', () => {
     expect(problems('scorers/.hidden.md', VALID)).toEqual(['scorers/.hidden.md: the file name must be a token such as review-quality.md']);
+  });
+
+  it('rejects a file named like a generated scorer, with a colon', () => {
+    expect(problems('scorers/teamai:correctness:fix.md', VALID)).toEqual(['scorers/teamai:correctness:fix.md: the file name must be a token such as review-quality.md']);
   });
 
   it('rejects a name ending in .md, which --scorer would take for a file', () => {

@@ -7,11 +7,14 @@ import { z } from 'zod';
 import { AgentObservationSchema, ObservedEffortSchema, ObservedModelSchema, UsedSchema } from '../agent-observation.js';
 import { RunModeSchema } from '../launch-context.js';
 import { canonicalJson } from '../utils/canonical-json.js';
+import type { JsonValue } from '../types.js';
 
 export const RunSubjectSchema = z.object({ runId: z.string().min(1), step: z.string().min(1), pass: z.number().int().positive() });
+
 export type RunSubject = z.infer<typeof RunSubjectSchema>;
 
 export const SessionSubjectSchema = z.object({ platform: z.string().min(1), sessionId: z.string().min(1) });
+
 export type SessionSubject = z.infer<typeof SessionSubjectSchema>;
 
 /** What the judge's tool reports it used, as far as it reports it. `cost` is in the tool's own unit. */
@@ -20,6 +23,7 @@ export const JudgeUsageSchema = z.object({
   outputTokens: z.number().finite().nonnegative().optional(),
   cost: z.object({ amount: z.number().finite().nonnegative(), unit: z.string().min(1) }).optional(),
 });
+
 export type JudgeUsage = z.infer<typeof JudgeUsageSchema>;
 
 /** The spend of two judge calls together; a cost in another unit than the first is kept as the second reports it. */
@@ -29,12 +33,24 @@ export function sumUsage(first: JudgeUsage | undefined, second: JudgeUsage | und
   const inputTokens = tokens(first.inputTokens, second.inputTokens);
   const outputTokens = tokens(first.outputTokens, second.outputTokens);
   const cost = first.cost && second.cost?.unit === first.cost.unit ? { amount: first.cost.amount + second.cost.amount, unit: first.cost.unit } : second.cost ?? first.cost;
-  return { ...(inputTokens !== undefined ? { inputTokens } : {}), ...(outputTokens !== undefined ? { outputTokens } : {}), ...(cost ? { cost } : {}) };
+
+  const sum: JudgeUsage = {};
+
+  if (inputTokens !== undefined) sum.inputTokens = inputTokens;
+
+  if (outputTokens !== undefined) sum.outputTokens = outputTokens;
+
+  if (cost) sum.cost = cost;
+
+  return sum;
 }
 
 export const ISOLATIONS = ['best-effort', 'verified'] as const;
+
 export type Isolation = (typeof ISOLATIONS)[number];
+
 export const ACCESS_LEVELS = ['answer', 'read', 'full'] as const;
+
 export type JudgeAccess = (typeof ACCESS_LEVELS)[number];
 
 /**
@@ -76,7 +92,21 @@ const SessionLabelSchema = z.object({
   /** The team skills the session or its subagents loaded. */
   used: UsedSchema.optional(),
 });
+
 export type SessionLabel = z.infer<typeof SessionLabelSchema>;
+
+/**
+ * What settled a workflow label (#1247): the scorer's `check`, the delivered pull request's CI, the delivery's
+ * protected-path refusal, each before any judge runs, or the judge.
+ */
+export const DECIDERS = ['check', 'ci', 'protected', 'judge'] as const;
+
+export type Decider = (typeof DECIDERS)[number];
+
+/** Whether a check, CI or protected-path stage decided a label before any judge ran. A label from before #1247 has none: a judge decided it. */
+export function isStageDecider(by: Decider | undefined): boolean {
+  return by !== undefined && by !== 'judge';
+}
 
 /** Unknown keys are dropped, so a label a newer teamai wrote still reads here. */
 export const ScoreLabelSchema = z.discriminatedUnion('source', [
@@ -84,11 +114,18 @@ export const ScoreLabelSchema = z.discriminatedUnion('source', [
     ...LabelFields,
     source: z.literal('workflow'),
     subject: RunSubjectSchema,
+    /** What the judged work ran as: the pass's observation, or the one every prompt pass of a workflow step agrees on. */
+    agent: AgentObservationSchema.optional(),
     /** The team skills the judged pass loaded, as its driver reported them. */
     used: UsedSchema.optional(),
+    /** Absent on a label an older teamai wrote, which the judge decided. */
+    decidedBy: z.enum(DECIDERS).optional(),
+    /** `sha256:<hex>` of the evidence the label was decided on, so a rescore of unchanged evidence shows the same hash. */
+    evidenceHash: z.string().regex(/^sha256:[0-9a-f]{64}$/).optional(),
   }),
   SessionLabelSchema,
 ]);
+
 export type ScoreLabel = z.infer<typeof ScoreLabelSchema>;
 
 /**
@@ -96,11 +133,13 @@ export type ScoreLabel = z.infer<typeof ScoreLabelSchema>;
  * agree on one, the team skills it used, and its redacted first prompt, which heads the label's reasoning file.
  */
 export const SessionLabelContextSchema = SessionLabelSchema.pick({ agent: true, used: true, runMode: true }).required({ used: true }).extend({ prompt: z.string() });
+
 export type SessionLabelContext = z.infer<typeof SessionLabelContextSchema>;
 
 /** The label `value` holds, or undefined when it is not one. */
-export function parseScoreLabel(value: unknown): ScoreLabel | undefined {
+export function parseScoreLabel(value: JsonValue): ScoreLabel | undefined {
   const parsed = ScoreLabelSchema.safeParse(value);
+
   return parsed.success ? parsed.data : undefined;
 }
 
@@ -108,8 +147,10 @@ export function parseScoreLabel(value: unknown): ScoreLabel | undefined {
 export function parseScoreLabels(text: string): ScoreLabel[] {
   return text.split('\n').flatMap((line) => {
     if (line.trim() === '') return [];
+
     try {
       const label = parseScoreLabel(JSON.parse(line));
+
       return label ? [label] : [];
     } catch {
       return [];
@@ -117,9 +158,36 @@ export function parseScoreLabels(text: string): ScoreLabel[] {
   });
 }
 
-/** The logical key: a newer label with the same key replaces an older one, so a model rescore never replaces a hand label. */
+/** A judge as labels and cohorts tell judges apart: a model judge by its tool and the model it recorded. */
+export type JudgeCohort =
+  | { kind: 'human' }
+  | { kind: 'model'; tool: string; model?: { id: string; isReported: boolean; alias?: string } };
+
+export function judgeCohort(judge: ScoreLabel['judge']): JudgeCohort {
+  switch (judge.kind) {
+    case 'human':
+      return { kind: 'human' };
+    case 'model': {
+      const id = judge.model?.reported ?? judge.model?.requested;
+
+      return { kind: 'model', tool: judge.tool, model: id ? { id, isReported: judge.model?.reported !== undefined } : undefined };
+    }
+
+    default: {
+      const unhandled: never = judge;
+
+      return unhandled;
+    }
+  }
+}
+
+/**
+ * The logical key: a newer label with the same key replaces an older one. The judge is its cohort, so a model rescore
+ * never replaces a hand label, and the label of one model judge never replaces another's. An outbox file named by an
+ * older key is still read by its content.
+ */
 function labelKey(label: Pick<ScoreLabel, 'scorer' | 'rubric' | 'subject' | 'judge'>): string {
-  return canonicalJson({ scorer: label.scorer, sourceHash: label.rubric.sourceHash, subject: label.subject, judge: label.judge.kind });
+  return canonicalJson({ scorer: label.scorer, sourceHash: label.rubric.sourceHash, subject: label.subject, judge: judgeCohort(label.judge) });
 }
 
 /** sha256 of the canonical logical key: the name of the label's outbox file. */
@@ -138,10 +206,13 @@ export function labelVersion(label: ScoreLabel): string {
 /** The newest `scoredAt` per key, in the order each key first appears. */
 export function newestLabels(labels: Iterable<ScoreLabel>): ScoreLabel[] {
   const newest = new Map<string, ScoreLabel>();
+
   for (const label of labels) {
     const key = labelKey(label);
     const kept = newest.get(key);
+
     if (!kept || label.scoredAt > kept.scoredAt) newest.set(key, label);
   }
+
   return [...newest.values()];
 }

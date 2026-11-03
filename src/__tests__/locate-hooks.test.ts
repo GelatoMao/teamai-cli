@@ -14,6 +14,7 @@ const JOYCODE_SOURCE = 'JoyCode Desktop 0.6.0: JOYCODE_HOME moves the user hooks
 const HERMES_SOURCE = 'hermes-agent hermes_constants.py:51-58: HERMES_HOME, else %LOCALAPPDATA%\\hermes on Windows, else ~/.hermes; shell hooks registered in config.yaml';
 const SELF = 'issue #1221 matrix, Self scope';
 const TEAM = 'resolveHookScope: a workspace takes the user hooks (#264)';
+const CLAUDE_HOOKS_SWITCH = 'Claude Code 2.1.316 (`claude -p`): disableAllHooks in the checkout\'s settings.local.json, else its settings.json, else the user settings.json, holds back every hook';
 
 /** A tool's hook list in `file`, which it reads from any session: `probe` says it is installed. */
 const settings = (tool: string, scope: 'user' | 'project', file: Spot, probe: Spot, rest: Partial<FilesRow> = {}): FilesRow => ({
@@ -35,22 +36,34 @@ const adapter = (tool: string, scope: 'user' | 'project', dir: Spot, probe: Spot
   ...rest,
 });
 
+/** OpenClaw's switches for teamai's workspace hook and the team hooks plugin, both in the openclaw.json of `stateDir` unless `config` moves it. */
+const openclawGates = (stateDir: `~/${string}` | `/${string}`, config: Spot = `${stateDir}/openclaw.json`): FilesRow['readGates'] => [
+  { kind: 'openclaw-hooks-enabled', config },
+  { kind: 'openclaw-plugins-enabled', config, plugin: `${stateDir}/teamai/teamai-team-hooks.mjs` },
+];
+
 const ROWS: readonly (FilesRow | OtherRow)[] = [
   settings('claude', 'user', '~/.claude/settings.json', '~/.claude'),
   settings('claude', 'user', '~/.claude-work/settings.json', '~/.claude-work', {
     toolRoots: { claude: '~/.claude-work' }, reads: [{ at: '~/.claude-work/settings.json', when: 'always', key: HOOK_LIST }],
     source: 'CLAUDE_CONFIG_DIR recorded by teamai init (RELOCATABLE_TOOLS)',
   }),
-  settings('claude', 'project', '~/.claude/settings.json', '~/.claude', { source: 'resolveHookScope: a workspace takes the user hooks (#264)' }),
+  settings('claude', 'project', '~/.claude/settings.json', '~/.claude', {
+    readGates: [{ kind: 'claude-hooks-enabled', settings: '~/.claude/settings.json', checkout: '<root>' }],
+    source: `resolveHookScope: a workspace takes the user hooks (#264); ${CLAUDE_HOOKS_SWITCH}`,
+  }),
   settings('claude', 'project', '~/.claude-work/settings.json', '~/.claude-work', {
     userToolRoots: { claude: '~/.claude-work' }, reads: [{ at: '~/.claude-work/settings.json', when: 'always', key: HOOK_LIST }],
-    source: 'a project config that records no toolRoots follows the user config (resolveMemberToolRoots)',
+    readGates: [{ kind: 'claude-hooks-enabled', settings: '~/.claude-work/settings.json', checkout: '<root>' }],
+    source: `a project config that records no toolRoots follows the user config (resolveMemberToolRoots); ${CLAUDE_HOOKS_SWITCH}`,
   }),
   selfSettings('claude', '<root>/.claude/settings.json', '<root>/.claude', 'workspaceUnder', {
     reads: [
       { at: '<root>/.claude/settings.json', when: 'workspaceUnder', key: HOOK_LIST },
       { at: '<root>/.claude/settings.local.json', when: 'workspaceUnder', key: HOOK_LIST },
     ],
+    readGates: [{ kind: 'claude-hooks-enabled', settings: '~/.claude/settings.json', checkout: '<root>' }],
+    source: `${SELF}; ${CLAUDE_HOOKS_SWITCH}`,
   }),
   settings('codex', 'user', '~/.codex/hooks.json', '~/.codex'),
   settings('codex', 'project', '~/.codex/hooks.json', '~/.codex', { source: 'resolveHookScope: a workspace takes the user hooks (#264)' }),
@@ -79,7 +92,8 @@ const ROWS: readonly (FilesRow | OtherRow)[] = [
       { at: '~/.copilot/hooks/teamai.json', when: 'always', key: HOOK_LIST },
       { at: '<root>/.github/hooks/teamai.json', when: 'workspaceUnder', key: HOOK_LIST },
     ],
-    source: 'resolveHookScope: a workspace takes the user hooks (#264), and the team hooks in the project file Copilot CLI loads from .github/hooks',
+    readGates: [{ kind: 'copilot-folder-trust', config: '~/.copilot/config.json', checkout: '<root>' }],
+    source: 'resolveHookScope: a workspace takes the user hooks (#264), and the team hooks in the project file Copilot CLI loads from .github/hooks in a trusted folder (Copilot CLI 1.0.105)',
   }),
   settings('copilot', 'project', '/copilot-home/hooks/teamai.json', '/copilot-home', {
     env: { COPILOT_HOME: '/copilot-home' },
@@ -88,10 +102,12 @@ const ROWS: readonly (FilesRow | OtherRow)[] = [
       { at: '/copilot-home/hooks/teamai.json', when: 'always', key: HOOK_LIST },
       { at: '<root>/.github/hooks/teamai.json', when: 'workspaceUnder', key: HOOK_LIST },
     ],
-    source: 'Copilot CLI 1.0.98: COPILOT_HOME moves the user hooks; the project file stays in the project',
+    readGates: [{ kind: 'copilot-folder-trust', config: '/copilot-home/config.json', checkout: '<root>' }],
+    source: 'Copilot CLI 1.0.98: COPILOT_HOME moves the user hooks and config.json; the project file stays in the project',
   }),
   selfSettings('copilot', '<root>/.github/hooks/teamai.json', '~/.copilot', 'workspaceUnder', {
-    source: `${SELF}: whether repo hooks wait for folder trust is not traced`,
+    readGates: [{ kind: 'copilot-folder-trust', config: '~/.copilot/config.json', checkout: '<root>' }],
+    source: `${SELF}: Copilot CLI 1.0.105 runs repo hooks only in a trusted folder (copilot -p, verified)`,
   }),
   settings('qoder', 'user', '~/.qoder/settings.json', '~/.qoder'),
   settings('qoder', 'user', '/qoder/settings.json', '/qoder', {
@@ -107,8 +123,13 @@ const ROWS: readonly (FilesRow | OtherRow)[] = [
     env: { QODER_CLI_HOME: '/qoder-cli' }, reads: [{ at: '/qoder-cli/.qoder/settings.json', when: 'always', key: HOOK_LIST }], source: 'QODER_CLI_HOME moves the project install user hook file',
   }),
   selfSettings('qoder', '<root>/.qoder/settings.json', '~/.qoder', 'cwdOnly', {
+    reads: [
+      { at: '<root>/.qoder/settings.json', when: 'cwdOnly', key: HOOK_LIST },
+      { at: '<root>/.qoder/settings.local.json', when: 'cwdOnly', key: HOOK_LIST },
+    ],
     broken: { 'project-subdir': { reason: 'cwd-only', issue: '#1221' } },
-    source: `${SELF}: <cwd>/.qoder/settings.json, shared with Qoder CN`,
+    readGates: [{ kind: 'qoder-folder-trust', config: '~/.qoder/settings.json', checkout: '<root>' }],
+    source: `${SELF}: <cwd>/.qoder/settings.json, shared with Qoder CN, then settings.local.json beside it; Qoder CLI 1.1.81 reads both only in a trusted folder`,
   }),
   settings('qoder-cn', 'user', '~/.qoder-cn/settings.json', '~/.qoder-cn'),
   settings('qoder-cn', 'user', '/qodercn/settings.json', '/qodercn', {
@@ -124,6 +145,10 @@ const ROWS: readonly (FilesRow | OtherRow)[] = [
     env: { QODERCN_CLI_HOME: '/qodercn-cli' }, reads: [{ at: '/qodercn-cli/.qoder-cn/settings.json', when: 'always', key: HOOK_LIST }], source: 'QODERCN_CLI_HOME supplies the parent of the Qoder CN project install user hook file',
   }),
   selfSettings('qoder-cn', '<root>/.qoder/settings.json', '~/.qoder-cn', 'cwdOnly', {
+    reads: [
+      { at: '<root>/.qoder/settings.json', when: 'cwdOnly', key: HOOK_LIST },
+      { at: '<root>/.qoder/settings.local.json', when: 'cwdOnly', key: HOOK_LIST },
+    ],
     broken: { 'project-subdir': { reason: 'cwd-only', issue: '#1221' } },
     source: `${SELF}: Qoder CN's project hooks are Qoder's <cwd>/.qoder/settings.json`,
   }),
@@ -144,8 +169,12 @@ const ROWS: readonly (FilesRow | OtherRow)[] = [
     source: `${CODEBUDDY_SOURCE}; a workspace takes the user hooks`,
   }),
   selfSettings('codebuddy', '<root>/.codebuddy/settings.json', '<root>/.codebuddy', 'cwdOnly', {
+    reads: [
+      { at: '<root>/.codebuddy/settings.json', when: 'cwdOnly', key: HOOK_LIST },
+      { at: '<root>/.codebuddy/settings.local.json', when: 'cwdOnly', key: HOOK_LIST },
+    ],
     broken: { 'project-subdir': { reason: 'cwd-only', issue: '#1221' } },
-    source: `${SELF}: CodeBuddy reads project settings from the session cwd only`,
+    source: `${SELF}: CodeBuddy Code 2.179.1 runs the hooks of settings.json and settings.local.json, from the session cwd only`,
   }),
   settings('workbuddy', 'user', '~/.workbuddy/settings.json', '~/.workbuddy', { source: 'issue #1221 matrix, WorkBuddy user hooks (t)' }),
   selfSettings('workbuddy', '<root>/.workbuddy/settings.json', '<root>/.workbuddy', 'cwdOnly', { reads: 'unknown', source: `${SELF}: WorkBuddy (?t)` }),
@@ -155,7 +184,10 @@ const ROWS: readonly (FilesRow | OtherRow)[] = [
     retired: [{ at: '~/.config/muse/settings.json', was: 'default' }],
     source: `${MUSE_SOURCE}; earlier releases wrote the hooks to ~/.config/muse`,
   }),
-  selfSettings('muse', '<root>/.muse/hooks.json', '~/.config/muse', 'workspaceUnder', { source: `${SELF}: runs only in a trusted workspace` }),
+  selfSettings('muse', '<root>/.muse/hooks.json', '~/.config/muse', 'workspaceUnder', {
+    readGates: [{ kind: 'muse-workspace-trust', config: '~/.config/muse/trust.json', checkout: '<root>' }],
+    source: `${SELF}: runs only in a trusted workspace (Muse Code 1.4.14 trust.json)`,
+  }),
   settings('muse', 'project', '/xdg/muse/settings.json', '/xdg/muse', {
     env: { XDG_CONFIG_HOME: '/xdg' }, reads: [{ at: '/xdg/muse/settings.json', when: 'always', key: HOOK_LIST }],
     retired: [{ at: '~/.config/muse/settings.json', was: 'default' }],
@@ -197,13 +229,13 @@ const ROWS: readonly (FilesRow | OtherRow)[] = [
     source: `issue #1221 matrix, PI_CODING_AGENT_DIR row (v); ${TEAM}`,
   }),
   adapter('omp', 'user', '~/.omp/agent/extensions', '~/.omp', { source: 'issue #1221 matrix, Oh My Pi user hooks (v, 18.2.1)' }),
-  adapter('openclaw', 'user', '/oc-home/.openclaw/workspace/hooks', '/oc-home/.openclaw/workspace', { env: { OPENCLAW_HOME: '/oc-home' }, source: OPENCLAW_HOME_SOURCE }),
-  adapter('openclaw', 'user', '/oc-home/.openclaw-work/workspace/hooks', '/oc-home/.openclaw-work/workspace', { env: { OPENCLAW_HOME: '/oc-home' }, envLiterals: { OPENCLAW_PROFILE: 'work' }, source: OPENCLAW_HOME_SOURCE }),
+  adapter('openclaw', 'user', '/oc-home/.openclaw/workspace/hooks', '/oc-home/.openclaw/workspace', { readGates: openclawGates('/oc-home/.openclaw'), env: { OPENCLAW_HOME: '/oc-home' }, source: OPENCLAW_HOME_SOURCE }),
+  adapter('openclaw', 'user', '/oc-home/.openclaw-work/workspace/hooks', '/oc-home/.openclaw-work/workspace', { readGates: openclawGates('/oc-home/.openclaw-work'), env: { OPENCLAW_HOME: '/oc-home' }, envLiterals: { OPENCLAW_PROFILE: 'work' }, source: OPENCLAW_HOME_SOURCE }),
   adapter('hermes', 'user', '~/.hermes-canary/hooks', '~/.hermes-canary', { platforms: ['darwin', 'linux'], envLiterals: { HERMES_DATA_DIR_SUFFIX: '-canary' }, source: HERMES_PROFILE_SOURCE }),
   adapter('hermes', 'user', '$LOCALAPPDATA/hermes-canary/hooks', '$LOCALAPPDATA/hermes-canary', { platforms: ['win32'], envLiterals: { HERMES_DATA_DIR_SUFFIX: '-canary' }, source: HERMES_PROFILE_SOURCE }),
   adapter('hermes', 'user', '~/.hermes/profiles/work/hooks', '~/.hermes/profiles/work', { platforms: ['darwin', 'linux'], texts: [{ at: '~/.hermes/active_profile', text: 'work\n' }], source: HERMES_PROFILE_SOURCE }),
-  adapter('openclaw', 'project', '/oc-home/.openclaw/workspace/hooks', '/oc-home/.openclaw/workspace', { env: { OPENCLAW_HOME: '/oc-home' }, source: `${OPENCLAW_HOME_SOURCE}; ${TEAM}` }),
-  adapter('openclaw', 'project', '/oc-home/.openclaw-work/workspace/hooks', '/oc-home/.openclaw-work/workspace', { env: { OPENCLAW_HOME: '/oc-home' }, envLiterals: { OPENCLAW_PROFILE: 'work' }, source: `${OPENCLAW_HOME_SOURCE}; ${TEAM}` }),
+  adapter('openclaw', 'project', '/oc-home/.openclaw/workspace/hooks', '/oc-home/.openclaw/workspace', { readGates: openclawGates('/oc-home/.openclaw'), env: { OPENCLAW_HOME: '/oc-home' }, source: `${OPENCLAW_HOME_SOURCE}; ${TEAM}` }),
+  adapter('openclaw', 'project', '/oc-home/.openclaw-work/workspace/hooks', '/oc-home/.openclaw-work/workspace', { readGates: openclawGates('/oc-home/.openclaw-work'), env: { OPENCLAW_HOME: '/oc-home' }, envLiterals: { OPENCLAW_PROFILE: 'work' }, source: `${OPENCLAW_HOME_SOURCE}; ${TEAM}` }),
   adapter('hermes', 'project', '~/.hermes-canary/hooks', '~/.hermes-canary', { platforms: ['darwin', 'linux'], envLiterals: { HERMES_DATA_DIR_SUFFIX: '-canary' }, source: `${HERMES_PROFILE_SOURCE}; ${TEAM}` }),
   adapter('hermes', 'project', '$LOCALAPPDATA/hermes-canary/hooks', '$LOCALAPPDATA/hermes-canary', { platforms: ['win32'], envLiterals: { HERMES_DATA_DIR_SUFFIX: '-canary' }, source: `${HERMES_PROFILE_SOURCE}; ${TEAM}` }),
   adapter('hermes', 'project', '~/.hermes/profiles/work/hooks', '~/.hermes/profiles/work', { platforms: ['darwin', 'linux'], texts: [{ at: '~/.hermes/active_profile', text: 'work\n' }], source: `${HERMES_PROFILE_SOURCE}; ${TEAM}` }),
@@ -221,30 +253,30 @@ const ROWS: readonly (FilesRow | OtherRow)[] = [
   adapter('hermes', 'user', '/recorded/hermes/hooks', '/recorded/hermes', {
     toolHomes: { hermes: '/recorded/hermes' }, source: `${HERMES_SOURCE}; a recorded home wins over a shell without HERMES_HOME`,
   }),
-  adapter('openclaw', 'user', '~/.openclaw/workspace/hooks', '~/.openclaw/workspace', {
+  adapter('openclaw', 'user', '~/.openclaw/workspace/hooks', '~/.openclaw/workspace', { readGates: openclawGates('~/.openclaw'),
     source: 'OpenClaw 884a96d1 loads workspace hooks from <workspace>/hooks (issue #1221 matrix, v)',
   }),
-  adapter('openclaw', 'user', '/oc-state/workspace/hooks', '/oc-state/workspace', {
+  adapter('openclaw', 'user', '/oc-state/workspace/hooks', '/oc-state/workspace', { readGates: openclawGates('/oc-state'),
     env: { OPENCLAW_STATE_DIR: '/oc-state' }, source: 'OpenClaw: the workspace defaults to <state dir>/workspace',
   }),
-  adapter('openclaw', 'project', '/oc-state/workspace/hooks', '/oc-state/workspace', {
+  adapter('openclaw', 'project', '/oc-state/workspace/hooks', '/oc-state/workspace', { readGates: openclawGates('/oc-state'),
     env: { OPENCLAW_STATE_DIR: '/oc-state' }, source: `OpenClaw: the workspace defaults to <state dir>/workspace; ${TEAM}`,
   }),
-  adapter('openclaw', 'user', '~/.openclaw-work/workspace/hooks', '~/.openclaw-work/workspace', {
+  adapter('openclaw', 'user', '~/.openclaw-work/workspace/hooks', '~/.openclaw-work/workspace', { readGates: openclawGates('~/.openclaw-work'),
     envLiterals: { OPENCLAW_PROFILE: 'work' }, source: 'OpenClaw: a profile other than default is ~/.openclaw-<profile>, its workspace included',
   }),
-  adapter('openclaw', 'project', '~/.openclaw-work/workspace/hooks', '~/.openclaw-work/workspace', {
+  adapter('openclaw', 'project', '~/.openclaw-work/workspace/hooks', '~/.openclaw-work/workspace', { readGates: openclawGates('~/.openclaw-work'),
     envLiterals: { OPENCLAW_PROFILE: 'work' }, source: `OpenClaw: a profile other than default is ~/.openclaw-<profile>; ${TEAM}`,
   }),
-  adapter('openclaw', 'user', '/oc-ws/hooks', '/oc-ws', {
+  adapter('openclaw', 'user', '/oc-ws/hooks', '/oc-ws', { readGates: openclawGates('~/.openclaw'),
     env: { OPENCLAW_WORKSPACE_DIR: '/oc-ws' }, source: 'OpenClaw: OPENCLAW_WORKSPACE_DIR names the workspace when openclaw.json names none',
   }),
-  adapter('openclaw', 'user', '~/oc-cfg-ws/hooks', '~/oc-cfg-ws', {
+  adapter('openclaw', 'user', '~/oc-cfg-ws/hooks', '~/oc-cfg-ws', { readGates: openclawGates('~/.openclaw', '/oc-cfg/openclaw.json'),
     env: { OPENCLAW_CONFIG_PATH: '/oc-cfg/openclaw.json', OPENCLAW_WORKSPACE_DIR: '/oc-ws' },
     json: [{ at: '/oc-cfg/openclaw.json', value: { agents: { defaults: { workspace: '~/oc-cfg-ws' } } } }],
     source: 'OpenClaw: OPENCLAW_CONFIG_PATH names the openclaw.json read, whose workspace wins over OPENCLAW_WORKSPACE_DIR',
   }),
-  adapter('openclaw', 'user', '~/.openclaw/workspace/hooks', '~/.openclaw/workspace', {
+  adapter('openclaw', 'user', '~/.openclaw/workspace/hooks', '~/.openclaw/workspace', { readGates: openclawGates('~/.openclaw'),
     invalidJson: ['~/.openclaw/openclaw.json'],
     source: 'an openclaw.json teamai cannot parse leaves the workspace OPENCLAW_WORKSPACE_DIR or the state dir gives, where the hook still goes',
   }),

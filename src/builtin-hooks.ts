@@ -2,8 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { TEAMAI_HOOK_DESCRIPTION_PREFIX } from './types.js';
-import { CODEX_TOOL_IDS, isCodexTool } from './utils/tool-names.js';
-import type { HookDef, ToolId } from './types.js';
+import { isCodexTool } from './utils/tool-names.js';
+import type { HookDef } from './types.js';
+import { channelsOf, type HookAdapterId } from './tools.js';
 import { getUserHome } from './utils/home.js';
 import { log } from './utils/logger.js';
 import { bundledShellFor, findGitBashWindows, resetBundledRuntimeCache, resolveCodebuddyNode, resolveWorkbuddyNode } from './bundled-runtime.js';
@@ -36,13 +37,15 @@ const WRAPPER_NAME = 'teamai';
 const CODEBUDDY_HOOK_WRAPPER = 'teamai-codebuddy-hook';
 
 /**
- * Tools whose hook commands need a shell to execute at all: their hook runner
- * hands the rendered `command` string to a shell instead of an argv vector.
- * Which shell that is depends on the tool (and platform) — see
- * bundled-runtime.ts. Injection is skipped for a tool when no shell resolves,
- * because its hook commands could never run.
+ * Whether `tool`'s hook commands need a shell of its own to execute at all
+ * (`hooks.shell: 'bundled'`): its hook runner hands the rendered `command`
+ * string to a shell instead of an argv vector. Which shell that is depends on
+ * the tool (and platform) — see bundled-runtime.ts. Injection is skipped for a
+ * tool when no shell resolves, because its hook commands could never run.
  */
-export const SHELL_DEPENDENT_TOOLS = new Set<string>(['workbuddy', 'codebuddy'] satisfies ToolId[]);
+export function isShellDependentTool(tool: string): boolean {
+  return channelsOf(tool).hooks.shell === 'bundled';
+}
 
 /**
  * Check whether /bin/sh exists.  Remote containers (e.g. CloudStudio AI
@@ -55,6 +58,7 @@ export const SHELL_DEPENDENT_TOOLS = new Set<string>(['workbuddy', 'codebuddy'] 
  * entry points can skip hook installation and warn the user.
  */
 let _hasShellCache: boolean | undefined;
+
 export function hasShell(): boolean {
   if (_hasShellCache === undefined) {
     try {
@@ -63,6 +67,7 @@ export function hasShell(): boolean {
       _hasShellCache = false;
     }
   }
+
   return _hasShellCache;
 }
 
@@ -82,8 +87,10 @@ export function resolveTeamaiEntryScript(): string | null {
     const thisFile = fileURLToPath(import.meta.url);
     const distDir = path.dirname(thisFile);
     const candidate = path.join(distDir, 'index.js');
+
     if (fs.existsSync(candidate)) return candidate;
   } catch { /* fallback */ }
+
   return null;
 }
 
@@ -108,6 +115,7 @@ export function resolveCliEntry(): string | null {
  */
 export function ensureTeamaiWrapper(): string | null {
   const entryScript = resolveTeamaiEntryScript();
+
   if (!entryScript) return null;
 
   const nodeBin = resolveWorkbuddyNode() ?? resolveCodebuddyNode() ?? process.argv[0];
@@ -136,6 +144,7 @@ export function ensureTeamaiWrapper(): string | null {
   try {
     fs.mkdirSync(binDir, { recursive: true });
     fs.writeFileSync(wrapperPath, script, { mode: 0o755 });
+
     if (process.platform === 'win32') {
       fs.writeFileSync(path.join(binDir, `${WRAPPER_NAME}.cmd`), cmdScript);
       fs.writeFileSync(path.join(binDir, CODEBUDDY_HOOK_WRAPPER), [
@@ -144,6 +153,7 @@ export function ensureTeamaiWrapper(): string | null {
         '',
       ].join('\n'), { mode: 0o755 });
     }
+
     return binDir;
   } catch {
     return null;
@@ -157,6 +167,7 @@ export function ensureTeamaiWrapper(): string | null {
  */
 function hasShellFor(tool: string): boolean {
   if (bundledShellFor(tool)) return true;
+
   return hasShell();
 }
 
@@ -169,24 +180,30 @@ function hasShellFor(tool: string): boolean {
 export function skipToolsWithoutShell(tools: string[]): Set<string> {
   const skipped = new Set<string>();
   let withShell = false;
+
   for (const tool of tools) {
-    if (!SHELL_DEPENDENT_TOOLS.has(tool)) continue;
+    if (!isShellDependentTool(tool)) continue;
+
     if (hasShellFor(tool)) {
       withShell = true;
     } else {
       skipped.add(tool);
     }
   }
+
   // Non-login POSIX dispatch must not rely on a project git hook creating this.
   const nonLoginWrapper = process.platform !== 'win32'
     && tools.some(tool => tool === 'zcode' || tool === 'dsh') && hasShell();
+
   if (withShell || nonLoginWrapper) ensureTeamaiWrapper();
+
   if (skipped.size > 0) {
     log.warn(
       `Skipping hook injection for ${[...skipped].join(', ')}: no shell is available in this environment to execute hooks. ` +
       'Other tools (Claude Code, Cursor) are not affected.',
     );
   }
+
   return skipped;
 }
 
@@ -202,8 +219,10 @@ let _winBashLauncherCache: string | undefined;
  */
 function getHookShellCommand(): string {
   if (process.platform !== 'win32') return 'bash';
+
   if (_winBashLauncherCache === undefined) {
     const found = findGitBashWindows();
+
     if (found) {
       _winBashLauncherCache = `"${found.split(path.sep).join('/')}"`;
     } else {
@@ -211,6 +230,7 @@ function getHookShellCommand(): string {
       log.debug('teamai hooks: Git Bash not found on this Windows machine; hook commands keep bare `bash` and may resolve to the WSL launcher.');
     }
   }
+
   return _winBashLauncherCache;
 }
 
@@ -225,6 +245,7 @@ export function getDispatchCommand(event: string, tool: string, matcher?: string
   const bin = binPath ?? 'teamai';
   const matcherArg = matcher && matcher !== '*' ? ` --matcher ${matcher}` : '';
   const shell = isCodexTool(tool) ? 'bash' : getHookShellCommand();
+
   return `${shell} -lc "${bin} hook-dispatch ${event} --tool ${tool}${matcherArg} 2>/dev/null" || true`;
 }
 
@@ -264,6 +285,7 @@ export function toolUsesPwshShell(tool: string): boolean {
  */
 export function getTeamHookDispatchCommand(event: string, tool: string): string {
   const shell = isCodexTool(tool) ? 'bash' : getHookShellCommand();
+
   return `${shell} -lc "teamai hook-dispatch ${event} --tool ${tool} --team-hooks"`;
 }
 
@@ -284,6 +306,7 @@ export function getCodebuddyTeamHookDispatchCommand(
 ): string {
   const wrapper = path.join(getUserHome(), TEAMAI_BIN_DIR, CODEBUDDY_HOOK_WRAPPER).split(path.sep).join('/');
   const timeoutArg = timeout === undefined ? '' : ` --team-hook-timeout ${timeout}`;
+
   return `${getHookShellCommand()} "${wrapper}" hook-dispatch ${event} --tool codebuddy --team-hooks`
     + ` --team-hook-id ${id} --team-hook-gate ${encodedGate} --team-hook-command ${encodedCommand}${timeoutArg}`;
 }
@@ -308,6 +331,7 @@ export function getTeamHookDispatchCommandWindows(event: string, tool: string): 
  */
 export function getRawDispatchCommand(event: string, tool: string, matcher?: string): string {
   const matcherArg = matcher && matcher !== '*' ? ` --matcher ${matcher}` : '';
+
   return `teamai hook-dispatch ${event} --tool ${tool}${matcherArg}`;
 }
 
@@ -322,10 +346,13 @@ export function getRawDispatchCommand(event: string, tool: string, matcher?: str
  */
 function getWrapperDispatchCommand(event: string, tool: string, matcher?: string): string {
   const matcherArg = matcher && matcher !== '*' ? ` --matcher ${matcher}` : '';
+
   if (tool === 'codebuddy' && process.platform === 'win32') {
     const wrapper = path.join(getUserHome(), TEAMAI_BIN_DIR, CODEBUDDY_HOOK_WRAPPER).split(path.sep).join('/');
+
     return `${getHookShellCommand()} "${wrapper}" hook-dispatch ${event} --tool ${tool}${matcherArg} || exit 0`;
   }
+
   return `PATH="$HOME/${TEAMAI_BIN_DIR}:$PATH" teamai hook-dispatch ${event} --tool ${tool}${matcherArg} 2>/dev/null || true`;
 }
 
@@ -347,6 +374,7 @@ function getWrapperDispatchCommand(event: string, tool: string, matcher?: string
  */
 function getPwshDispatchCommand(event: string, tool: string, matcher?: string): string {
   const matcherArg = matcher && matcher !== '*' ? ` --matcher ${matcher}` : '';
+
   return `teamai hook-dispatch ${event} --tool ${tool}${matcherArg} 2>$null; exit 0`;
 }
 
@@ -403,23 +431,6 @@ const SUBAGENT_START_SPEC: BuiltinHookSpec = {
 };
 
 /**
- * Tools that fire SubagentStop with the parent's session id, so the recall
- * reducer can credit a read a subagent made after the session's last Stop
- * (#884): Claude Code, Codex, CodeBuddy and Qoder document it, and their
- * internal builds share the format. The installed Codex 0.159 knows
- * `SubagentStop`, and Codex main's `HookEventsToml` (codex-rs/config/src/
- * hook_config.rs) has no `deny_unknown_fields`, so it skips an event key it
- * does not know; how older hook-capable builds treat one is unverified (a
- * hooks.json Codex cannot parse is dropped whole). Not WorkBuddy, whose shipped engine version is unverified; not Cursor
- * or Copilot, whose subagents run in sessions of their own that no hook links
- * to the parent; not ZCode, which has no such event and rejects the whole
- * hooks block on an unknown key.
- */
-const SUBAGENT_STOP_TOOLS = new Set<string>([
-  'claude', 'claude-internal', 'tclaude', ...CODEX_TOOL_IDS, 'codebuddy', 'qoder', 'qoder-cn',
-] satisfies ToolId[]);
-
-/**
  * Build the built-in hook definitions for a tool.
  *
  * Tool-specific by design: Cursor, WorkBuddy, CodeBuddy and the Codex family
@@ -434,39 +445,51 @@ const SUBAGENT_STOP_TOOLS = new Set<string>([
  * uses Git Bash but its IDE uses cmd.exe, so its built-ins launch Git Bash
  * explicitly through a script that keeps the fail-open contract.
  */
-const WRAPPER_TOOLS = SHELL_DEPENDENT_TOOLS;
-
-
 export function builtinHookDefs(tool: string): HookDef[] {
   // ZCode renders per-event timeouts from the ZCODE_TIMEOUT_MS table in its own
   // writer (toZcodeEntry), so def.timeout stays unset for it.
   const withTimeout = tool === 'cursor' || tool === 'copilot' || tool === 'workbuddy' || tool === 'codebuddy' || tool === 'joycode' || isCodexTool(tool);
+
   const buildCommand = tool === 'zcode'
     ? getRawDispatchCommand
     : toolUsesPwshShell(tool)
       ? getPwshDispatchCommand
-      : WRAPPER_TOOLS.has(tool) || tool === 'dsh'
+      : isShellDependentTool(tool) || tool === 'dsh'
         ? getWrapperDispatchCommand
         : getDispatchCommand;
+
   const specs = [
     ...BUILTIN_HOOK_SPECS,
     ...(tool === 'copilot' ? [COPILOT_SESSION_END_SPEC] : []),
-    ...(SUBAGENT_STOP_TOOLS.has(tool) ? [SUBAGENT_STOP_SPEC] : []),
+    ...(channelsOf(tool).hooks.subagentStop ? [SUBAGENT_STOP_SPEC] : []),
     ...(isCodexTool(tool) ? [SUBAGENT_START_SPEC] : []),
   ];
-  return specs.map((spec) => ({
-    source: 'builtin' as const,
-    key: spec.key,
-    event: spec.event,
-    matcher: spec.matcher,
-    command: (tool === 'zcode' && process.platform !== 'win32' ? `PATH="$HOME/${TEAMAI_BIN_DIR}:$PATH" ` : '')
-      + buildCommand(spec.dispatchEvent, tool, spec.matcher),
-    timeout: withTimeout ? spec.timeoutSec : undefined,
+
+  return specs.map((spec): HookDef => {
+    const def = {
+      source: 'builtin' as const,
+      key: spec.key,
+      event: spec.event,
+      matcher: spec.matcher,
+      command: (tool === 'zcode' && process.platform !== 'win32' ? `PATH="$HOME/${TEAMAI_BIN_DIR}:$PATH" ` : '')
+        + buildCommand(spec.dispatchEvent, tool, spec.matcher),
+      timeout: withTimeout ? spec.timeoutSec : undefined,
+    };
+
+    const description = `${TEAMAI_HOOK_DESCRIPTION_PREFIX} ${spec.key}`;
+
     // The team rules reach the Codex family through its start hooks (#938);
     // Codex would otherwise keep only the start and end of a large rule set.
-    ...(isCodexTool(tool) && (spec.event === 'SessionStart' || spec.event === 'SubagentStart') ? { additionalContextLimit: 0 } : {}),
-    description: `${TEAMAI_HOOK_DESCRIPTION_PREFIX} ${spec.key}`,
-  }));
+    return isCodexTool(tool) && (spec.event === 'SessionStart' || spec.event === 'SubagentStart')
+      ? { ...def, additionalContextLimit: 0, description }
+      : { ...def, description };
+  });
+}
+
+/** The built-in hooks one adapter installs, and what its artifact appends to each dispatch command. */
+interface AdapterBuiltinHooks {
+  keys: string[];
+  suffix?: string;
 }
 
 /**
@@ -478,13 +501,14 @@ export function builtinHookDefs(tool: string): HookDef[] {
  * cover a narrower slice, and spawn the dispatcher directly — so the shell
  * wrapper the settings tools carry would misreport what is on disk.
  *
- * A tool in neither place is not listed: it has no hook surface teamai writes.
+ * Keyed by the tool's hook adapter. A tool with neither a settings file nor an
+ * adapter here has no hook surface teamai writes.
  */
-const ADAPTER_BUILTIN_HOOKS: Record<string, { keys: string[]; suffix?: string }> = {
-  kiro: { keys: ['Hook dispatch session-start'] },
+const ADAPTER_BUILTIN_HOOKS: Record<HookAdapterId, AdapterBuiltinHooks | null> = {
+  'kiro-hooks': { keys: ['Hook dispatch session-start'] },
   // agy-hooks.ts maps the same four events as OMP into agy's hooks.json
   // (SessionStart, PreInvocation, PostToolUse, Stop).
-  agy: {
+  'agy-hooks': {
     keys: [
       'Hook dispatch session-start',
       'Hook dispatch stop',
@@ -494,11 +518,11 @@ const ADAPTER_BUILTIN_HOOKS: Record<string, { keys: string[]; suffix?: string }>
   },
   // hermes-hooks.ts registers one on_session_start script whose single line is
   // the dispatch command with errors swallowed (buildReportScript).
-  hermes: { keys: ['Hook dispatch session-start'], suffix: ' >/dev/null 2>&1 || true' },
+  'hermes-plugin': { keys: ['Hook dispatch session-start'], suffix: ' >/dev/null 2>&1 || true' },
   // omp-hooks.ts subscribes to four OMP extension events and spawns the
   // dispatcher with argv; `tool_result` carries no matcher, so the TodoWrite
   // pass does not exist there.
-  omp: {
+  'omp-extension': {
     keys: [
       'Hook dispatch session-start',
       'Hook dispatch stop',
@@ -507,7 +531,7 @@ const ADAPTER_BUILTIN_HOOKS: Record<string, { keys: string[]; suffix?: string }>
     ],
   },
   // opencode-hooks.ts maps the same four events as OMP.
-  opencode: {
+  'opencode-plugin': {
     keys: [
       'Hook dispatch session-start',
       'Hook dispatch stop',
@@ -520,7 +544,7 @@ const ADAPTER_BUILTIN_HOOKS: Record<string, { keys: string[]; suffix?: string }>
   // TodoWrite matcher concept, so post-tool-use is wildcard-only there
   // too. tool_execution_start only caches the tool input for the later
   // post-tool-use dispatch — it never calls hook-dispatch itself.
-  pi: {
+  'pi-extension': {
     keys: [
       'Hook dispatch session-start',
       'Hook dispatch stop',
@@ -533,7 +557,9 @@ const ADAPTER_BUILTIN_HOOKS: Record<string, { keys: string[]; suffix?: string }>
   // argv. Only `openclaw`:
   // the other claw variants share its workspace resolver, so reconciliation
   // does not route them (see reconcileHooksToAllTools).
-  openclaw: { keys: ['Hook dispatch session-start', 'Hook dispatch prompt-submit'] },
+  'openclaw-hook': { keys: ['Hook dispatch session-start', 'Hook dispatch prompt-submit'] },
+  // dsh's hooks file is reconciled like a settings file, so dsh takes the full `builtinHookDefs`.
+  'dsh-hooks': null,
 };
 
 /**
@@ -547,16 +573,19 @@ const ADAPTER_BUILTIN_HOOKS: Record<string, { keys: string[]; suffix?: string }>
  */
 export function installedBuiltinHookDefs(tool: string, settingsDriven: boolean): HookDef[] {
   if (settingsDriven) return builtinHookDefs(tool);
-  const adapter = ADAPTER_BUILTIN_HOOKS[tool];
+  const channel = channelsOf(tool).hooks.user;
+  const adapter = channel !== 'none' && channel !== 'unknown' && channel.channel === 'adapter' ? ADAPTER_BUILTIN_HOOKS[channel.adapter] : null;
+
   if (!adapter) return [];
-  return BUILTIN_HOOK_SPECS.filter((spec) => adapter.keys.includes(spec.key)).map((spec) => ({
+
+  return BUILTIN_HOOK_SPECS.flatMap((spec) => (adapter.keys.includes(spec.key) ? [{
     source: 'builtin' as const,
     key: spec.key,
     event: spec.event,
     matcher: spec.matcher,
     command: getRawDispatchCommand(spec.dispatchEvent, tool, spec.matcher) + (adapter.suffix ?? ''),
     description: `${TEAMAI_HOOK_DESCRIPTION_PREFIX} ${spec.key}`,
-  }));
+  }] : []));
 }
 
 /** §4.8 team override of built-in hooks. Only whitelisted fields are honored. */
@@ -575,10 +604,11 @@ export interface BuiltinHookOverride {
 export function applyBuiltinOverride(defs: HookDef[], override?: BuiltinHookOverride): HookDef[] {
   if (!override) return defs;
   const disabled = new Set(override.disabled ?? []);
-  return defs
-    .filter((d) => !disabled.has(d.key))
-    .map((d) => {
-      const o = override.overrides?.[d.key];
-      return o && o.timeout !== undefined ? { ...d, timeout: o.timeout } : d;
-    });
+
+  return defs.flatMap((d) => {
+    if (disabled.has(d.key)) return [];
+    const o = override.overrides?.[d.key];
+
+    return [o && o.timeout !== undefined ? { ...d, timeout: o.timeout } : d];
+  });
 }
